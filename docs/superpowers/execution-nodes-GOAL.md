@@ -33,9 +33,20 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
-- [~] Phase 5 — **presence-cadence heartbeat DONE + reviewed + pushed (product-blocker resolved)**; remaining: shutdown-stops-agents + no-dup-spawn, move-flow bounded stop-before-start (+ AGENT_NODE_STATUS created_at recency), publish-task coalescing, breaker-open health vocab, publish_announce promptness test, two-node e2e (#[ignore])
+- [~] Phase 5 — presence-cadence + **Batch A (move gate + startup/reconnect resync + LWW one-live-instance, incl AGENT_NODE_STATUS created_at recency) DONE + reviewed + pushed**. Remaining: Batch B (smoke-probe health/classify incl breaker-open Stopped-not-Crashed vocab; at-rest secret store) · Batch C (two-node e2e #[ignore]; process adoption [PID+liveness so resync can't dup-spawn on daemon restart] + node-restart test; real next_status subscription [real moves are 30s-timeout-only until then] + validate_status doc; publish_announce promptness test; per-tick publish coalescing; resync watermark carry-forward)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 5 Batch A ✅): move gate (bounded stop-before-start) + startup/reconnect
+  full-resync + LWW one-live-instance (assignment created_at dedup + retarget-stop) landed in
+  buzz-node, adapting the plan's Engine-struct assumption to the real free-fn run() (added
+  NodeRelay::next_status/query_desired/take_reconnected; &mut→&self interior mutability). Adversarial
+  review caught a real Critical — an emergent Task1×Task3 move-gate BYPASS (stale pending_spawns leak →
+  I4 double-spawn) — fixed + regression-tested, plus 2 resilience Important (resync error no longer
+  kills the loop; peer-status LWW) and cheap Minors. buzz-node lib 74 tests, clippy+fmt clean;
+  re-review clean; pushed. TWO limitations knowingly deferred to Batch C: LocalProcessSubstrate.observe()
+  doesn't adopt pre-existing processes (→ resync would dup-spawn on a daemon RESTART — needs PID+liveness
+  adoption), and NostrNodeRelay::next_status is still a stub (→ real cross-node moves take the full 30s
+  timeout until Batch C wires a real status subscription). → Batch B (health probing + at-rest secrets).
 - 2026-08-29 (Phase 4 G3 ✅ → PHASE 4 COMPLETE): Run-on picker + agent-card status/controls done, and
   the G3 Critical (a node-hosted agent could be double-spawned LOCALLY, defeating the whole
   remote-execution model) fully closed over 3 SDD fix rounds under adversarial re-review. 7 distinct

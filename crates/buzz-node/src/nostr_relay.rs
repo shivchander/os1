@@ -211,6 +211,39 @@ impl NostrNodeRelay {
         }
     }
 
+    /// Build this node's presence event without publishing it. Shared by the
+    /// fire-and-forget [`NodeRelay::publish_presence`] and the awaited
+    /// [`Self::publish_presence_awaited`], so the two can never drift apart
+    /// on event shape.
+    fn presence_event(&self, online: bool) -> Result<Event, NodeError> {
+        let content = if online { "online" } else { "offline" };
+        // Mirrors `crates/buzz-acp/src/lib.rs`'s `publish_presence`: bare
+        // status string, no tags — matching the desktop client's format.
+        EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), content)
+            .tags([])
+            .sign_with_keys(&self.inner.node_keys)
+            .map_err(|e| NodeError::Relay(format!("build presence event: {e}")))
+    }
+
+    /// Publish presence and wait for the relay to actually accept it,
+    /// instead of enqueueing on a background task like
+    /// [`NodeRelay::publish_presence`] does.
+    ///
+    /// This exists solely for the daemon's shutdown path
+    /// (`buzz-node`'s `daemon::run_until_shutdown`). By the time the process
+    /// is exiting, a [`Self::spawn_publish`]-style detached background task
+    /// can be killed before it ever runs — tokio does not wait for spawned
+    /// tasks when the runtime shuts down — which would silently break the
+    /// "clean shutdown ⇒ offline presence delivered" guarantee. Callers on
+    /// the shutdown path should still wrap this in an external timeout:
+    /// [`Inner::publish_with_retry`]'s reconnect-forever policy is correct
+    /// for a long-lived background publish but would otherwise hang process
+    /// exit indefinitely against a relay that never comes back.
+    pub async fn publish_presence_awaited(&self, online: bool) -> Result<(), NodeError> {
+        let event = self.presence_event(online)?;
+        self.inner.publish_with_retry(event).await
+    }
+
     /// Publish a pre-built, signed event on a background task, returning as
     /// soon as the task is enqueued — NOT once the event is actually
     /// delivered.
@@ -302,13 +335,7 @@ impl NodeRelay for NostrNodeRelay {
     }
 
     async fn publish_presence(&self, online: bool) -> Result<(), NodeError> {
-        let content = if online { "online" } else { "offline" };
-        // Mirrors `crates/buzz-acp/src/lib.rs`'s `publish_presence`: bare
-        // status string, no tags — matching the desktop client's format.
-        let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), content)
-            .tags([])
-            .sign_with_keys(&self.inner.node_keys)
-            .map_err(|e| NodeError::Relay(format!("build presence event: {e}")))?;
+        let event = self.presence_event(online)?;
         self.spawn_publish(event);
         Ok(())
     }
@@ -484,6 +511,31 @@ mod tests {
             .await
             .expect("publish_presence must return promptly (enqueue-and-return), not block on the relay being unreachable");
         result.expect("building/enqueueing the presence event must still succeed synchronously");
+    }
+
+    #[tokio::test]
+    async fn publish_presence_awaited_blocks_on_an_unreachable_relay_instead_of_enqueueing() {
+        let node = Keys::generate();
+        let owner = Keys::generate();
+        let relay = NostrNodeRelay::new(UNREACHABLE_RELAY_URL.into(), node, owner.public_key());
+
+        // The inverse of `publish_presence_returns_promptly_...` above: unlike
+        // the fire-and-forget trait method, this variant awaits real
+        // delivery, so against a relay that will never come up it must NOT
+        // resolve within a short window — `Inner::publish_with_retry` never
+        // gives up. This is exactly the property the daemon shutdown path
+        // depends on: `publish_presence_awaited` returning `Ok` is real
+        // evidence of delivery, not just that a background task got
+        // scheduled.
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            relay.publish_presence_awaited(false),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "publish_presence_awaited must actually wait for delivery, not enqueue-and-return"
+        );
     }
 
     /// Requires a running relay. Run with:

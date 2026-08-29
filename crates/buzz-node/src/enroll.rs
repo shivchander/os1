@@ -149,11 +149,19 @@ pub fn load_or_create_node_keys(store: &dyn SecretStore) -> Result<Keys, NodeErr
     }
 }
 
-/// Default path for the persisted [`NodeConfig`]: `~/.buzz-node/config.json`.
-pub fn config_path() -> Result<PathBuf, NodeError> {
+/// Root directory for all node-local state: the persisted config, the
+/// daemon's PID/status/log files (`crate::daemon`), and per-agent
+/// workspaces. `~/.buzz-node`. A single shared resolver so every caller
+/// agrees on where "this node's home" is.
+pub fn node_home_dir() -> Result<PathBuf, NodeError> {
     let home = dirs::home_dir()
         .ok_or_else(|| NodeError::Config("could not resolve home directory".into()))?;
-    Ok(home.join(".buzz-node").join("config.json"))
+    Ok(home.join(".buzz-node"))
+}
+
+/// Default path for the persisted [`NodeConfig`]: `~/.buzz-node/config.json`.
+pub fn config_path() -> Result<PathBuf, NodeError> {
+    Ok(node_home_dir()?.join("config.json"))
 }
 
 /// Persist `cfg` as JSON to `path` (mode `0600` on Unix), creating parent

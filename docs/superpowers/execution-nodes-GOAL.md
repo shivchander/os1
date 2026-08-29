@@ -32,10 +32,34 @@ committed piece will actually pass its tests.
 - [x] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` 276/276, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
-- [~] Phase 4 — G1 (native Tauri commands) + G2 (nodes live store + Nodes panel + enrollment approval, presence author-scoped) DONE + reviewed + pushed; G3 (Run-on picker + agent-card status/controls) pending
+- [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
 - [~] Phase 5 — **presence-cadence heartbeat DONE + reviewed + pushed (product-blocker resolved)**; remaining: shutdown-stops-agents + no-dup-spawn, move-flow bounded stop-before-start (+ AGENT_NODE_STATUS created_at recency), publish-task coalescing, breaker-open health vocab, publish_announce promptness test, two-node e2e (#[ignore])
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 4 G3 ✅ → PHASE 4 COMPLETE): Run-on picker + agent-card status/controls done, and
+  the G3 Critical (a node-hosted agent could be double-spawned LOCALLY, defeating the whole
+  remote-execution model) fully closed over 3 SDD fix rounds under adversarial re-review. 7 distinct
+  local-spawn entry points gated: avatar/profile/bulk/sidebar-pair controls, @-mention auto-start,
+  project-message auto-start, edit "Start now" toast, huddle-add raw-invoke, the shared
+  attachManagedAgentToChannel create-with-channel path (via SYNCHRONOUS node-intent, closing an
+  assignment-echo race the store-only check would always lose), welcomeKickoff ×2, and the
+  autoRestartPolicy background loop — PLUS a fail-closed backstop in the low-level startManagedAgent
+  wrapper so any FUTURE ungated caller fails loud instead of silently double-spawning. Also: fixed a
+  subscription-retry gap (transient failure no longer permanently disables the gate), added created_at
+  LWW on assignments, and a useSyncExternalStore reactivity fix. Re-review clean; pushed
+  (rounds 1-3 = f89c4b941..da1787c66). → rest of Phase 5.
+- 2026-08-29 (Phase 4 G3 review → real CRITICAL caught, fix in flight): G3's mechanical work is
+  correct (Run-on picker → real publishAgentAssignment; store move to shared/api = byte-identical
+  no-op; controls wired to the real live cards; zero cross-feature imports; rem tokens; 26/26
+  playwright). BUT review-phase4c found a functional regression from the design choice of persisting
+  node-hosted agents as `backend:{type:local}`: every pre-existing local-lifecycle control (avatar
+  "Start Agent", members-sidebar button, bulk Stop/Respawn) stays live for them → clicking local
+  "Start" spawns a SECOND competing process under the same identity (local "Stop" then kills only the
+  local copy). Same root cause makes the respond-to warning falsely say "access your computer". Fix
+  round 1 dispatched (impl-phase4c, FIX_BASE 1eccaaa0c): gate the local-lifecycle affordances +
+  runLocationForBackend on a robust node-assignment signal (owner's AGENT_ASSIGNMENT desired-state in
+  the shared store, not just live getAgentStatus) + fix AGENTS.md + add the missing
+  create-with-node-target e2e. **G3 NOT pushed until this re-reviews clean; Phase 4 not complete.**
 - 2026-08-29 (presence-cadence ✅ — PRODUCT-BLOCKER RESOLVED): engine heartbeats presence(true)
   every 60s (= relay TTL 180s / 3); reviewed Approved (cadence math hand-traced, non-blocking
   inherited from spawn_publish, all EngineConfig constructors updated). Pushed. **A healthy remote

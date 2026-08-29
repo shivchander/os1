@@ -33,9 +33,15 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [~] Phase 4 — G1 (native Tauri commands) + G2 (nodes live store + Nodes panel + enrollment approval, presence author-scoped) DONE + reviewed + pushed; G3 (Run-on picker + agent-card status/controls) pending
-- [ ] Phase 5 — move/resilience + two-node e2e (unit green; e2e written, infra-gated)
+- [~] Phase 5 — **presence-cadence heartbeat DONE + reviewed + pushed (product-blocker resolved)**; remaining: shutdown-stops-agents + no-dup-spawn, move-flow bounded stop-before-start (+ AGENT_NODE_STATUS created_at recency), publish-task coalescing, breaker-open health vocab, publish_announce promptness test, two-node e2e (#[ignore])
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (presence-cadence ✅ — PRODUCT-BLOCKER RESOLVED): engine heartbeats presence(true)
+  every 60s (= relay TTL 180s / 3); reviewed Approved (cadence math hand-traced, non-blocking
+  inherited from spawn_publish, all EngineConfig constructors updated). Pushed. **A healthy remote
+  node now stays 'online' in the app end-to-end.** → Phase 4 G3 (Run-on picker + agent controls),
+  then rest of Phase 5 (shutdown-stops-agents, move-flow, coalesce, health vocab, publish_announce
+  test, two-node e2e).
 - 2026-08-29 (Phase 4 G2 ✅): Nodes live store + Nodes panel + enrollment approval; review caught +
   fix closed the unscoped-presence bug (now author-scoped to node pubkeys via the shared
   PresenceSubscriptionReconciler). tsc/biome/playwright green, full suite 5788/5788. Pushed. → next:

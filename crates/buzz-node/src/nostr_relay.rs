@@ -66,8 +66,9 @@ fn backoff_delay(attempt: usize) -> Duration {
 
 /// Current Unix time in seconds, for the `created_at` the node-event codecs
 /// require. Clamped to 0 rather than panicking if the system clock is ever
-/// set before the epoch.
-fn now_unix() -> u64 {
+/// set before the epoch. `pub(crate)` so `crate::enroll` can reuse it for
+/// its own `NODE_ANNOUNCE`/`NODE_ENROLLMENT` timestamps.
+pub(crate) fn now_unix() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0)
 }
 

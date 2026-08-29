@@ -9,6 +9,9 @@
 
 /// The engine loop tying relay + substrate + reconcile together.
 pub mod engine;
+/// Node enrollment: keypair bootstrap, keychain-backed secret storage,
+/// pairing code, and the owner-discovery handshake.
+pub mod enroll;
 /// Domain types: desired agents, observed states, actions, errors.
 pub mod model;
 /// The real Nostr `NodeRelay`: dial-out/NIP-42, assignment intake, publish.

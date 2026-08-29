@@ -158,23 +158,36 @@ pub async fn run(
 /// reconnected node restores its assigned agents from the relay instead of
 /// waiting on further live updates (spec §13 offline catch-up).
 ///
-/// KNOWN LIMITATION (tracked as a Phase 5 follow-up): this reconciles
-/// `current` against [`Substrate::observe`], which for the real
-/// `LocalProcessSubstrate` only knows about processes *this OS process*
-/// spawned — a fresh `LocalProcessSubstrate` (as constructed after a node
-/// restart) starts with an empty process table and does not discover
-/// pre-existing agent processes left running by a prior node process (node
-/// shutdown deliberately leaves agents running so they survive a node
-/// restart; see `crates/buzz-node/src/daemon.rs`). So on a real reboot where
-/// the previous agent process is still alive, this resync's `reconcile`
-/// sees that agent as `Absent` and emits a second `Start`, spawning a
-/// duplicate live instance until the orphaned original is separately
-/// reaped — a real dup-spawn hazard against invariant I4. Closing it needs
-/// `LocalProcessSubstrate` to discover pre-existing processes on startup
-/// (e.g. a per-agent PID file under its workspace dir, checked for liveness
-/// the way `crate::daemon::singleton::live_daemon_pid` already does for the
-/// node's own PID) — a substantive `Substrate`-level change, intentionally
-/// out of scope for this batch; see the Phase 5 batch A report.
+/// DUP-SPAWN-ON-RESTART (spec §13 I3/I4) IS CLOSED for the real substrate:
+/// this reconciles `current` against [`Substrate::observe`], and the real
+/// `LocalProcessSubstrate` now discovers pre-existing agent processes on
+/// construction rather than always starting from an empty table.
+/// `LocalProcessSubstrate::new` synchronously scans its workspace root for
+/// per-agent PID records left by a prior incarnation of this node process
+/// (node shutdown deliberately leaves agents running so they survive a node
+/// restart; see `crates/buzz-node/src/daemon.rs`), liveness-checks each one
+/// (unix `kill(pid, 0)`, mirroring how `crate::daemon::singleton::live_daemon_pid`
+/// already does this for the node's own PID), and ADOPTS still-alive ones —
+/// see `crate::substrate::LocalProcessSubstrate::adopt_existing`. So on a
+/// real reboot where the previous agent process is still alive,
+/// `observe()` already reports it `Running` before this resync's first
+/// `reconcile` call ever runs, which then correctly emits `Noop`, not a
+/// second `Start`; a genuinely-dead prior process is (correctly) restarted.
+/// See `crate::substrate::tests::adoption_discovers_a_still_running_process_after_a_simulated_restart`.
+///
+/// RESIDUAL, ACCEPTED LIMITATIONS (see `adopt_existing`'s own doc comment
+/// for more detail):
+/// - Pid reuse: adoption's only identity check is the bare pid (no
+///   corroborating start-time/command-line check), so an OS that recycles a
+///   pid during a long gap between an agent stopping and a much later
+///   restart could in principle be mis-adopted as an unrelated process.
+///   Accepted for v1 given this feature's target ("always-on boxes I own").
+/// - Windows liveness shells out to `tasklist` (no `unsafe` FFI allowed) and
+///   has no automated test here, unlike the unix path.
+/// - Assumes a single daemon per workspace root, same as today — the
+///   daemon's own PID/status singleton guard is what actually enforces
+///   that; adoption does not add an independent guard against two daemons
+///   somehow racing over the same root.
 ///
 /// A `query_desired` failure (e.g. a connection reset mid-backlog) does
 /// NOT propagate out of this function: every other relay-facing path in

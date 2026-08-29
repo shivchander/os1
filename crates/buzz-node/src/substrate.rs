@@ -57,6 +57,13 @@ const BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
 const STOP_GRACE: Duration = Duration::from_millis(500);
 /// Poll interval while waiting for a signaled process group to exit.
 const STOP_POLL: Duration = Duration::from_millis(20);
+/// File name of the per-agent PID record written on every successful
+/// [`Substrate::start`], under the same per-agent directory as
+/// [`workspace_dir`]. Contains nothing but a bare pid integer (mirrors
+/// `crate::daemon`'s own `daemon.pid`) — never a secret. Consulted by
+/// [`LocalProcessSubstrate::adopt_existing`] on the next construction (e.g.
+/// after a node/daemon restart) to re-find and adopt a still-running agent.
+const AGENT_PID_FILE: &str = "agent.pid";
 
 /// Per-agent crash-restart breaker state. All transitions go through
 /// [`Circuit::record_crash`] (called from `observe()` on each newly detected
@@ -123,6 +130,25 @@ enum AgentSlot {
         /// over-count crashes.
         reported_crash: bool,
     },
+    /// A process this substrate did NOT spawn itself but discovered, alive,
+    /// in a per-agent PID record left by a prior incarnation of this node
+    /// process (see [`LocalProcessSubstrate::adopt_existing`]) — closes the
+    /// dup-spawn-on-restart hazard (spec §13 I3/I4): `observe()` reports
+    /// this as `Running` from the very first call, so `reconcile` emits
+    /// `Noop` instead of a second `Start`. There is no [`Child`] handle to
+    /// `try_wait`/reap (this OS process never forked it), so liveness is
+    /// polled via [`pid_is_alive`] instead — see `observe()`.
+    Adopted {
+        pid: u32,
+        /// Same one-time-recording guard as `Live::reported_crash`, needed
+        /// here too: `pid_is_alive` is polled fresh on every `observe()`
+        /// call (there is no "already reaped" terminal state to fall back
+        /// on the way a real `Child`'s cached exit status provides), so
+        /// without this an agent that died once would re-feed the breaker
+        /// on every subsequent reconcile pass for as long as it stays
+        /// unreplaced.
+        reported_crash: bool,
+    },
     /// Intentionally stopped; persists until the next `start()` so the
     /// engine's post-action `observe()` can report the terminal status once
     /// (mirrors `FakeSubstrate::stop`, which leaves the same tombstone).
@@ -155,18 +181,122 @@ pub struct LocalProcessSubstrate {
 impl LocalProcessSubstrate {
     /// Build a substrate that spawns through `runtime`, passes `relay_url`
     /// to every spawned agent, and roots per-agent workspaces under `root`.
+    ///
+    /// Synchronously scans `root` for per-agent PID records left by a prior
+    /// incarnation of this process and adopts any still-alive ones (see
+    /// [`Self::adopt_existing`]) before returning — so the very first
+    /// `observe()` call already reports them, closing the
+    /// dup-spawn-on-restart hazard a fresh, always-empty table used to
+    /// cause (spec §13 I3/I4; see `crate::engine::full_resync`'s doc
+    /// comment).
     pub fn new(
         runtime: std::sync::Arc<dyn AgentRuntime>,
         relay_url: String,
         root: PathBuf,
     ) -> Self {
+        let table = Self::adopt_existing(&root);
         Self {
             runtime,
             relay_url,
             root,
-            table: std::sync::Mutex::new(BTreeMap::new()),
+            table: std::sync::Mutex::new(table),
             breaker: std::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Scan `<root>/agents/*/agent.pid` for PID records a prior incarnation
+    /// of this process left behind, adopting each still-alive one so this
+    /// substrate's very first `observe()` reports it `Running` (spec §13
+    /// I3/I4 — see the module-level doc comment on
+    /// `crate::engine::full_resync`).
+    ///
+    /// A record naming a pid nothing runs as (the agent genuinely didn't
+    /// survive, was already stopped, or the file is corrupt/unreadable) is
+    /// removed and NOT adopted — that agent is simply absent from the
+    /// returned table, exactly as it would be today, so `reconcile` spawns
+    /// it fresh.
+    ///
+    /// Best-effort and non-fatal throughout: a missing `agents` directory
+    /// (a brand-new node), an unreadable entry, or a malformed directory
+    /// name just skips that one entry (logged) rather than failing
+    /// construction — adoption exists to improve on the pre-adoption
+    /// baseline (an always-empty table), never to make startup less robust
+    /// than that baseline.
+    ///
+    /// SCOPE: liveness is checked via [`pid_is_alive`] (unix `kill(pid,
+    /// 0)`, with a Windows `tasklist` fallback) — no corroborating identity
+    /// check (e.g. process start time or command line) beyond the bare pid.
+    /// Accepted for v1 given this feature's target ("always-on boxes I
+    /// own", not short-lived/high-churn hosts where pid reuse between a
+    /// stop and a much-later restart is more likely); see
+    /// `crate::engine::full_resync`'s doc comment for the full limitations
+    /// list.
+    fn adopt_existing(root: &Path) -> BTreeMap<PublicKey, AgentSlot> {
+        let mut table = BTreeMap::new();
+        let agents_dir = root.join("agents");
+        let entries = match std::fs::read_dir(&agents_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %agents_dir.display(),
+                        "failed to scan agents dir for pid adoption; starting with no adopted agents"
+                    );
+                }
+                return table;
+            }
+        };
+
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                tracing::warn!(
+                    dir = ?entry.path(),
+                    "skipping non-UTF8 entry under agents dir during pid adoption"
+                );
+                continue;
+            };
+            let Ok(agent) = PublicKey::from_hex(name) else {
+                tracing::warn!(
+                    dir = name,
+                    "skipping non-agent entry under agents dir during pid adoption"
+                );
+                continue;
+            };
+            let pid_path = entry.path().join(AGENT_PID_FILE);
+            let recorded_pid = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            match recorded_pid {
+                Some(pid) if pid_is_alive(pid) => {
+                    tracing::info!(
+                        agent = %agent.to_hex(),
+                        pid,
+                        "adopted a still-running agent process from a previous run"
+                    );
+                    table.insert(
+                        agent,
+                        AgentSlot::Adopted {
+                            pid,
+                            reported_crash: false,
+                        },
+                    );
+                }
+                _ => {
+                    // Dead pid, unreadable/corrupt record, or none at all:
+                    // nothing to adopt. Clean up so a stale file can never
+                    // be misread by a later scan. Best-effort: a failed
+                    // removal just leaves this agent `Absent`, same as
+                    // today, not a new hazard.
+                    let _ = std::fs::remove_file(&pid_path);
+                }
+            }
+        }
+        table
     }
 
     /// Lock the process table, mapping mutex poisoning to a [`NodeError`]
@@ -215,6 +345,46 @@ impl LocalProcessSubstrate {
             .record_crash();
         Ok(())
     }
+
+    /// Persist `pid` as `agent`'s PID record (see [`AGENT_PID_FILE`]) so a
+    /// future [`Self::adopt_existing`] scan (e.g. after a node/daemon
+    /// restart) can re-find and adopt this process if it's still alive.
+    /// Best-effort: a write failure is only logged, never propagated — the
+    /// agent is already successfully spawned by the time this is called, so
+    /// failing to persist the adoption record must not be treated as a
+    /// start failure; it only means this particular agent won't be adopted
+    /// on a future restart (degrading to today's pre-adoption behavior for
+    /// that one agent, not a new hazard).
+    fn record_pid(&self, agent: &PublicKey, pid: u32) {
+        let path = pid_file_path(&self.root, agent);
+        if let Err(e) = std::fs::write(&path, pid.to_string()) {
+            tracing::warn!(
+                agent = %agent.to_hex(),
+                error = %e,
+                "failed to persist agent pid record; this agent will not be adopted on a future restart"
+            );
+        }
+    }
+
+    /// Remove `agent`'s PID record, if any. Called on every [`Self::stop`]
+    /// so a pid this substrate just intentionally terminated is never later
+    /// misread as still belonging to that agent if the OS recycles the pid
+    /// number before this agent is started again — shrinking (not
+    /// eliminating; see [`Self::adopt_existing`]'s doc comment) the
+    /// pid-reuse window. A missing file is not an error (never started, or
+    /// already cleared).
+    fn clear_pid_record(&self, agent: &PublicKey) {
+        let path = pid_file_path(&self.root, agent);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    agent = %agent.to_hex(),
+                    error = %e,
+                    "failed to clear agent pid record"
+                );
+            }
+        }
+    }
 }
 
 /// The persistent workspace directory for `agent` under a substrate rooted
@@ -222,6 +392,99 @@ impl LocalProcessSubstrate {
 pub fn workspace_dir(root: &Path, agent: &PublicKey) -> PathBuf {
     root.join("agents").join(agent.to_hex()).join("workspace")
 }
+
+/// The PID record path for `agent` under a substrate rooted at `root`:
+/// `<root>/agents/<agent-hex>/agent.pid` — a sibling of [`workspace_dir`]'s
+/// directory. See [`AGENT_PID_FILE`].
+fn pid_file_path(root: &Path, agent: &PublicKey) -> PathBuf {
+    root.join("agents")
+        .join(agent.to_hex())
+        .join(AGENT_PID_FILE)
+}
+
+/// True iff a process with pid `pid` currently exists (adoption's liveness
+/// check — see [`LocalProcessSubstrate::adopt_existing`]). Mirrors
+/// `crate::daemon::singleton::pid_is_alive`'s logic exactly; kept as an
+/// independent copy rather than a shared helper because that one lives in
+/// the `buzz-node` *binary* crate (for the daemon's own PID file) while this
+/// one lives in the *library* crate (for per-agent adoption) — the binary
+/// depends on the library, never the reverse, so a three-line platform check
+/// can't be shared across that boundary without a new module solely for it.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    // Signal 0: existence/permission check only -- no signal is delivered.
+    kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    // No unsafe FFI (`OpenProcess`) allowed here (`#![deny(unsafe_code)]`),
+    // so shell out exactly like `crate::daemon::singleton::pid_is_alive`'s
+    // Windows arm does.
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_is_alive(_pid: u32) -> bool {
+    // Can't verify liveness on this target; fail closed (assume alive) so
+    // adoption never mistakes a live agent for dead and double-spawns it —
+    // mirrors `crate::daemon::singleton::pid_is_alive`'s identical stance
+    // for the same reason.
+    true
+}
+
+/// Terminate the process group rooted at `pid` when there is no [`Child`]
+/// handle to poll/reap — i.e. an [`AgentSlot::Adopted`] process this
+/// substrate discovered rather than spawned itself. Signals exactly like
+/// [`kill_group`] (SIGTERM, a grace period, then SIGKILL), but polls
+/// [`pid_is_alive`] instead of `try_wait` since there is no local `Child` to
+/// ask. Never reaps: an adopted process was never actually this OS
+/// process's child (`wait`/`waitpid` only works on a real parent-child
+/// relationship) — whatever process it was reparented to (`init`/`launchd`,
+/// once the prior `buzz-node` incarnation that originally spawned it
+/// exited) owns that.
+#[cfg(unix)]
+async fn terminate_adopted(pid: u32) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+
+    let pgid = Pid::from_raw(pid as i32);
+    let _ = killpg(pgid, Signal::SIGTERM);
+    let deadline = Instant::now() + STOP_GRACE;
+    loop {
+        if !pid_is_alive(pid) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = killpg(pgid, Signal::SIGKILL);
+            break;
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
+/// Windows fallback: `taskkill /T /F` terminates the whole process tree
+/// rooted at `pid`, mirroring [`kill_group`]'s Windows arm minus the
+/// `Child` reap (see [`terminate_adopted`]'s doc comment for why there is
+/// none here).
+#[cfg(windows)]
+async fn terminate_adopted(pid: u32) {
+    let _ = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await;
+}
+
+/// Fallback for other targets: best-effort direct kill, keeping the crate
+/// compiling everywhere (mirrors [`kill_group`]'s equivalent fallback arm).
+#[cfg(not(any(unix, windows)))]
+async fn terminate_adopted(_pid: u32) {}
 
 #[async_trait]
 impl Substrate for LocalProcessSubstrate {
@@ -241,6 +504,26 @@ impl Substrate for LocalProcessSubstrate {
                     // (subject to the breaker, which was already fed at the
                     // point of failure in `record_start_failure`).
                     AgentSlot::Failed => Observed::Crashed { code: None },
+                    // No `Child` handle to `try_wait` -- poll OS-level
+                    // liveness directly instead. Guarded by the same
+                    // one-time `reported_crash` flag `Live` uses, since this
+                    // poll (unlike `try_wait`) has no "already reaped"
+                    // terminal state of its own to stop re-detecting the
+                    // same death on every subsequent `observe()` call.
+                    AgentSlot::Adopted {
+                        pid,
+                        reported_crash,
+                    } => {
+                        if pid_is_alive(*pid) {
+                            Observed::Running
+                        } else {
+                            if !*reported_crash {
+                                *reported_crash = true;
+                                crashed_now.push(*pk);
+                            }
+                            Observed::Crashed { code: None }
+                        }
+                    }
                     AgentSlot::Live {
                         child,
                         reported_crash,
@@ -302,6 +585,16 @@ impl Substrate for LocalProcessSubstrate {
         match self.runtime.spawn(desired, &ws, &self.relay_url).await {
             Ok(child) => {
                 let pid = child.id();
+                // Persist BEFORE tracking in-memory, so a future restart can
+                // adopt this process even if something after this point
+                // (there is nothing async left in this function, but keep
+                // the ordering robust to later refactors) never runs. Only a
+                // real pid is worth persisting; `Child::id()` returning
+                // `None` (already reaped) is already handled below exactly
+                // like today, without a pid record to leave behind.
+                if let Some(pid) = pid {
+                    self.record_pid(&desired.agent_pubkey, pid);
+                }
                 self.lock_table()?.insert(
                     desired.agent_pubkey,
                     AgentSlot::Live {
@@ -318,9 +611,15 @@ impl Substrate for LocalProcessSubstrate {
 
     async fn stop(&self, agent: &PublicKey) -> Result<(), NodeError> {
         let removed = self.lock_table()?.remove(agent);
-        if let Some(AgentSlot::Live { mut child, pid, .. }) = removed {
-            kill_group(pid, &mut child).await;
+        match removed {
+            Some(AgentSlot::Live { mut child, pid, .. }) => kill_group(pid, &mut child).await,
+            Some(AgentSlot::Adopted { pid, .. }) => terminate_adopted(pid).await,
+            Some(AgentSlot::Stopped) | Some(AgentSlot::Failed) | None => {}
         }
+        // Always clear, regardless of what (if anything) was removed above:
+        // an intentional stop must never leave a pid record behind for a
+        // future restart to misadopt if the OS later recycles that pid.
+        self.clear_pid_record(agent);
         self.lock_table()?.insert(*agent, AgentSlot::Stopped);
         Ok(())
     }
@@ -616,6 +915,172 @@ mod tests {
         sub.stop(&d.agent_pubkey).await.expect("stop");
         let obs = sub.observe().await;
         assert_eq!(obs.get(&d.agent_pubkey), Some(&Observed::Stopped));
+    }
+
+    #[tokio::test]
+    async fn start_persists_a_pid_record_and_stop_clears_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+        let pid_path = pid_file_path(dir.path(), &d.agent_pubkey);
+
+        sub.start(&d).await.expect("start");
+        let recorded: u32 = std::fs::read_to_string(&pid_path)
+            .expect("pid record written on start")
+            .trim()
+            .parse()
+            .expect("pid record holds a valid pid");
+        assert!(
+            pid_is_alive(recorded),
+            "recorded pid must be the live child"
+        );
+
+        sub.stop(&d.agent_pubkey).await.expect("stop");
+        assert!(
+            !pid_path.exists(),
+            "stop() must clear the pid record so a later restart can't misadopt a recycled pid"
+        );
+    }
+
+    // --- Process adoption across a simulated restart (spec §13 I3/I4) ---
+
+    /// Spawns `sleep 30` WITHOUT `kill_on_drop`, so the OS process survives
+    /// when the returned `Child` (and, transitively, the substrate/table
+    /// that owns it) is dropped. This models how a real agent process
+    /// survives THIS process's own exit today: `main.rs` calls
+    /// `std::process::exit`, which skips Rust destructors entirely, so
+    /// `AcpRuntime`'s `kill_on_drop(true)` "abnormal drop" safety net never
+    /// actually fires on a normal daemon shutdown (see its doc comment) —
+    /// the agent process is simply left running. Using `kill_on_drop(false)`
+    /// here reaches the same end state (a Rust-side handle drop that does
+    /// NOT touch the real OS process) without needing to exec a second real
+    /// OS process just for this test.
+    struct SurvivingSleepRuntime;
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for SurvivingSleepRuntime {
+        async fn spawn(
+            &self,
+            _desired: &DesiredAgent,
+            workspace: &std::path::Path,
+            _relay_url: &str,
+        ) -> Result<tokio::process::Child, NodeError> {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30"]).current_dir(workspace);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn()
+                .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
+        }
+        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+            Ok(())
+        }
+    }
+
+    /// The core property this batch closes: a still-running process from a
+    /// PRIOR incarnation of this substrate (over the same root dir) is
+    /// discovered and adopted by a FRESH `LocalProcessSubstrate::new()` —
+    /// so `observe()` reports it `Running`, and a subsequent `reconcile`
+    /// against that observation yields `Noop`, never a duplicate `Start`.
+    /// Also proves `stop()` can terminate an adopted process (no `Child`
+    /// handle) via `terminate_adopted`, cleaning up the real `sleep` this
+    /// test spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adoption_discovers_a_still_running_process_after_a_simulated_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+
+        let pid = {
+            // "Incarnation 1": spawn the agent, then drop the substrate --
+            // simulating this process exiting (via `std::process::exit`,
+            // which skips destructors) without ever calling `stop()`.
+            let sub = LocalProcessSubstrate::new(
+                std::sync::Arc::new(SurvivingSleepRuntime),
+                "wss://r".into(),
+                dir.path().into(),
+            );
+            sub.start(&d).await.expect("start");
+            let recorded: u32 = std::fs::read_to_string(pid_file_path(dir.path(), &d.agent_pubkey))
+                .expect("pid file written")
+                .trim()
+                .parse()
+                .expect("pid file holds a valid pid");
+            assert!(
+                pid_is_alive(recorded),
+                "sanity: the freshly spawned pid must be alive"
+            );
+            recorded
+            // `sub` (and its `AgentSlot::Live`'s `Child`, spawned with no
+            // `kill_on_drop`) drops here without touching the real process.
+        };
+
+        // "Incarnation 2": a fresh substrate over the SAME root dir, exactly
+        // as a restarted daemon would construct one.
+        let sub2 = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SurvivingSleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+        let observed = sub2.observe().await;
+        assert_eq!(
+            observed.get(&d.agent_pubkey),
+            Some(&Observed::Running),
+            "a still-alive process from a prior incarnation must be adopted as Running"
+        );
+
+        // The no-dup-spawn property itself: reconciling `d` (still desired
+        // Assigned) against this observation must NOT emit a Start/Restart
+        // for an agent that's already (adopted-)Running.
+        let actions = crate::reconcile::reconcile(std::slice::from_ref(&d), &observed);
+        assert_eq!(
+            actions,
+            vec![crate::model::Action::Noop(d.agent_pubkey)],
+            "an adopted, still-running agent must reconcile to Noop, never a duplicate spawn"
+        );
+
+        // Cleanup + a second property: stop() must actually be able to
+        // terminate an Adopted slot (no Child handle), not just a Live one.
+        sub2.stop(&d.agent_pubkey).await.expect("stop adopted");
+        assert!(
+            !pid_is_alive(pid),
+            "stop() must terminate an adopted process, not just forget it"
+        );
+    }
+
+    /// The complementary property: a PID record naming a pid nothing runs
+    /// as (the agent genuinely didn't survive) must NOT be adopted, and
+    /// must be cleaned up so it can never be misread by a later scan.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adoption_ignores_and_cleans_up_a_stale_dead_pid_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Keys::generate().public_key();
+        let pid_path = pid_file_path(dir.path(), &agent);
+        std::fs::create_dir_all(pid_path.parent().expect("has parent")).expect("create agent dir");
+        // A pid essentially guaranteed to name no live process (mirrors
+        // `daemon::singleton::tests`' identical stale-pid sentinel).
+        std::fs::write(&pid_path, "999999999").expect("write stale pid");
+
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+
+        assert!(
+            !sub.observe().await.contains_key(&agent),
+            "a dead pid record must not be adopted -- the agent stays Absent"
+        );
+        assert!(
+            !pid_path.exists(),
+            "a stale dead-pid record must be cleaned up during the adoption scan"
+        );
     }
 
     #[tokio::test]

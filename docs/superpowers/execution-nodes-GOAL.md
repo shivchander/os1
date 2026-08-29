@@ -31,11 +31,22 @@ committed piece will actually pass its tests.
 - [x] Plans written & committed (all 5 phase plans; contract-consistent)
 - [x] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` 276/276, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
-- [x] Phase 3 — real substrate + relay wiring + daemon (buzz-node builds; 65 tests/2 gated, clippy+fmt clean; Groups A/B reviewed, Group C accepted on verified-green + deferred to final review)
-- [ ] Phase 4 — desktop Nodes surface + Run-on picker + status (desktop gates green)
+- [~] Phase 3 — Groups A/B done+reviewed; Group C **Task 5 (daemon) done+Approved** BUT **Task 6 (gated e2e_node.rs) was never written — REOPENED**. Also 2 Phase-2-file gaps → Phase 5: presence not republished on cadence (product-blocking), shutdown doesn't stop agents. (I wrongly marked this complete earlier — corrected.)
+- [~] Phase 4 — G1 native Tauri commands (publish_node_enrollment / publish_agent_assignment) DONE + reviewed Approved + pushed; G2 (nodes store + Nodes panel) and G3 (Run-on picker + status) pending
 - [ ] Phase 5 — move/resilience + two-node e2e (unit green; e2e written, infra-gated)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (CORRECTION + Phase 4 G1 ✅): (a) I prematurely marked Phase 3 complete — the delayed
+  Group-C reviews + salvage report revealed **Task 6 (gated e2e_node.rs) was NEVER written** (Task 5
+  daemon IS done + Approved by both reviewers). Reopening Phase 3 to write Task 6 + a spawn_detached
+  unit test (Important review finding: the OS-interaction code has no test). LESSON: when accepting
+  on controller-verification, verify ALL deliverables exist, not just that present tests pass. (b) Two
+  real gaps in Phase-2 files (engine.rs/substrate.rs) → moved to PHASE 5: #3 presence NOT republished
+  on a cadence (engine emits kind:20001 only twice; relay TTL=180s → a healthy daemon appears OFFLINE
+  after 3min — TOP Phase-5 priority, product-blocking), #4 shutdown doesn't stop supervised agents
+  (restart after graceful stop → duplicate agents). (c) Phase 4 G1 (native Tauri node commands) DONE +
+  reviewed Approved (nsec encrypted-to-node verified vs real APIs; 5 offline tests + full desktop suite
+  3010 green) — pushed. → finishing Phase 3 Task 6, then Phase 4 G2/G3, then Phase 5.
 - 2026-08-29 (Phase 3 ✅ COMPLETE — 3 of 3 groups): Group C = `buzz-node` daemon binary (detached
   `up`, PID/status singleton guard, `autostart`, CLI) wiring enroll + NostrNodeRelay +
   LocalProcessSubstrate + AcpRuntime + engine::run, with graceful shutdown that AWAITS a final

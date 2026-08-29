@@ -37,9 +37,7 @@ pub fn reconcile(
         } else {
             match obs {
                 Observed::Starting | Observed::Running => Action::Stop(pk),
-                Observed::Absent | Observed::Stopped | Observed::Crashed { .. } => {
-                    Action::Noop(pk)
-                }
+                Observed::Absent | Observed::Stopped | Observed::Crashed { .. } => Action::Noop(pk),
             }
         };
         actions.push(action);
@@ -70,7 +68,10 @@ mod tests {
     fn assigned_absent_starts() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Assigned);
-        assert_eq!(reconcile(std::slice::from_ref(&d), &BTreeMap::new()), vec![start_of(&d)]);
+        assert_eq!(
+            reconcile(std::slice::from_ref(&d), &BTreeMap::new()),
+            vec![start_of(&d)]
+        );
     }
 
     #[test]
@@ -88,63 +89,90 @@ mod tests {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Assigned);
         let observed = obs(&[(&a, Observed::Crashed { code: Some(1) })]);
-        assert_eq!(reconcile(std::slice::from_ref(&d), &observed), vec![restart_of(&d)]);
+        assert_eq!(
+            reconcile(std::slice::from_ref(&d), &observed),
+            vec![restart_of(&d)]
+        );
     }
 
     #[test]
     fn assigned_running_noops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Assigned);
-        assert_eq!(reconcile(&[d], &obs(&[(&a, Observed::Running)])), vec![Action::Noop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &obs(&[(&a, Observed::Running)])),
+            vec![Action::Noop(a.public_key())]
+        );
     }
 
     #[test]
     fn assigned_starting_noops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Assigned);
-        assert_eq!(reconcile(&[d], &obs(&[(&a, Observed::Starting)])), vec![Action::Noop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &obs(&[(&a, Observed::Starting)])),
+            vec![Action::Noop(a.public_key())]
+        );
     }
 
     #[test]
     fn unassigned_running_stops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Unassigned);
-        assert_eq!(reconcile(&[d], &obs(&[(&a, Observed::Running)])), vec![Action::Stop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &obs(&[(&a, Observed::Running)])),
+            vec![Action::Stop(a.public_key())]
+        );
     }
 
     #[test]
     fn unassigned_starting_stops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Unassigned);
-        assert_eq!(reconcile(&[d], &obs(&[(&a, Observed::Starting)])), vec![Action::Stop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &obs(&[(&a, Observed::Starting)])),
+            vec![Action::Stop(a.public_key())]
+        );
     }
 
     #[test]
     fn unassigned_absent_noops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Unassigned);
-        assert_eq!(reconcile(&[d], &BTreeMap::new()), vec![Action::Noop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &BTreeMap::new()),
+            vec![Action::Noop(a.public_key())]
+        );
     }
 
     #[test]
     fn unassigned_stopped_noops() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, Unassigned);
-        assert_eq!(reconcile(&[d], &obs(&[(&a, Observed::Stopped)])), vec![Action::Noop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[d], &obs(&[(&a, Observed::Stopped)])),
+            vec![Action::Noop(a.public_key())]
+        );
     }
 
     #[test]
     fn not_desired_running_stops() {
         // Agent running on the substrate but no longer in the desired set (moved away).
         let a = Keys::generate();
-        assert_eq!(reconcile(&[], &obs(&[(&a, Observed::Running)])), vec![Action::Stop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[], &obs(&[(&a, Observed::Running)])),
+            vec![Action::Stop(a.public_key())]
+        );
     }
 
     #[test]
     fn not_desired_crashed_noops() {
         let a = Keys::generate();
         let observed = obs(&[(&a, Observed::Crashed { code: None })]);
-        assert_eq!(reconcile(&[], &observed), vec![Action::Noop(a.public_key())]);
+        assert_eq!(
+            reconcile(&[], &observed),
+            vec![Action::Noop(a.public_key())]
+        );
     }
 
     #[test]

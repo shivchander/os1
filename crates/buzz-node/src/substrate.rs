@@ -59,7 +59,10 @@ impl Substrate for FakeSubstrate {
     }
     async fn stop(&self, agent: &PublicKey) -> Result<(), NodeError> {
         self.stops.lock().expect("lock").push(*agent);
-        self.inner.lock().expect("lock").insert(*agent, Observed::Stopped);
+        self.inner
+            .lock()
+            .expect("lock")
+            .insert(*agent, Observed::Stopped);
         Ok(())
     }
 }
@@ -77,9 +80,15 @@ mod tests {
         assert!(s.observe().await.is_empty());
         let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
         s.start(&d).await.unwrap();
-        assert_eq!(s.observe().await.get(&a.public_key()), Some(&Observed::Running));
+        assert_eq!(
+            s.observe().await.get(&a.public_key()),
+            Some(&Observed::Running)
+        );
         s.stop(&a.public_key()).await.unwrap();
-        assert_eq!(s.observe().await.get(&a.public_key()), Some(&Observed::Stopped));
+        assert_eq!(
+            s.observe().await.get(&a.public_key()),
+            Some(&Observed::Stopped)
+        );
         assert_eq!(*s.starts.lock().unwrap(), vec![a.public_key()]);
         assert_eq!(*s.stops.lock().unwrap(), vec![a.public_key()]);
     }
@@ -89,6 +98,9 @@ mod tests {
         let a = Keys::generate();
         let s = FakeSubstrate::new();
         s.set(a.public_key(), Observed::Crashed { code: Some(2) });
-        assert_eq!(s.observe().await.get(&a.public_key()), Some(&Observed::Crashed { code: Some(2) }));
+        assert_eq!(
+            s.observe().await.get(&a.public_key()),
+            Some(&Observed::Crashed { code: Some(2) })
+        );
     }
 }

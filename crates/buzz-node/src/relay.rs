@@ -56,7 +56,10 @@ impl FakeRelay {
             presence: Log::default(),
         };
         (
-            Self { script: script.into(), handle: handle.clone() },
+            Self {
+                script: script.into(),
+                handle: handle.clone(),
+            },
             handle,
         )
     }
@@ -69,11 +72,19 @@ impl NodeRelay for FakeRelay {
         self.script.pop_front()
     }
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError> {
-        self.handle.statuses.lock().expect("lock").push(status.clone());
+        self.handle
+            .statuses
+            .lock()
+            .expect("lock")
+            .push(status.clone());
         Ok(())
     }
     async fn publish_announce(&self, caps: &NodeCapabilities) -> Result<(), NodeError> {
-        self.handle.announces.lock().expect("lock").push(caps.clone());
+        self.handle
+            .announces
+            .lock()
+            .expect("lock")
+            .push(caps.clone());
         Ok(())
     }
     async fn publish_presence(&self, online: bool) -> Result<(), NodeError> {

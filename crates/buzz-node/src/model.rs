@@ -100,7 +100,11 @@ pub(crate) fn fake_desired(
         env_vars: BTreeMap::new(),
         reap_after_idle_seconds: None,
     };
-    DesiredAgent { agent_pubkey: agent.public_key(), secret, state }
+    DesiredAgent {
+        agent_pubkey: agent.public_key(),
+        secret,
+        state,
+    }
 }
 
 #[cfg(test)]

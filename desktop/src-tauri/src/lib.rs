@@ -685,6 +685,7 @@ pub fn run() {
             resolve_oa_owner,
             list_relay_agents,
             revalidate_relay_agents,
+            publish_node_enrollment,
             list_managed_agents,
             list_managed_agent_runtimes,
             start_managed_agent_runtime,

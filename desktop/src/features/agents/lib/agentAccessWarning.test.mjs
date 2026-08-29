@@ -1,11 +1,33 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 
+import { ingestNodeEvent, resetNodesStore } from "@/shared/api/nodesStore";
+import { KIND_AGENT_ASSIGNMENT } from "@/shared/constants/kinds";
 import {
   agentAccessWarningText,
   runLocationForBackend,
   runLocationForRunOn,
 } from "./agentAccessWarning.ts";
+
+beforeEach(() => {
+  resetNodesStore();
+});
+
+function assign(agentPubkey, state = "assigned") {
+  ingestNodeEvent({
+    id: `assign-${agentPubkey}-${state}`,
+    kind: KIND_AGENT_ASSIGNMENT,
+    pubkey: "owner1",
+    created_at: 1,
+    tags: [
+      ["d", agentPubkey],
+      ["node", "node1"],
+      ["state", state],
+    ],
+    sig: "sig",
+    content: "encrypted-marker",
+  });
+}
 
 test("only the modes that share access warn", () => {
   assert.equal(agentAccessWarningText("owner-only", "local"), null);
@@ -66,13 +88,41 @@ test("every variant leads with the audience and stays jargon-free", () => {
 });
 
 test("runLocationForBackend maps the backend union", () => {
-  assert.equal(runLocationForBackend({ type: "local" }), "local");
   assert.equal(
-    runLocationForBackend({ type: "provider", id: "blox", config: {} }),
+    runLocationForBackend({ pubkey: "a1", backend: { type: "local" } }),
+    "local",
+  );
+  assert.equal(
+    runLocationForBackend({
+      pubkey: "a1",
+      backend: { type: "provider", id: "blox", config: {} },
+    }),
     "remote",
   );
   assert.equal(runLocationForBackend(null), null);
   assert.equal(runLocationForBackend(undefined), null);
+});
+
+// Phase 4 fix-round-1 Important finding: a node-hosted agent persists as
+// backend:{type:"local"} (see instanceInputForDefinition.ts's "node"
+// BackendIntent branch), so `backend.type` alone always read it as "local" —
+// understating the respond-to warning ("access YOUR COMPUTER") for an agent
+// whose key and process actually live on a separate execution node.
+test("a node-hosted agent (backend:local + an active assignment) resolves as remote", () => {
+  assign("a1", "assigned");
+  assert.equal(
+    runLocationForBackend({ pubkey: "a1", backend: { type: "local" } }),
+    "remote",
+  );
+});
+
+test("an unassigned agent with backend:local still resolves as local", () => {
+  assign("a1", "assigned");
+  assign("a1", "unassigned");
+  assert.equal(
+    runLocationForBackend({ pubkey: "a1", backend: { type: "local" } }),
+    "local",
+  );
 });
 
 test("runLocationForRunOn treats a provider id as remote", () => {

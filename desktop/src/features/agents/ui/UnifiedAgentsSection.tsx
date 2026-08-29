@@ -7,11 +7,18 @@ import {
 } from "@/features/agents/lib/agentCardAvatar";
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  isManagedAgentActive,
+  isNodeHostedAgent,
+} from "@/features/agents/lib/managedAgentControlActions";
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
-import { ensureNodesRelaySubscription } from "@/shared/api/nodesStore";
+import {
+  ensureNodesRelaySubscription,
+  getNodesSnapshot,
+  subscribeNodes,
+} from "@/shared/api/nodesStore";
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
@@ -61,6 +68,18 @@ type UnifiedAgentsSectionProps = {
   onDeactivatePersona: (persona: AgentPersona) => void;
   onDeletePersona: (persona: AgentPersona) => void;
 };
+
+/**
+ * Explains why the avatar's local Start/Restart is disabled for a node-hosted
+ * agent (see `managedAgentControlActions.ts`'s `isNodeHostedAgent` — the
+ * target node, not this desktop, owns that process's lifetime). `null` for
+ * every other agent, which is the common case today.
+ */
+function localStartDisabledReason(agent: ManagedAgent): string | null {
+  return isNodeHostedAgent(agent)
+    ? "This agent runs on an execution node — use its Start/Stop/Move controls (below) to manage it."
+    : null;
+}
 
 const AGENT_CARD_COLUMN_CLASS = "w-full";
 export const AGENT_CARD_GRID_COLUMNS_CLASS =
@@ -272,6 +291,9 @@ function AgentPersonaCard({
   onStartAgent: (pubkey: string) => void;
   onStartPersona: (persona: AgentPersona) => void;
 }) {
+  // Re-render when nodesStore changes (assignment state, in particular) —
+  // isNodeHostedAgent below is a plain read with no reactivity of its own.
+  React.useSyncExternalStore(subscribeNodes, getNodesSnapshot);
   const title = persona.displayName;
   const modelLabel = resolveAgentCardModelLabel({
     agent,
@@ -300,6 +322,7 @@ function AgentPersonaCard({
           <AgentRuntimeAvatarControl
             activeTestId={`agent-runtime-active-${agent.pubkey}`}
             avatarUrl={avatarUrl}
+            disabledReason={localStartDisabledReason(agent)}
             errorLabel={friendlyError}
             errorTestId={`agent-runtime-error-${agent.pubkey}`}
             isActive={isActive}
@@ -382,6 +405,9 @@ function StandaloneAgentCard({
   onRestartAgent: (pubkey: string) => void;
   onStartAgent: (pubkey: string) => void;
 }) {
+  // Re-render when nodesStore changes (assignment state, in particular) —
+  // isNodeHostedAgent below is a plain read with no reactivity of its own.
+  React.useSyncExternalStore(subscribeNodes, getNodesSnapshot);
   const title = agent.name;
   const profileQuery = useUserProfileQuery(agent.pubkey);
   const friendlyError = friendlyAgentLastError(
@@ -399,6 +425,7 @@ function StandaloneAgentCard({
         <AgentRuntimeAvatarControl
           activeTestId={`agent-runtime-active-${agent.pubkey}`}
           avatarUrl={profileQuery.data?.avatarUrl}
+          disabledReason={localStartDisabledReason(agent)}
           errorLabel={friendlyError}
           errorTestId={`agent-runtime-error-${agent.pubkey}`}
           isActive={isActive}

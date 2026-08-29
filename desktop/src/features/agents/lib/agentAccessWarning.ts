@@ -1,4 +1,5 @@
-import type { ManagedAgentBackend, RespondToMode } from "@/shared/api/types";
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
+import type { ManagedAgent, RespondToMode } from "@/shared/api/types";
 
 /**
  * Where an agent's process runs, as far as the calling surface can tell.
@@ -11,12 +12,26 @@ import type { ManagedAgentBackend, RespondToMode } from "@/shared/api/types";
  */
 export type AgentRunLocation = "local" | "remote";
 
-/** Resolve a running agent's backend record. `null` when the backend is unknown. */
+/**
+ * Resolve a running agent's actual run location. `null` when the agent is
+ * unknown.
+ *
+ * Checks node-hosting FIRST: a node-hosted agent persists as
+ * `backend:{type:"local"}` (see `instanceInputForDefinition.ts`'s `"node"`
+ * `BackendIntent` branch) — its process and key live on the assigned
+ * execution node, a machine the owner doesn't necessarily own the way "your
+ * computer" implies, so `backend.type` alone would wrongly report "local"
+ * and understate the respond-to warning's disclosure (Phase 4 fix-round-1
+ * Important finding).
+ */
 export function runLocationForBackend(
-  backend: ManagedAgentBackend | null | undefined,
+  agent: Pick<ManagedAgent, "pubkey" | "backend"> | null | undefined,
 ): AgentRunLocation | null {
-  if (!backend) return null;
-  return backend.type === "local" ? "local" : "remote";
+  if (!agent?.backend) return null;
+  if (agent.backend.type === "local" && isAgentNodeHosted(agent.pubkey)) {
+    return "remote";
+  }
+  return agent.backend.type === "local" ? "local" : "remote";
 }
 
 /**
@@ -39,11 +54,13 @@ export function runLocationForRunOn(
  * the owner, so both warn; only the audience phrase differs.
  *
  * An unknown run location falls back to the same "your computer" wording as
- * `local` rather than hedging with "computer or server". A remote host is only
- * reachable when a `buzz-backend-*` provider binary is installed — without one
- * `WhereToRunSection`'s "Run on" selector never renders and every agent is
- * local — so hedging would name a concept most owners have never been shown.
- * When it *is* remote the owner picked that host from the selector
+ * `local` rather than hedging with "computer or server". A remote host is
+ * only reachable when a `buzz-backend-*` provider binary is installed or an
+ * execution node is enrolled+online — without either, `WhereToRunSection`'s
+ * "Run on" selector never renders and every agent is local — so hedging
+ * would name a concept most owners have never been shown. When it *is*
+ * remote the owner picked that host from the selector (provider) or it was
+ * assigned to a node (`runLocationForBackend`'s `isAgentNodeHosted` check)
  * deliberately, so naming a server is meaningful there.
  */
 export function agentAccessWarningText(

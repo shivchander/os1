@@ -80,7 +80,7 @@ export function EditRespondToDialog({
           onAllowlistChange={setRespondToAllowlist}
           onModeChange={setRespondTo}
           ownerPubkey={currentPubkey}
-          runLocation={runLocationForBackend(agent?.backend)}
+          runLocation={runLocationForBackend(agent)}
         />
         {updateMutation.error instanceof Error ? (
           <p className="text-sm text-destructive">

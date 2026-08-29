@@ -6,8 +6,9 @@ import {
   useStopManagedAgentMutation,
 } from "@/features/agents/hooks";
 import {
-  respawnManagedAgentWithRules,
   isManagedAgentActive,
+  isNodeHostedAgent,
+  respawnManagedAgentWithRules,
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
@@ -155,6 +156,17 @@ export function useMembersSidebarActions({
       // agent-wide deploy/!shutdown flow below.
       if (agent.backend.type === "local" && relayUrl) {
         const action = managedAgentPairAction(runtime);
+        // This pair-scoped path calls the local start/stop Tauri commands
+        // directly (via runtimeActionMutation), bypassing
+        // startManagedAgentWithRules/respawnManagedAgentWithRules's own
+        // node-hosted gate — so it needs its own. Stop is exempt: it can
+        // only ever reduce a double-run, never cause one.
+        if (action !== "stop" && isNodeHostedAgent(agent)) {
+          throw new Error(
+            `${agent.name} runs on an execution node — use its ` +
+              "Start/Stop/Move controls (not this local control) to manage it.",
+          );
+        }
         await runtimeActionMutation.mutateAsync({
           action,
           pubkey: agent.pubkey,

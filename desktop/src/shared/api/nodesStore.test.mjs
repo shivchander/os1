@@ -3,15 +3,18 @@ import { beforeEach, describe, it, mock } from "node:test";
 
 import { relayClient } from "@/shared/api/relayClient";
 import {
+  KIND_AGENT_ASSIGNMENT,
   KIND_AGENT_NODE_STATUS,
   KIND_NODE_ANNOUNCE,
   KIND_PRESENCE_UPDATE,
 } from "@/shared/constants/kinds";
 import {
   ensureNodesRelaySubscription,
+  getAgentAssignment,
   getAgentStatus,
   getNodesSnapshot,
   ingestNodeEvent,
+  isAgentNodeHosted,
   resetNodesStore,
   subscribeNodes,
 } from "./nodesStore.ts";
@@ -66,6 +69,30 @@ function statusEvent(overrides = {}) {
       reason: overrides.reason,
       updated_at: "2026-08-29T00:00:00Z",
     }),
+  };
+}
+
+function assignmentEvent(overrides = {}) {
+  const agentPubkey = overrides.agentPubkey ?? "a1";
+  const nodePubkey = overrides.nodePubkey ?? "n1";
+  const state = overrides.state ?? "assigned";
+  return {
+    id: overrides.id ?? `assignment-${agentPubkey}-${state}`,
+    kind: KIND_AGENT_ASSIGNMENT,
+    // Owner-authored, not node- or agent-authored — see
+    // crates/buzz-core/src/assignment.rs's build_assignment.
+    pubkey: overrides.ownerPubkey ?? "owner1",
+    created_at: overrides.createdAt ?? 4,
+    tags: [
+      ["d", agentPubkey],
+      ["node", nodePubkey],
+      ["state", state],
+    ],
+    sig: "sig",
+    // Real content is NIP-44-encrypted to the node; this store never
+    // decrypts it (see parseAgentAssignmentTags's doc comment) — a marker
+    // string is enough to prove content is never inspected.
+    content: "encrypted-marker",
   };
 }
 
@@ -209,6 +236,81 @@ describe("nodesStore", () => {
     // proves presence state was actually cleared, not just the node map.
     ingestNodeEvent(announceEvent({ nodePubkey: "n1" }));
     assert.equal(getNodesSnapshot()[0].online, false);
+  });
+
+  // ── AGENT_ASSIGNMENT: the desired-state signal that gates local-only ──────
+  // lifecycle controls (isAgentNodeHosted). See the Phase-4 fix-round-1
+  // review: nodesStore.getAgentStatus() alone is empty in the window between
+  // publishing an assignment and the node's first AGENT_NODE_STATUS, which
+  // would leave local Start/Restart live during exactly the gap that
+  // matters. getAgentAssignment/isAgentNodeHosted read the OWNER's own
+  // desired-state record instead, which is set the instant the assignment
+  // publishes.
+
+  it("projects an assigned AGENT_ASSIGNMENT into isAgentNodeHosted", () => {
+    ingestNodeEvent(
+      assignmentEvent({
+        agentPubkey: "a1",
+        nodePubkey: "n1",
+        state: "assigned",
+      }),
+    );
+    assert.deepEqual(getAgentAssignment("a1"), {
+      agentPubkey: "a1",
+      nodePubkey: "n1",
+      state: "assigned",
+    });
+    assert.equal(isAgentNodeHosted("a1"), true);
+  });
+
+  it("an unassigned state is not node-hosted", () => {
+    ingestNodeEvent(
+      assignmentEvent({
+        agentPubkey: "a1",
+        nodePubkey: "n1",
+        state: "assigned",
+      }),
+    );
+    assert.equal(isAgentNodeHosted("a1"), true);
+    ingestNodeEvent(
+      assignmentEvent({
+        agentPubkey: "a1",
+        nodePubkey: "n1",
+        state: "unassigned",
+      }),
+    );
+    assert.equal(isAgentNodeHosted("a1"), false);
+    assert.equal(getAgentAssignment("a1").state, "unassigned");
+  });
+
+  it("an agent with no assignment history is not node-hosted", () => {
+    assert.equal(getAgentAssignment("never-assigned"), undefined);
+    assert.equal(isAgentNodeHosted("never-assigned"), false);
+  });
+
+  it("never reads AGENT_ASSIGNMENT.content — only the public d/node/state tags", () => {
+    // assignmentEvent()'s content is an opaque marker string, not valid JSON
+    // for any known schema. If ingestion tried to parse/decrypt it, this
+    // would throw or silently drop the record; it must do neither.
+    assert.doesNotThrow(() => {
+      ingestNodeEvent(assignmentEvent({ agentPubkey: "a1" }));
+    });
+    assert.equal(isAgentNodeHosted("a1"), true);
+  });
+
+  it("drops an AGENT_ASSIGNMENT missing a required public tag", () => {
+    const missingState = assignmentEvent({ agentPubkey: "a1" });
+    missingState.tags = missingState.tags.filter((tag) => tag[0] !== "state");
+    ingestNodeEvent(missingState);
+    assert.equal(getAgentAssignment("a1"), undefined);
+  });
+
+  it("reset also clears assignment desired-state", () => {
+    ingestNodeEvent(assignmentEvent({ agentPubkey: "a1", state: "assigned" }));
+    assert.equal(isAgentNodeHosted("a1"), true);
+    resetNodesStore();
+    assert.equal(getAgentAssignment("a1"), undefined);
+    assert.equal(isAgentNodeHosted("a1"), false);
   });
 
   it(

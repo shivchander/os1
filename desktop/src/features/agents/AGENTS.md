@@ -169,16 +169,28 @@ with a TypeScript lookup table or an id comparison in a component.
    `buzz-backend-*` provider or an enrolled, online execution node (Phase 4 —
    `nodesStore.getNodesSnapshot()`); without either, `WhereToRunSection` never
    renders, so "server" would name a concept the owner has never been shown;
-   when it *is* remote they picked that host from the selector themselves. A
-   `node:<pubkey>` `runOn` value resolves as `remote` through both resolvers,
-   same as a provider id — `resolveBackendIntent` returns a distinct
-   `{type:"node", nodePubkey}` `BackendIntent`, and
-   `buildInstanceInputForDefinition`'s node branch keeps
-   `backend:{type:"local"}` (a normal local identity) but forces
-   `spawnAfterCreate:false`: the target node starts the process via the
+   when it *is* remote they picked that host from the selector themselves.
+   **A node-hosted agent's two resolvers reach "remote" via two DIFFERENT
+   signals, not the same one — do not conflate them.** At create time,
+   `runLocationForRunOn` reads the draft's `runOn` string directly: a
+   `node:<pubkey>` value resolves as `remote`, same as a provider id. But a
+   node-hosted `ManagedAgent` record persists as plain `backend:{type:"local"}`
+   forever after (`instanceInputForDefinition.ts`'s `"node"` `BackendIntent`
+   branch keeps it a normal local identity — `spawnAfterCreate:false` is the
+   only thing that differs, so the target node starts the process via the
    `AGENT_ASSIGNMENT` the create flow publishes right after creation
-   (`publishNodeAssignmentForCreatedAgent.ts`), never this desktop. Never
-   synthesize a run location a surface doesn't have. Don't
+   (`publishNodeAssignmentForCreatedAgent.ts`), never this desktop) — the
+   `runOn` value that produced it is never stored anywhere on the record.
+   So for every *instance* surface (`runLocationForBackend`, used by
+   `AgentDialog` instance-edit and `EditRespondToDialog`), `backend.type`
+   alone is permanently "local" and cannot tell a node-hosted agent from a
+   genuine one; `runLocationForBackend` must check
+   `nodesStore.isAgentNodeHosted(agent.pubkey)` FIRST and only fall back to
+   `backend.type` when that's false (Phase 4 fix-round-1 Important finding:
+   the un-gated version silently told a node-hosted agent's owner that a
+   shared-access agent could reach "your computer", when the key and process
+   actually live on a separate machine). Never synthesize a run location a
+   surface doesn't have. Don't
    expose `respond-to`, `allowlist`, Nostr, or harness jargon in primary UI
    copy. **The owner-only-access build capability is backend-independent.** When
    `getAgentAccessOwnerOnly()` is true, every managed agent's access control is

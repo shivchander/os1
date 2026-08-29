@@ -60,6 +60,7 @@ function agent(overrides = {}) {
     lastErrorCode: null,
     needsRestart: false,
     personaOrphaned: false,
+    backend: { type: "local" },
     ...overrides,
   };
 }

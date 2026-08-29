@@ -14,6 +14,15 @@ import { IdentityInitialsAvatar } from "./IdentityInitialsAvatar";
 type AgentRuntimeAvatarControlProps = {
   activeTestId: string;
   avatarUrl?: string | null;
+  /**
+   * When set, disables the Start/Restart action and explains why (e.g. "This
+   * agent runs on an execution node..."). Does not affect the already-running
+   * dot or the error badge — only the actionable spawn button, since viewing
+   * a stale error is harmless and stopping is never gated here (see
+   * `managedAgentControlActions.ts`'s `isNodeHostedAgent`: only local *start*
+   * risks a second, competing process under the same identity).
+   */
+  disabledReason?: string | null;
   errorLabel?: string | null;
   errorTestId?: string;
   isActive: boolean;
@@ -128,6 +137,7 @@ const MASK_TRANSITION = {
 export function AgentRuntimeAvatarControl({
   activeTestId,
   avatarUrl,
+  disabledReason,
   errorLabel,
   errorTestId,
   isActive,
@@ -153,6 +163,7 @@ export function AgentRuntimeAvatarControl({
   const isPending = isStarting || isRestarting;
   const showRunningDot = isActive && !isRestartAction;
   const hasError = !isActive && !isPending && Boolean(errorLabel);
+  const isDisabledByPolicy = !hasError && Boolean(disabledReason);
   const errorActionLabel = `${label} has a runtime error. Open runtime details.`;
   const transition = shouldReduceMotion ? { duration: 0 } : MASK_TRANSITION;
   const actionBadge = isRestartAction
@@ -190,16 +201,25 @@ export function AgentRuntimeAvatarControl({
                     : "bg-primary text-primary-foreground hover:bg-primary/90",
               )}
               data-testid={hasError ? errorTestId : startTestId}
-              disabled={isPending}
+              disabled={isPending || isDisabledByPolicy}
               onClick={(event) => {
                 event.stopPropagation();
                 if (hasError) {
                   onOpenError?.();
                   return;
                 }
+                if (isDisabledByPolicy) {
+                  return;
+                }
                 onStart();
               }}
-              title={hasError ? errorLabel || errorActionLabel : actionLabel}
+              title={
+                hasError
+                  ? errorLabel || errorActionLabel
+                  : isDisabledByPolicy
+                    ? (disabledReason ?? actionLabel)
+                    : actionLabel
+              }
               type="button"
             >
               {isPending ? (

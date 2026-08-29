@@ -1,10 +1,29 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach } from "node:test";
 
+import { ingestNodeEvent, resetNodesStore } from "@/shared/api/nodesStore";
+import { KIND_AGENT_ASSIGNMENT } from "@/shared/constants/kinds";
 import {
+  isNodeHostedAgent,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
+
+function assign(agentPubkey, state = "assigned") {
+  ingestNodeEvent({
+    id: `assign-${agentPubkey}-${state}`,
+    kind: KIND_AGENT_ASSIGNMENT,
+    pubkey: "owner1",
+    created_at: 1,
+    tags: [
+      ["d", agentPubkey],
+      ["node", "node1"],
+      ["state", state],
+    ],
+    sig: "sig",
+    content: "encrypted-marker",
+  });
+}
 
 function agent(overrides = {}) {
   return {
@@ -40,6 +59,84 @@ function agent(overrides = {}) {
     ...overrides,
   };
 }
+
+beforeEach(() => {
+  resetNodesStore();
+});
+
+// ── isNodeHostedAgent / node-hosted refusal (Phase 4 fix-round-1 Critical) ──
+//
+// Root cause: a node-hosted agent persists as backend:{type:"local"} —
+// indistinguishable from a genuine local agent unless callers explicitly
+// check nodesStore's owner-side AGENT_ASSIGNMENT desired state. These pin
+// that startManagedAgentWithRules/respawnManagedAgentWithRules refuse before
+// ever calling the local start/stop Tauri commands, so every UI surface that
+// goes through them (avatar Start/Restart, profile panel primary action,
+// bulk respawn, the sidebar's non-pair-scoped fallback) is covered for free.
+
+test("isNodeHostedAgent is true only for a local-backend agent with an active assignment", () => {
+  const localAgent = agent();
+  assert.equal(isNodeHostedAgent(localAgent), false);
+  assign(localAgent.pubkey, "assigned");
+  assert.equal(isNodeHostedAgent(localAgent), true);
+
+  // A provider-backend agent is never locally spawned in the first place —
+  // an assignment record existing for its pubkey (shouldn't happen, but
+  // defense-in-depth) must not make it "node-hosted".
+  const providerAgent = agent({
+    pubkey: "cafef00d".repeat(8),
+    backend: { type: "provider", id: "blox", config: {} },
+  });
+  assign(providerAgent.pubkey, "assigned");
+  assert.equal(isNodeHostedAgent(providerAgent), false);
+});
+
+test("unassigning clears the node-hosted gate", () => {
+  const localAgent = agent();
+  assign(localAgent.pubkey, "assigned");
+  assert.equal(isNodeHostedAgent(localAgent), true);
+  assign(localAgent.pubkey, "unassigned");
+  assert.equal(isNodeHostedAgent(localAgent), false);
+});
+
+test("startManagedAgentWithRules refuses a node-hosted agent without touching the local start command", async () => {
+  const hostedAgent = agent();
+  assign(hostedAgent.pubkey, "assigned");
+  let called = false;
+
+  await assert.rejects(
+    startManagedAgentWithRules({
+      agent: hostedAgent,
+      startManagedAgent: async () => {
+        called = true;
+      },
+    }),
+    /runs on an execution node/,
+  );
+  assert.equal(called, false, "the local start command must never fire");
+});
+
+test("respawnManagedAgentWithRules refuses a node-hosted agent before stopping or starting", async () => {
+  const hostedAgent = agent({ status: "running" });
+  assign(hostedAgent.pubkey, "assigned");
+  let stopCalled = false;
+  let startCalled = false;
+
+  await assert.rejects(
+    respawnManagedAgentWithRules({
+      agent: hostedAgent,
+      stopManagedAgent: async () => {
+        stopCalled = true;
+      },
+      startManagedAgent: async () => {
+        startCalled = true;
+      },
+    }),
+    /runs on an execution node/,
+  );
+  assert.equal(stopCalled, false);
+  assert.equal(startCalled, false);
+});
 
 test("relay-mesh agents delegate start to the backend preflight", async () => {
   const meshAgent = agent({

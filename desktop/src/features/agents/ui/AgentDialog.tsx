@@ -100,7 +100,7 @@ export function AgentDialog(props: AgentDialogProps) {
       // A running instance knows its own backend, so the respond-to warning can
       // name the machine it will actually run on.
       <AgentRunLocationProvider
-        runLocation={runLocationForBackend(props.agent.backend)}
+        runLocation={runLocationForBackend(props.agent)}
       >
         <AgentInstanceEditDialog
           agent={props.agent}

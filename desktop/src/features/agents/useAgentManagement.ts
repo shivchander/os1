@@ -217,11 +217,27 @@ export function useAgentManagement() {
           ),
         );
         if (created.spawnError) throw new Error(created.spawnError);
-        await publishNodeAssignmentForCreatedAgent(
-          backendIntent,
-          created.agent,
-          identityQuery.data?.pubkey,
-        );
+        // Soft-fail, don't rethrow: the persona AND the managed-agent record
+        // already exist by this point (createPersonaMutation +
+        // createAgentMutation both resolved). Letting this throw into the
+        // outer catch would report "Could not save this agent" and leave the
+        // dialog open for a retry that mints a SECOND persona+agent — the
+        // record is already saved, only the node assignment failed. Mirrors
+        // usePersonaActions.handleSubmit's identical soft-fail for the same
+        // call.
+        try {
+          await publishNodeAssignmentForCreatedAgent(
+            backendIntent,
+            created.agent,
+            identityQuery.data?.pubkey,
+          );
+        } catch (assignError) {
+          setError(
+            assignError instanceof Error
+              ? `${created.agent.name} was created, but assigning it to the node failed: ${assignError.message}`
+              : `${created.agent.name} was created, but assigning it to the node failed.`,
+          );
+        }
         const targetChannel = (channelsQuery.data ?? []).find(
           (channel) => channel.id === request.request.channelId,
         );

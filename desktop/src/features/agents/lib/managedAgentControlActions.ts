@@ -1,3 +1,4 @@
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type {
   Channel,
@@ -33,6 +34,41 @@ export type ManagedAgentActionResult = {
 
 export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
+}
+
+/**
+ * True for a local-backend record with an active node assignment — the
+ * target node, not this desktop, owns that process's lifetime. Only a
+ * local-backend agent can even be node-hosted: a provider-backend agent is
+ * never locally spawned in the first place, so it needs no gate.
+ *
+ * This is the ROOT-CAUSE fix for Phase 4 fix-round-1's Critical finding: a
+ * node-hosted agent persists as `backend:{type:"local"}` (see
+ * `instanceInputForDefinition.ts`'s `"node"` BackendIntent branch), which is
+ * indistinguishable from a genuine local agent to every pre-existing local
+ * lifecycle control unless they explicitly check this. `startManagedAgentWithRules`
+ * and `respawnManagedAgentWithRules` below refuse for a node-hosted agent —
+ * every caller (`useManagedAgentActions`'s avatar Start/Restart and bulk
+ * respawn, `useAgentLifecycleActions`'s profile-panel primary action,
+ * `useMembersSidebarActions`'s per-agent lifecycle fallback branch) gets the
+ * gate for free by going through these shared rule functions instead of
+ * calling the Tauri start/stop commands directly.
+ */
+export function isNodeHostedAgent(
+  agent: Pick<ManagedAgent, "pubkey" | "backend">,
+): boolean {
+  // Optional-chained: real ManagedAgent records always carry `backend`
+  // (required by the type), but this guards a caller with an incomplete
+  // fixture/partial object the same way an unconfirmed-local agent should
+  // read — not node-hosted — rather than throwing.
+  return agent.backend?.type === "local" && isAgentNodeHosted(agent.pubkey);
+}
+
+function nodeHostedRefusal(agent: Pick<ManagedAgent, "name">): Error {
+  return new Error(
+    `${agent.name} runs on an execution node — use its Start/Stop/Move ` +
+      "controls (not this local control) to manage it.",
+  );
 }
 
 export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
@@ -82,6 +118,11 @@ export async function startManagedAgentWithRules({
   agent: ManagedAgent;
   startManagedAgent: StartManagedAgent;
 }) {
+  // A node-hosted agent's process belongs to its assigned node — starting it
+  // here would spawn a second, competing process under the same identity/key.
+  if (isNodeHostedAgent(agent)) {
+    throw nodeHostedRefusal(agent);
+  }
   // Relay-mesh agents are no longer blocked here: the backend start preflight
   // (ensure_relay_mesh_for_record) re-resolves a live serve target and dials
   // it, failing with an actionable error when no peer serves the model.
@@ -101,6 +142,11 @@ export async function respawnManagedAgentWithRules({
    * clear stale working badges at the right boundary. */
   onStopped?: () => void;
 }) {
+  // Same double-run hazard as startManagedAgentWithRules above — refuse
+  // before touching either side of the stop-then-start sequence.
+  if (isNodeHostedAgent(agent)) {
+    throw nodeHostedRefusal(agent);
+  }
   if (agent.backend.type === "local" && isManagedAgentActive(agent)) {
     await stopManagedAgent(agent.pubkey);
     onStopped?.();

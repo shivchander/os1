@@ -1,8 +1,10 @@
 import { openPresenceSubscription } from "@/shared/api/presenceRelaySubscription";
 import { PresenceSubscriptionReconciler } from "@/shared/api/presenceSubscriptionReconciler";
 import { relayClient } from "@/shared/api/relayClient";
+import { getIdentity } from "@/shared/api/tauriIdentity";
 import type { RelayEvent } from "@/shared/api/types";
 import {
+  KIND_AGENT_ASSIGNMENT,
   KIND_AGENT_NODE_STATUS,
   KIND_NODE_ANNOUNCE,
   KIND_PRESENCE_UPDATE,
@@ -71,6 +73,22 @@ export type AgentStatusView = {
   reason?: string;
 };
 
+/**
+ * The owner's own desired-state record for an agent, from the public tags of
+ * an `AGENT_ASSIGNMENT` event (`d`=agent, `node`=target, `state`). Never the
+ * NIP-44-encrypted `content` (nsec + launch contract) — this store has no
+ * owner key and cannot decrypt it, and doesn't need to: per
+ * `crates/buzz-core/src/assignment.rs`, "the signed outer event exposes only
+ * the agent coordinate, target node, and desired lifecycle state as public
+ * tags — any of the owner's nodes can decide whether they are the target
+ * without decrypting anything."
+ */
+export type AgentAssignmentView = {
+  agentPubkey: string;
+  nodePubkey: string;
+  state: "assigned" | "unassigned";
+};
+
 type NodeAnnounceContent = {
   node_pubkey: string;
   os: string;
@@ -84,7 +102,14 @@ type PresenceContent = "online" | "away" | "offline";
 const nodesByPubkey = new Map<string, NodeAnnounceContent>();
 const statusByAgent = new Map<string, AgentStatusView>();
 const presenceByPubkey = new Map<string, PresenceContent>();
+const assignmentByAgent = new Map<string, AgentAssignmentView>();
 const listeners = new Set<() => void>();
+
+// Set once ensureNodesRelaySubscription() resolves the active identity; null
+// otherwise (including in pure-reducer tests that call ingestNodeEvent
+// directly without ever starting a subscription — see the author check in
+// the KIND_AGENT_ASSIGNMENT case below). Cleared on every resetNodesStore().
+let currentOwnerPubkey: string | null = null;
 
 // Cached snapshot so `useSyncExternalStore` gets a referentially stable
 // array between changes; invalidated (set to null) on every ingest/reset and
@@ -189,6 +214,41 @@ function parsePresence(content: string): PresenceContent | null {
     : null;
 }
 
+function findTagValue(tags: readonly string[][], name: string): string | null {
+  for (const tag of tags) {
+    if (tag[0] === name) return tag[1] ?? null;
+  }
+  return null;
+}
+
+/**
+ * Read an `AGENT_ASSIGNMENT`'s public tags only — `d` (agent), `node`
+ * (target), `state` (`assigned`|`unassigned`). Mirrors buzz-core's
+ * `validate_envelope` tag set exactly (that function additionally rejects
+ * unexpected tags and duplicates; this store, like its announce/status
+ * parsers, just drops anything it can't make sense of rather than treating a
+ * malformed event as fatal).
+ */
+function parseAgentAssignmentTags(
+  event: RelayEvent,
+): AgentAssignmentView | null {
+  const agentPubkey = findTagValue(event.tags, "d");
+  const nodePubkey = findTagValue(event.tags, "node");
+  const state = findTagValue(event.tags, "state");
+  if (
+    !agentPubkey ||
+    !nodePubkey ||
+    (state !== "assigned" && state !== "unassigned")
+  ) {
+    return null;
+  }
+  return {
+    agentPubkey: normalizePubkey(agentPubkey),
+    nodePubkey: normalizePubkey(nodePubkey),
+    state,
+  };
+}
+
 /**
  * Ingest one raw relay event into the store. Exported for tests and for the
  * E2E mock bridge (`__BUZZ_E2E_SEED_NODE_EVENTS__`), which calls this
@@ -249,6 +309,31 @@ export function ingestNodeEvent(event: RelayEvent): void {
       notifyListeners();
       return;
     }
+    case KIND_AGENT_ASSIGNMENT: {
+      // Defense-in-depth: only accept assignment records authored by the
+      // identity this store was told is the current owner (mirrors the
+      // announce/status author-binding checks above) — the relay's
+      // `authors:[ownerPubkey]` filter already enforces this server-side;
+      // this guards a compromised relay. `null` (no subscription started
+      // yet — e.g. a pure-reducer test, or the identity fetch failed) skips
+      // the check rather than rejecting everything, matching how this store
+      // behaves before any live subscription has opened.
+      if (
+        currentOwnerPubkey &&
+        normalizePubkey(event.pubkey) !== currentOwnerPubkey
+      ) {
+        return;
+      }
+      const assignment = parseAgentAssignmentTags(event);
+      if (!assignment) return;
+      assignmentByAgent.set(assignment.agentPubkey, assignment);
+      // Assignments don't change the NodeView roster (name/os/runtimes/
+      // online/agentCount all derive from announce+status+presence only) —
+      // no invalidateSnapshot(), just wake subscribers so
+      // getAgentAssignment/isAgentNodeHosted reads see the update.
+      notifyListeners();
+      return;
+    }
     default:
       return;
   }
@@ -293,6 +378,34 @@ export function getAgentStatus(
   return statusByAgent.get(normalizePubkey(agentPubkey));
 }
 
+export function getAgentAssignment(
+  agentPubkey: string,
+): AgentAssignmentView | undefined {
+  return assignmentByAgent.get(normalizePubkey(agentPubkey));
+}
+
+/**
+ * True when the OWNER's own desired-state record for this agent says
+ * "assigned" — i.e. some execution node should be running it right now.
+ *
+ * This is the signal every local-only lifecycle affordance (avatar
+ * Start/Restart, the Members-sidebar per-agent and bulk controls, the
+ * profile panel's primary action) must gate on before spawning a local
+ * process: a node-hosted agent's only start/stop/move is the
+ * assignment-based `AgentNodeControls`, never a local spawn — otherwise the
+ * desktop and the node both run the same identity/key at once.
+ *
+ * Deliberately keyed on `getAgentAssignment` (the owner's desired state),
+ * NOT `getAgentStatus` (the node's *observed* health): status is empty in
+ * the window between publishing an assignment and the node's first
+ * `AGENT_NODE_STATUS`, which would leave every local control live during
+ * exactly the gap right after create or move — the moment double-running is
+ * most likely.
+ */
+export function isAgentNodeHosted(agentPubkey: string): boolean {
+  return getAgentAssignment(agentPubkey)?.state === "assigned";
+}
+
 export function subscribeNodes(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
@@ -303,11 +416,20 @@ export function subscribeNodes(listener: () => void): () => void {
 /**
  * Open the live subscriptions feeding this store if they aren't already
  * open: the roster subscription (NODE_ANNOUNCE + AGENT_NODE_STATUS, unscoped
- * — both are addressable and roster-sized) and the presence reconciler
+ * — both are addressable and roster-sized), the presence reconciler
  * (author-scoped to the announced node pubkeys, growing as the roster
- * grows). Idempotent and safe to call from multiple mounted consumers
- * (mirrors `ensureRelayObserverSubscription`). Errors are logged, not
- * thrown — the panel should still render whatever the store already has.
+ * grows), and this owner's own AGENT_ASSIGNMENT feed (author-scoped to the
+ * resolved identity — that kind carries no `p` tag, so an unscoped filter
+ * would leak every community member's assignment records). Idempotent and
+ * safe to call from multiple mounted consumers (mirrors
+ * `ensureRelayObserverSubscription`). Errors are logged, not thrown — the
+ * panel should still render whatever the store already has.
+ *
+ * The assignment feed's identity resolution is best-effort: if `getIdentity`
+ * fails, the roster subscription above is unaffected (it doesn't depend on
+ * identity) and `isAgentNodeHosted` simply stays `false` for everything —
+ * the same fail-open posture `useCommunityInit.ts` already takes on an
+ * identity-resolution failure elsewhere in this app.
  */
 export function ensureNodesRelaySubscription(): Promise<void> {
   if (unsubscribeRelay) {
@@ -337,32 +459,65 @@ export function ensureNodesRelaySubscription(): Promise<void> {
     reconcilePresenceAuthors();
   }
 
-  startPromise = relayClient
-    .subscribeLive(
-      {
-        kinds: [KIND_NODE_ANNOUNCE, KIND_AGENT_NODE_STATUS],
-        limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
-      },
-      (event) => {
-        if (activeGeneration !== generation) return;
-        ingestNodeEvent(event);
-      },
-    )
-    .then((unsubscribe) => {
+  startPromise = (async () => {
+    const unsubscribers: Array<() => Promise<void>> = [];
+    try {
+      const unsubscribeRoster = await relayClient.subscribeLive(
+        {
+          kinds: [KIND_NODE_ANNOUNCE, KIND_AGENT_NODE_STATUS],
+          limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
+        },
+        (event) => {
+          if (activeGeneration !== generation) return;
+          ingestNodeEvent(event);
+        },
+      );
       if (activeGeneration !== generation) {
-        void unsubscribe();
+        void unsubscribeRoster();
         return;
       }
-      unsubscribeRelay = unsubscribe;
-    })
-    .catch((error) => {
+      unsubscribers.push(unsubscribeRoster);
+      unsubscribeRelay = async () => {
+        await Promise.all(unsubscribers.map((unsubscribe) => unsubscribe()));
+      };
+    } catch (error) {
       console.error("Failed to subscribe to the execution-node roster:", error);
-    })
-    .finally(() => {
-      if (activeGeneration === generation) {
-        startPromise = null;
+      return;
+    }
+
+    try {
+      const identity = await getIdentity();
+      if (activeGeneration !== generation) return;
+      currentOwnerPubkey = normalizePubkey(identity.pubkey);
+      const unsubscribeAssignments = await relayClient.subscribeLive(
+        {
+          kinds: [KIND_AGENT_ASSIGNMENT],
+          authors: [currentOwnerPubkey],
+          limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
+        },
+        (event) => {
+          if (activeGeneration !== generation) return;
+          ingestNodeEvent(event);
+        },
+      );
+      if (activeGeneration !== generation) {
+        void unsubscribeAssignments();
+        return;
       }
-    });
+      unsubscribers.push(unsubscribeAssignments);
+    } catch (error) {
+      // Degrades to isAgentNodeHosted always false — logged, not thrown, and
+      // does not tear down the roster subscription established above.
+      console.error(
+        "Failed to subscribe to this owner's node assignments:",
+        error,
+      );
+    }
+  })().finally(() => {
+    if (activeGeneration === generation) {
+      startPromise = null;
+    }
+  });
 
   return startPromise;
 }
@@ -375,9 +530,11 @@ export function resetNodesStore(): void {
   startPromise = null;
   const reconciler = presenceReconciler;
   presenceReconciler = null;
+  currentOwnerPubkey = null;
   nodesByPubkey.clear();
   statusByAgent.clear();
   presenceByPubkey.clear();
+  assignmentByAgent.clear();
   invalidateSnapshot();
   notifyListeners();
   void unsubscribe?.();

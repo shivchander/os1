@@ -97,6 +97,18 @@ enum AgentSlot {
     /// engine's post-action `observe()` can report the terminal status once
     /// (mirrors `FakeSubstrate::stop`, which leaves the same tombstone).
     Stopped,
+    /// `start()` could not produce a live child at all — workspace-directory
+    /// creation or the `AgentRuntime::spawn` call itself failed (e.g. a
+    /// missing binary or an unwritable workspace) — so there is no process
+    /// to track. Observed as `Crashed` so reconcile retries it (subject to
+    /// the breaker) exactly like a post-spawn crash, and the failure is
+    /// contained here rather than propagated out of `start()`, so one bad
+    /// agent can never take down the whole node's reconcile loop. The
+    /// failure reason is logged at the point of detection (see
+    /// `record_start_failure`) rather than stored here, since nothing
+    /// downstream currently reads a per-agent error string back out of the
+    /// table.
+    Failed,
 }
 
 /// A real substrate: a local child-process table, one persistent workspace
@@ -132,10 +144,57 @@ impl LocalProcessSubstrate {
     pub fn breaker_open(&self, agent: &PublicKey) -> bool {
         self.breaker
             .lock()
-            .expect("breaker lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(*agent)
             .or_default()
             .is_open()
+    }
+
+    /// Lock the process table, mapping mutex poisoning to a [`NodeError`]
+    /// instead of panicking. A poisoned lock means some other call already
+    /// panicked while holding it; that must not additionally crash *this*
+    /// caller (`start`/`stop` are on the same hot path the engine drives
+    /// every reconcile tick for every agent).
+    fn lock_table(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<PublicKey, AgentSlot>>, NodeError> {
+        self.table
+            .lock()
+            .map_err(|_| NodeError::Substrate("process table lock poisoned".into()))
+    }
+
+    /// Lock the breaker map, mapping mutex poisoning to a [`NodeError`].
+    fn lock_breaker(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<PublicKey, Circuit>>, NodeError> {
+        self.breaker
+            .lock()
+            .map_err(|_| NodeError::Substrate("breaker lock poisoned".into()))
+    }
+
+    /// Record a failed start attempt: workspace creation or the runtime's
+    /// `spawn()` call itself failed, so there was never a live child to
+    /// track. Marks the slot [`AgentSlot::Failed`] (observed as `Crashed`)
+    /// and feeds the crash-restart breaker exactly as a post-spawn crash
+    /// would, so a persistently broken agent (missing binary, unwritable
+    /// workspace, ...) backs off instead of being retried on every tick.
+    ///
+    /// This is the containment boundary for [`Substrate::start`]: callers
+    /// pass the underlying error's `reason` for a log line, then treat this
+    /// call's own (rare — lock poisoning only) failure as the only thing
+    /// still worth propagating.
+    fn record_start_failure(&self, agent: PublicKey, reason: &str) -> Result<(), NodeError> {
+        tracing::warn!(
+            agent = %agent.to_hex(),
+            reason,
+            "agent failed to start; marked Failed and recorded as a breaker crash"
+        );
+        self.lock_table()?.insert(agent, AgentSlot::Failed);
+        self.lock_breaker()?
+            .entry(agent)
+            .or_default()
+            .record_crash();
+        Ok(())
     }
 }
 
@@ -151,10 +210,18 @@ impl Substrate for LocalProcessSubstrate {
         let mut crashed_now = Vec::new();
         let mut out = BTreeMap::new();
         {
-            let mut table = self.table.lock().expect("table lock");
+            let mut table = self
+                .table
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (pk, slot) in table.iter_mut() {
                 let observed = match slot {
                     AgentSlot::Stopped => Observed::Stopped,
+                    // No live child was ever produced for this attempt;
+                    // report it exactly like a crash so reconcile retries it
+                    // (subject to the breaker, which was already fed at the
+                    // point of failure in `record_start_failure`).
+                    AgentSlot::Failed => Observed::Crashed { code: None },
                     AgentSlot::Live {
                         child,
                         reported_crash,
@@ -183,7 +250,10 @@ impl Substrate for LocalProcessSubstrate {
             }
         }
         if !crashed_now.is_empty() {
-            let mut breaker = self.breaker.lock().expect("breaker lock");
+            let mut breaker = self
+                .breaker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for pk in crashed_now {
                 breaker.entry(pk).or_default().record_crash();
             }
@@ -199,31 +269,40 @@ impl Substrate for LocalProcessSubstrate {
             // probe once the cooldown elapses).
             return Ok(());
         }
+        // Both failure modes below are contained here, not propagated: the
+        // engine's run() loop does `substrate.start(&d).await?` for every
+        // agent in the same reconcile pass, so a hard `Err` from this method
+        // for one broken agent (missing binary, unwritable workspace, ...)
+        // would tear down the whole loop and stop *every* agent on this
+        // node, not just the broken one.
         let ws = workspace_dir(&self.root, &desired.agent_pubkey);
-        std::fs::create_dir_all(&ws)
-            .map_err(|e| NodeError::Substrate(format!("create workspace dir: {e}")))?;
-        let child = self.runtime.spawn(desired, &ws, &self.relay_url).await?;
-        let pid = child.id();
-        self.table.lock().expect("table lock").insert(
-            desired.agent_pubkey,
-            AgentSlot::Live {
-                child,
-                pid,
-                reported_crash: false,
-            },
-        );
-        Ok(())
+        if let Err(e) = std::fs::create_dir_all(&ws) {
+            return self
+                .record_start_failure(desired.agent_pubkey, &format!("create workspace dir: {e}"));
+        }
+        match self.runtime.spawn(desired, &ws, &self.relay_url).await {
+            Ok(child) => {
+                let pid = child.id();
+                self.lock_table()?.insert(
+                    desired.agent_pubkey,
+                    AgentSlot::Live {
+                        child,
+                        pid,
+                        reported_crash: false,
+                    },
+                );
+                Ok(())
+            }
+            Err(e) => self.record_start_failure(desired.agent_pubkey, &e.to_string()),
+        }
     }
 
     async fn stop(&self, agent: &PublicKey) -> Result<(), NodeError> {
-        let removed = self.table.lock().expect("table lock").remove(agent);
+        let removed = self.lock_table()?.remove(agent);
         if let Some(AgentSlot::Live { mut child, pid, .. }) = removed {
             kill_group(pid, &mut child).await;
         }
-        self.table
-            .lock()
-            .expect("table lock")
-            .insert(*agent, AgentSlot::Stopped);
+        self.lock_table()?.insert(*agent, AgentSlot::Stopped);
         Ok(())
     }
 }
@@ -420,6 +499,202 @@ mod tests {
         let agent = Keys::generate().public_key();
         sub.stop(&agent).await.expect("stop never-started agent");
         assert_eq!(sub.observe().await.get(&agent), Some(&Observed::Stopped));
+    }
+
+    /// Spawns a shell that forks a real *descendant* (`sleep 30 &`, then
+    /// `wait`s on it) instead of a single leaf process, so tests can prove
+    /// `stop()`'s `killpg` reaps the whole process tree — not just the one
+    /// direct child the substrate's table tracks. Records the spawned pid
+    /// (== pgid, since it's spawned into its own group) so the test can
+    /// independently check the group afterward.
+    #[derive(Default)]
+    struct ForkingRuntime {
+        last_pid: std::sync::atomic::AtomicU32,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for ForkingRuntime {
+        async fn spawn(
+            &self,
+            _desired: &DesiredAgent,
+            workspace: &std::path::Path,
+            _relay_url: &str,
+        ) -> Result<tokio::process::Child, NodeError> {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30 & wait"])
+                .current_dir(workspace)
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let child = cmd
+                .spawn()
+                .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))?;
+            if let Some(pid) = child.id() {
+                self.last_pid
+                    .store(pid, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(child)
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_kills_the_whole_process_group_not_just_the_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = std::sync::Arc::new(ForkingRuntime::default());
+        let sub = LocalProcessSubstrate::new(runtime.clone(), "wss://r".into(), dir.path().into());
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+
+        sub.start(&d).await.expect("start");
+        // Give the shell a moment to fork+background the `sleep` descendant
+        // before we act on it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            sub.observe().await.get(&d.agent_pubkey),
+            Some(&Observed::Running)
+        );
+        let pgid = runtime.last_pid.load(std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(pgid, 0, "fixture must have recorded a pid");
+
+        sub.stop(&d.agent_pubkey).await.expect("stop");
+
+        // The whole process group — `sh` AND the `sleep` descendant it
+        // forked — must be gone, not just the direct child the substrate
+        // tracked. `killpg(pgid, None)` sends signal 0 (existence check,
+        // no actual signal); ESRCH means no process in that group exists.
+        // Poll briefly: a descendant that dies from the same SIGTERM as its
+        // parent can take a moment to be reaped by the kernel/init.
+        use nix::errno::Errno;
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+        let mut group_empty = false;
+        for _ in 0..20 {
+            if killpg(Pid::from_raw(pgid as i32), None) == Err(Errno::ESRCH) {
+                group_empty = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            group_empty,
+            "process group {pgid} still has a member after stop()"
+        );
+    }
+
+    /// Fails `spawn()` for one specific agent pubkey (simulating e.g. a
+    /// missing binary) and spawns a harmless `sleep` for anyone else, so a
+    /// single substrate can host both a permanently-broken agent and a
+    /// healthy one in the same test.
+    struct SelectiveFailRuntime {
+        fail_for: PublicKey,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for SelectiveFailRuntime {
+        async fn spawn(
+            &self,
+            desired: &DesiredAgent,
+            workspace: &std::path::Path,
+            _relay_url: &str,
+        ) -> Result<tokio::process::Child, NodeError> {
+            if desired.agent_pubkey == self.fail_for {
+                return Err(NodeError::Spawn {
+                    agent: desired.agent_pubkey.to_hex(),
+                    reason: "simulated: binary not found".into(),
+                });
+            }
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 5"])
+                .current_dir(workspace)
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn()
+                .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn start_contains_a_spawn_failure_and_other_agents_still_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (bad_agent, bad_node, bad_owner) =
+            (Keys::generate(), Keys::generate(), Keys::generate());
+        let bad = fake_desired(
+            &bad_agent,
+            &bad_node,
+            &bad_owner,
+            buzz_core::AssignState::Assigned,
+        );
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SelectiveFailRuntime {
+                fail_for: bad.agent_pubkey,
+            }),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+
+        // The failing agent's start() must NOT propagate an error — a
+        // single broken agent must never tear down the whole node's
+        // reconcile loop (engine.rs's run() does `substrate.start(&d).await?`
+        // for every agent in the same pass).
+        sub.start(&bad)
+            .await
+            .expect("start() must contain the per-agent spawn failure");
+        // ...and it must be observed as Crashed (so reconcile retries it,
+        // subject to the breaker), not silently vanish from the table.
+        assert!(matches!(
+            sub.observe().await.get(&bad.agent_pubkey),
+            Some(Observed::Crashed { code: None })
+        ));
+
+        // A second, healthy agent must still be able to start on the SAME
+        // substrate — the first agent's failure must not have wedged
+        // anything shared (table/breaker locks, etc).
+        let (good_agent, good_node, good_owner) =
+            (Keys::generate(), Keys::generate(), Keys::generate());
+        let good = fake_desired(
+            &good_agent,
+            &good_node,
+            &good_owner,
+            buzz_core::AssignState::Assigned,
+        );
+        sub.start(&good)
+            .await
+            .expect("a healthy agent must still start");
+        assert_eq!(
+            sub.observe().await.get(&good.agent_pubkey),
+            Some(&Observed::Running)
+        );
+        sub.stop(&good.agent_pubkey).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn start_contains_a_workspace_creation_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+
+        // Pre-create a plain FILE at the exact path `workspace_dir` needs to
+        // create as a DIRECTORY, so `create_dir_all` fails deterministically
+        // — unlike a permissions-based failure, this doesn't depend on the
+        // test not running as root (common in CI containers, where root
+        // bypasses permission checks entirely).
+        let agent_dir = dir.path().join("agents").join(d.agent_pubkey.to_hex());
+        std::fs::create_dir_all(&agent_dir).expect("create parent");
+        std::fs::write(agent_dir.join("workspace"), b"not a directory")
+            .expect("seed conflicting file");
+
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+        sub.start(&d)
+            .await
+            .expect("start() must contain a workspace-creation failure");
+        assert!(matches!(
+            sub.observe().await.get(&d.agent_pubkey),
+            Some(Observed::Crashed { code: None })
+        ));
     }
 
     #[derive(Default)]

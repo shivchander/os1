@@ -83,6 +83,27 @@ pub(crate) async fn dispatch(cli: Cli) -> i32 {
 fn spawn_detached(paths: &DaemonPaths) -> Result<u32, NodeError> {
     let exe = std::env::current_exe()
         .map_err(|e| NodeError::Config(format!("resolve current exe: {e}")))?;
+    spawn_detached_command(paths, exe, ["up", "--foreground"])
+}
+
+/// The detach/spawn/PID-file mechanics behind [`spawn_detached`], factored
+/// out and parametrized over `program`/`args` so tests can launch a harmless
+/// stand-in command (e.g. `sleep`) instead of re-execing this same test
+/// binary as `buzz-node up --foreground` — which would need a full
+/// relay/engine environment to observe running to completion, and would
+/// actually re-invoke the *test harness* binary (since `current_exe()` under
+/// `cargo test` is the test binary, not `buzz-node`). Production code only
+/// ever reaches this through [`spawn_detached`]'s fixed
+/// `current_exe() up --foreground` invocation.
+fn spawn_detached_command<I, S>(
+    paths: &DaemonPaths,
+    program: impl AsRef<std::ffi::OsStr>,
+    args: I,
+) -> Result<u32, NodeError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let log_out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -92,9 +113,8 @@ fn spawn_detached(paths: &DaemonPaths) -> Result<u32, NodeError> {
         .try_clone()
         .map_err(|e| NodeError::Config(format!("dup log file handle: {e}")))?;
 
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("up")
-        .arg("--foreground")
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_out))
         .stderr(std::process::Stdio::from(log_err));
@@ -514,6 +534,65 @@ mod tests {
         assert!(
             start.elapsed() < FINAL_PUBLISH_TIMEOUT + Duration::from_secs(2),
             "must return promptly once the final-publish timeout elapses, not hang forever"
+        );
+    }
+
+    // --- spawn_detached_command (the detached-process launcher) ---
+
+    /// Hermetic test for the detach/PID-file mechanics: no relay, no engine,
+    /// just a harmless `sleep` standing in for the real re-exec'd binary
+    /// (see [`spawn_detached_command`]'s doc comment for why the real
+    /// [`spawn_detached`] can't be exercised directly under `cargo test`).
+    /// `#[cfg(unix)]` because it signals/reaps via `nix` (a Unix-only
+    /// dependency) and spawns `sleep`, which doesn't exist on Windows —
+    /// mirrors `substrate::tests::stop_kills_the_whole_process_group_not_just_the_leaf`.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_detached_command_produces_a_live_distinct_pid_matching_the_pid_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = DaemonPaths {
+            pid_file: dir.path().join("daemon.pid"),
+            status_file: dir.path().join("daemon.status.json"),
+            log_file: dir.path().join("daemon.log"),
+        };
+
+        let pid = spawn_detached_command(&paths, "sleep", ["30"]).expect("spawn detached");
+
+        // A new, live process distinct from this test process itself.
+        assert_ne!(
+            pid,
+            std::process::id(),
+            "spawned pid must not be this test process"
+        );
+        assert!(
+            live_daemon_pid(&paths.pid_file).is_some(),
+            "freshly spawned pid must be observed as live"
+        );
+
+        // The pid file's contents must match what was actually spawned.
+        let recorded: u32 = std::fs::read_to_string(&paths.pid_file)
+            .expect("read pid file")
+            .trim()
+            .parse()
+            .expect("pid file must contain a valid pid");
+        assert_eq!(
+            recorded, pid,
+            "pid file contents must match the spawned pid"
+        );
+
+        // Kill it and confirm cleanup.
+        terminate(pid).expect("terminate spawned process");
+        // Reap it ourselves: in production the short-lived launcher process
+        // exits immediately after spawning, so the OS reparents the
+        // detached child to init, which reaps it once it exits. This test
+        // process stays alive to make assertions, so without an explicit
+        // reap the terminated child would sit as a zombie — which still
+        // answers `kill(pid, 0)` (what `live_daemon_pid` uses) as "alive"
+        // until reaped, not as gone.
+        let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None);
+        assert!(
+            live_daemon_pid(&paths.pid_file).is_none(),
+            "pid must no longer be live once terminated and reaped"
         );
     }
 }

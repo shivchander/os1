@@ -1,3 +1,5 @@
+import { openPresenceSubscription } from "@/shared/api/presenceRelaySubscription";
+import { PresenceSubscriptionReconciler } from "@/shared/api/presenceSubscriptionReconciler";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import {
@@ -19,10 +21,21 @@ import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
  * snapshot, `resetXStore()`). It does NOT reuse observerRelayStore's decrypt
  * + owner-scoped-`#p` + per-agent-eviction machinery: that machinery exists
  * because agent telemetry is per-agent-encrypted and can be high-volume.
- * Node/status/presence events are plaintext and community-wide (small,
- * roster-sized), so the live subscription is wired directly through
- * `relayClient.subscribeLive`, the same primitive `useTeamCatalogRelay.ts`
- * uses for a community-wide catalog.
+ * NODE_ANNOUNCE/AGENT_NODE_STATUS are plaintext and community-wide but
+ * roster-sized (addressable, one event per author+d-tag), so that half of the
+ * live subscription is wired directly through `relayClient.subscribeLive`,
+ * the same primitive `useTeamCatalogRelay.ts` uses for a community-wide
+ * catalog.
+ *
+ * Presence is different: `KIND_PRESENCE_UPDATE` is NOT author-gated by the
+ * relay (unlike `#p`-gated kinds), so an unscoped `{kinds:[...]}` filter would
+ * receive every community member's presence heartbeat — population-sized,
+ * not roster-sized, and open for the whole app session. Presence is instead
+ * requested through the same author-scoped machinery the human-presence path
+ * uses (`openPresenceSubscription` + `PresenceSubscriptionReconciler`,
+ * `shared/api/presenceRelaySubscription.ts` /
+ * `shared/api/presenceSubscriptionReconciler.ts`), reconciled to exactly the
+ * set of currently-announced node pubkeys as the roster grows.
  */
 
 // Wire-format discriminators, mirrored from buzz-core (crates/buzz-core/src/
@@ -31,12 +44,10 @@ import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 const NODE_ANNOUNCE_FORMAT = "buzz-node-v1";
 const AGENT_NODE_STATUS_FORMAT = "buzz-node-status-v1";
 
-// Historical backfill depth for the combined announce/status/presence
-// subscription. NODE_ANNOUNCE and AGENT_NODE_STATUS are addressable
-// (parameterized-replaceable: at most one stored event per author+d-tag), so
-// this bounds total roster size (nodes + agents), not a message-volume
-// window. Presence is ephemeral and is never included in relay backfill
-// regardless of `limit` — only live presence updates arrive.
+// Historical backfill depth for the combined announce/status subscription.
+// NODE_ANNOUNCE and AGENT_NODE_STATUS are addressable (parameterized-
+// replaceable: at most one stored event per author+d-tag), so this bounds
+// total roster size (nodes + agents), not a message-volume window.
 const NODES_LIVE_SUBSCRIPTION_LIMIT = 500;
 
 export type NodeView = {
@@ -82,6 +93,12 @@ let cachedNodes: NodeView[] | null = null;
 
 let unsubscribeRelay: (() => Promise<void>) | null = null;
 let startPromise: Promise<void> | null = null;
+// Reconciles the author-scoped presence subscription onto the current set of
+// announced node pubkeys. Created lazily by `ensureNodesRelaySubscription`
+// (not eagerly at module load) so pure-reducer tests that only call
+// `ingestNodeEvent` directly never spin up a live subscription. `null`
+// between `resetNodesStore()` and the next `ensureNodesRelaySubscription()`.
+let presenceReconciler: PresenceSubscriptionReconciler | null = null;
 // Bumped on every reset so an in-flight subscribe/callback from a prior
 // community can never write into the next community's store (mirrors
 // observerRelayStore's `generation` guard).
@@ -95,6 +112,18 @@ function notifyListeners() {
 
 function invalidateSnapshot() {
   cachedNodes = null;
+}
+
+/**
+ * Push the current set of announced node pubkeys to the presence reconciler
+ * (if a live subscription session is active). A no-op when
+ * `ensureNodesRelaySubscription` hasn't been called — e.g. pure-reducer
+ * tests that ingest events directly — since there's no subscription to keep
+ * in sync. `PresenceSubscriptionReconciler.setAuthors` itself no-ops when the
+ * key is unchanged, so calling this on every announce is cheap.
+ */
+function reconcilePresenceAuthors(): void {
+  presenceReconciler?.setAuthors([...nodesByPubkey.keys()]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -182,6 +211,9 @@ export function ingestNodeEvent(event: RelayEvent): void {
         return;
       }
       nodesByPubkey.set(normalizePubkey(caps.node_pubkey), caps);
+      // Keep the author-scoped presence subscription in sync with the
+      // roster: a newly-announced node's liveness must start being tracked.
+      reconcilePresenceAuthors();
       invalidateSnapshot();
       notifyListeners();
       return;
@@ -202,10 +234,14 @@ export function ingestNodeEvent(event: RelayEvent): void {
       return;
     }
     case KIND_PRESENCE_UPDATE: {
-      // Presence is self-signed by its author (the subject is always
-      // event.pubkey, never a `p` tag — see features/presence/lib/presence.ts
-      // for the same rule on the human-presence path). A node publishes its
-      // own presence, so this needs no separate author check.
+      // In production this only ever arrives via the author-scoped presence
+      // subscription reconciled onto the known node pubkeys (see
+      // `ensureNodesRelaySubscription`/`reconcilePresenceAuthors`) — never
+      // through the broad roster filter, which would receive every
+      // community member's presence. Presence is self-signed by its author
+      // (the subject is always event.pubkey, never a `p` tag — see
+      // features/presence/lib/presence.ts for the same rule on the
+      // human-presence path), so this needs no separate author check.
       const status = parsePresence(event.content);
       if (!status) return;
       presenceByPubkey.set(normalizePubkey(event.pubkey), status);
@@ -265,11 +301,13 @@ export function subscribeNodes(listener: () => void): () => void {
 }
 
 /**
- * Open the live subscription feeding this store (NODE_ANNOUNCE +
- * AGENT_NODE_STATUS + presence) if one isn't already open. Idempotent and
- * safe to call from multiple mounted consumers (mirrors
- * `ensureRelayObserverSubscription`). Errors are logged, not thrown — the
- * panel should still render whatever the store already has.
+ * Open the live subscriptions feeding this store if they aren't already
+ * open: the roster subscription (NODE_ANNOUNCE + AGENT_NODE_STATUS, unscoped
+ * — both are addressable and roster-sized) and the presence reconciler
+ * (author-scoped to the announced node pubkeys, growing as the roster
+ * grows). Idempotent and safe to call from multiple mounted consumers
+ * (mirrors `ensureRelayObserverSubscription`). Errors are logged, not
+ * thrown — the panel should still render whatever the store already has.
  */
 export function ensureNodesRelaySubscription(): Promise<void> {
   if (unsubscribeRelay) {
@@ -280,14 +318,29 @@ export function ensureNodesRelaySubscription(): Promise<void> {
   }
 
   const activeGeneration = generation;
+
+  if (!presenceReconciler) {
+    presenceReconciler = new PresenceSubscriptionReconciler({
+      open: (authors) =>
+        openPresenceSubscription(
+          authors,
+          (event) => {
+            if (activeGeneration !== generation) return;
+            ingestNodeEvent(event);
+          },
+          (...args) => relayClient.subscribeLive(...args),
+        ),
+    });
+    // A node may already have been announced before the live subscription
+    // session started (e.g. an earlier ingestNodeEvent call) — reconcile
+    // immediately so its presence isn't missed until the next announce.
+    reconcilePresenceAuthors();
+  }
+
   startPromise = relayClient
     .subscribeLive(
       {
-        kinds: [
-          KIND_NODE_ANNOUNCE,
-          KIND_AGENT_NODE_STATUS,
-          KIND_PRESENCE_UPDATE,
-        ],
+        kinds: [KIND_NODE_ANNOUNCE, KIND_AGENT_NODE_STATUS],
         limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
       },
       (event) => {
@@ -320,10 +373,13 @@ export function resetNodesStore(): void {
   const unsubscribe = unsubscribeRelay;
   unsubscribeRelay = null;
   startPromise = null;
+  const reconciler = presenceReconciler;
+  presenceReconciler = null;
   nodesByPubkey.clear();
   statusByAgent.clear();
   presenceByPubkey.clear();
   invalidateSnapshot();
   notifyListeners();
   void unsubscribe?.();
+  reconciler?.dispose();
 }

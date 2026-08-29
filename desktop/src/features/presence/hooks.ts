@@ -17,8 +17,8 @@ import {
   PRESENCE_TTL_SECONDS,
   resolveAutomaticPresenceStatus,
 } from "@/features/presence/lib/presence";
-import { PresenceSubscriptionReconciler } from "@/features/presence/lib/presenceSubscriptionReconciler";
 import { openPresenceSubscription } from "@/shared/api/presenceRelaySubscription";
+import { PresenceSubscriptionReconciler } from "@/shared/api/presenceSubscriptionReconciler";
 import type { PresenceLookup, PresenceStatus } from "@/shared/api/types";
 
 const PRESENCE_STATUS_TICK_INTERVAL_MS = 30_000;

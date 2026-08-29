@@ -1,18 +1,28 @@
 import assert from "node:assert/strict";
-import { beforeEach, describe, it } from "node:test";
+import { beforeEach, describe, it, mock } from "node:test";
 
+import { relayClient } from "@/shared/api/relayClient";
 import {
+  KIND_AGENT_NODE_STATUS,
+  KIND_NODE_ANNOUNCE,
+  KIND_PRESENCE_UPDATE,
+} from "@/shared/constants/kinds";
+import {
+  ensureNodesRelaySubscription,
   getAgentStatus,
   getNodesSnapshot,
   ingestNodeEvent,
   resetNodesStore,
   subscribeNodes,
 } from "./nodesStore.ts";
-import {
-  KIND_AGENT_NODE_STATUS,
-  KIND_NODE_ANNOUNCE,
-  KIND_PRESENCE_UPDATE,
-} from "@/shared/constants/kinds";
+
+// node:test's async functions always yield at least one microtask/macrotask
+// per await even when the awaited value is already resolved — flush lets a
+// PresenceSubscriptionReconciler reconcile loop (triggered fire-and-forget
+// from ingestNodeEvent) fully settle before the next assertion or the next
+// triggering event. Mirrors the same helper in
+// shared/api/presenceSubscriptionReconciler.test.mjs.
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function announceEvent(overrides = {}) {
   const nodePubkey = overrides.nodePubkey ?? "n1";
@@ -200,4 +210,70 @@ describe("nodesStore", () => {
     ingestNodeEvent(announceEvent({ nodePubkey: "n1" }));
     assert.equal(getNodesSnapshot()[0].online, false);
   });
+
+  it(
+    "requests presence only for announced node pubkeys, author-scoped and " +
+      "growing with the roster — never as part of the unscoped roster filter",
+    async () => {
+      const calls = [];
+      mock.method(relayClient, "subscribeLive", (filter, onEvent, onReady) => {
+        calls.push({ filter, onEvent });
+        // openPresenceSubscription requires EOSE readiness to resolve
+        // (see shared/api/presenceRelaySubscription.ts); the roster
+        // subscription doesn't pass onReady at all, so this is a no-op there.
+        onReady?.("eose");
+        return Promise.resolve(async () => {});
+      });
+
+      try {
+        await ensureNodesRelaySubscription();
+
+        // Only the roster subscription opens up front, and it must not carry
+        // an authors scope (NODE_ANNOUNCE/AGENT_NODE_STATUS are addressable
+        // and roster-sized — fine unscoped).
+        assert.equal(calls.length, 1);
+        assert.deepEqual(calls[0].filter.kinds, [
+          KIND_NODE_ANNOUNCE,
+          KIND_AGENT_NODE_STATUS,
+        ]);
+        assert.equal(
+          "authors" in calls[0].filter,
+          false,
+          "the roster filter must not scope by authors",
+        );
+        const rosterOnEvent = calls[0].onEvent;
+
+        // Announcing n1 (via the roster subscription's own onEvent, proving
+        // the roster feed still drives this) opens a SEPARATE, author-scoped
+        // presence subscription for exactly that one node.
+        rosterOnEvent(announceEvent({ nodePubkey: "n1" }));
+        await flush();
+        let presenceCalls = calls.filter((call) =>
+          call.filter.kinds?.includes(KIND_PRESENCE_UPDATE),
+        );
+        assert.equal(presenceCalls.length, 1);
+        assert.deepEqual(presenceCalls[0].filter.authors, ["n1"]);
+
+        // Announcing n2 reconciles onto both authors — still scoped to the
+        // roster, never the whole community.
+        rosterOnEvent(announceEvent({ nodePubkey: "n2" }));
+        await flush();
+        presenceCalls = calls.filter((call) =>
+          call.filter.kinds?.includes(KIND_PRESENCE_UPDATE),
+        );
+        assert.equal(presenceCalls.length, 2);
+        assert.deepEqual(presenceCalls.at(-1).filter.authors, ["n1", "n2"]);
+
+        // The presence subscription's own events still update the roster via
+        // the same ingestNodeEvent reducer.
+        presenceCalls.at(-1).onEvent(presenceEvent("n1", "online"));
+        assert.equal(
+          getNodesSnapshot().find((node) => node.nodePubkey === "n1")?.online,
+          true,
+        );
+      } finally {
+        mock.reset();
+      }
+    },
+  );
 });

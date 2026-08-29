@@ -191,8 +191,11 @@ pub struct NostrNodeRelay {
     inner: Arc<Inner>,
     /// Latest known desired-state per agent (last-writer-wins by the
     /// underlying addressable event's `created_at`, enforced relay-side by
-    /// NIP-33). Mutated only from `next_desired`, which holds `&mut self`.
-    desired: BTreeMap<PublicKey, DesiredAgent>,
+    /// NIP-33). `&self` interior mutability (a plain `std::sync::Mutex`,
+    /// never held across an `.await`): [`NodeRelay::next_desired`] must stay
+    /// concurrently pollable with [`NodeRelay::next_status`] in
+    /// `engine::run`'s `select!`.
+    desired: std::sync::Mutex<BTreeMap<PublicKey, DesiredAgent>>,
 }
 
 impl NostrNodeRelay {
@@ -207,7 +210,7 @@ impl NostrNodeRelay {
                 relay_url,
                 conn: Mutex::new(None),
             }),
-            desired: BTreeMap::new(),
+            desired: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -277,7 +280,7 @@ impl NostrNodeRelay {
 
 #[async_trait]
 impl NodeRelay for NostrNodeRelay {
-    async fn next_desired(&mut self) -> Option<Vec<DesiredAgent>> {
+    async fn next_desired(&self) -> Option<Vec<DesiredAgent>> {
         loop {
             let mut guard = self.inner.conn.lock().await;
             self.inner.ensure_connected(&mut guard).await;
@@ -298,8 +301,12 @@ impl NodeRelay for NostrNodeRelay {
                     // disjoint fields through the `guard` indirection.
                     drop(guard);
                     if let Some(d) = update {
-                        self.desired.insert(d.agent_pubkey, d);
-                        return Some(self.desired.values().cloned().collect());
+                        let mut desired = self
+                            .desired
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        desired.insert(d.agent_pubkey, d);
+                        return Some(desired.values().cloned().collect());
                     }
                     // Not decryptable / not ours — keep waiting.
                 }
@@ -318,6 +325,23 @@ impl NodeRelay for NostrNodeRelay {
                 }
             }
         }
+    }
+
+    async fn next_status(&self) -> Option<AgentNodeStatus> {
+        // Phase 5 batch A ships the move gate's pure logic
+        // (`crate::move_gate`) and its `FakeRelay` wiring, proven by
+        // `engine::run`'s unit tests, but does NOT yet subscribe this real
+        // relay client to peer `AGENT_NODE_STATUS` events. Doing so
+        // correctly needs a background task multiplexing two live
+        // subscriptions over one connection — this method must stay
+        // concurrently pollable with `next_desired` in `engine::run`'s
+        // `select!`, which the current one-reader-per-call design can't do
+        // for two long-lived streams at once. Until that lands, a *real*
+        // node's move gate is reachable only via `MOVE_HANDOFF_TIMEOUT`
+        // (never via an observed peer `stopped`), which still bounds a
+        // move's overlap but not as tightly as intended. Tracked as a
+        // follow-up — see the Phase 5 batch A report.
+        std::future::pending().await
     }
 
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError> {
@@ -546,7 +570,7 @@ mod tests {
         let relay_url = std::env::var("BUZZ_TEST_RELAY_URL").expect("set BUZZ_TEST_RELAY_URL");
         let owner = Keys::generate();
         let node = Keys::generate();
-        let mut relay = NostrNodeRelay::new(relay_url, node.clone(), owner.public_key());
+        let relay = NostrNodeRelay::new(relay_url, node.clone(), owner.public_key());
 
         let caps = buzz_core::NodeCapabilities {
             format: buzz_core::node::FORMAT.into(),

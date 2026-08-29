@@ -1,13 +1,20 @@
-//! The node engine: on each new desired-set or periodic tick, observe →
-//! reconcile → apply → publish status. Controlled entirely via the relay.
+//! The node engine: on each new desired-set, peer status, or periodic tick,
+//! observe → reconcile → apply → publish status. Controlled entirely via
+//! the relay.
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use nostr::{Keys, PublicKey};
+// `tokio::time::Instant`, not `std::time::Instant` — see `move_gate`'s doc
+// comment on the same import: move-gate deadlines must respect a paused
+// tokio clock in tests.
+use tokio::time::Instant;
 
 use buzz_core::{AgentHealth, AgentNodeStatus};
 
-use crate::model::{Action, NodeError, Observed};
+use crate::model::{Action, DesiredAgent, NodeError, Observed};
+use crate::move_gate::{self, PeerStatusView, MOVE_HANDOFF_TIMEOUT};
 use crate::reconcile::reconcile;
 use crate::relay::NodeRelay;
 use crate::substrate::Substrate;
@@ -34,15 +41,19 @@ pub struct EngineConfig {
 /// Run the node engine until the relay's desired-state stream ends (`None`).
 pub async fn run(
     substrate: Arc<dyn Substrate>,
-    mut relay: Box<dyn NodeRelay>,
+    relay: Box<dyn NodeRelay>,
     node_keys: Keys,
     cfg: EngineConfig,
 ) -> Result<(), NodeError> {
     // `node_keys` is reserved for Phase 3 (the real relay signs with it); the
     // status payload carries `node_pubkey` from config today.
     let _ = &node_keys;
+    let me = cfg.node_pubkey;
 
-    let mut current = Vec::new();
+    let mut current: Vec<DesiredAgent> = Vec::new();
+    let mut status_view = PeerStatusView::default();
+    let mut pending_spawns: HashMap<PublicKey, Instant> = HashMap::new();
+
     relay.publish_presence(true).await?;
 
     // First tick fires one period out so tests driven purely by the desired
@@ -62,6 +73,17 @@ pub async fn run(
                 Some(desired) => current = desired,
                 None => break,
             },
+            maybe_status = relay.next_status() => {
+                if let Some(s) = maybe_status {
+                    if status_view.record(&s).is_err() {
+                        tracing::warn!(
+                            agent_pubkey = %s.agent_pubkey,
+                            node_pubkey = %s.node_pubkey,
+                            "dropped a peer status with an unparseable pubkey"
+                        );
+                    }
+                }
+            }
             _ = ticker.tick() => {}
             _ = presence_ticker.tick() => {
                 // A heartbeat, not a reconcile trigger: refresh the relay's
@@ -72,39 +94,114 @@ pub async fn run(
             }
         }
 
-        let observed = substrate.observe().await;
-        for action in reconcile(&current, &observed) {
-            match action {
-                Action::Start(d) => substrate.start(&d).await?,
-                Action::Restart(d) => {
-                    substrate.stop(&d.agent_pubkey).await?;
-                    substrate.start(&d).await?;
-                }
-                Action::Stop(pk) => substrate.stop(&pk).await?,
-                Action::Noop(_) => {}
-            }
-        }
-
-        // Report observed status after applying actions.
-        let after = substrate.observe().await;
-        for (pk, obs) in &after {
-            if let Some(health) = health_of(*obs) {
-                let status = AgentNodeStatus {
-                    format: buzz_core::node_status::FORMAT.to_string(),
-                    version: buzz_core::node_status::VERSION,
-                    agent_pubkey: pk.to_hex(),
-                    node_pubkey: cfg.node_pubkey.to_hex(),
-                    health,
-                    reason: None,
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                };
-                relay.publish_status(&status).await?;
-            }
-        }
+        reconcile_and_apply(
+            relay.as_ref(),
+            &substrate,
+            &status_view,
+            &mut pending_spawns,
+            me,
+            &current,
+        )
+        .await?;
     }
 
     relay.publish_presence(false).await?;
     Ok(())
+}
+
+/// Observe the substrate, reconcile against `current`, apply the resulting
+/// actions — spawns gated through [`start_gated`] — and publish the
+/// resulting per-agent status.
+async fn reconcile_and_apply(
+    relay: &dyn NodeRelay,
+    substrate: &Arc<dyn Substrate>,
+    status_view: &PeerStatusView,
+    pending_spawns: &mut HashMap<PublicKey, Instant>,
+    me: PublicKey,
+    current: &[DesiredAgent],
+) -> Result<(), NodeError> {
+    let now = Instant::now();
+    let due: HashSet<PublicKey> = move_gate::due_pending(pending_spawns, now)
+        .into_iter()
+        .collect();
+
+    let observed = substrate.observe().await;
+    for action in reconcile(current, &observed) {
+        apply_action(substrate, status_view, pending_spawns, me, &due, action).await?;
+    }
+
+    // Report observed status after applying actions.
+    let after = substrate.observe().await;
+    for (pk, obs) in &after {
+        if let Some(health) = health_of(*obs) {
+            let status = AgentNodeStatus {
+                format: buzz_core::node_status::FORMAT.to_string(),
+                version: buzz_core::node_status::VERSION,
+                agent_pubkey: pk.to_hex(),
+                node_pubkey: me.to_hex(),
+                health,
+                reason: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            relay.publish_status(&status).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply one reconcile [`Action`], routing `Start`/`Restart` through
+/// [`start_gated`] so a move never produces two live instances (spec I4).
+async fn apply_action(
+    substrate: &Arc<dyn Substrate>,
+    status_view: &PeerStatusView,
+    pending_spawns: &mut HashMap<PublicKey, Instant>,
+    me: PublicKey,
+    due: &HashSet<PublicKey>,
+    action: Action,
+) -> Result<(), NodeError> {
+    match action {
+        Action::Start(d) => start_gated(substrate, status_view, pending_spawns, me, due, *d).await,
+        Action::Restart(d) => {
+            substrate.stop(&d.agent_pubkey).await?;
+            start_gated(substrate, status_view, pending_spawns, me, due, *d).await
+        }
+        Action::Stop(pk) => {
+            // Clear any stale deferral so a later re-assignment of this
+            // agent starts its own fresh handoff window rather than
+            // inheriting a leftover deadline.
+            pending_spawns.remove(&pk);
+            substrate.stop(&pk).await
+        }
+        Action::Noop(_) => Ok(()),
+    }
+}
+
+/// Spawn `d`, unless a *different* node's latest status still claims the
+/// agent alive (`Starting`/`Running`) and the bounded handoff window
+/// ([`MOVE_HANDOFF_TIMEOUT`]) hasn't elapsed yet (spec I4, §8 move flow). A
+/// blocked spawn is deferred into `pending_spawns` and retried on the next
+/// reconcile pass (the next tick, desired update, or peer status) — it
+/// fires as soon as the peer reports `stopped`, or unconditionally once
+/// `due` (computed from `pending_spawns` by the caller) says the deadline
+/// has passed.
+async fn start_gated(
+    substrate: &Arc<dyn Substrate>,
+    status_view: &PeerStatusView,
+    pending_spawns: &mut HashMap<PublicKey, Instant>,
+    me: PublicKey,
+    due: &HashSet<PublicKey>,
+    d: DesiredAgent,
+) -> Result<(), NodeError> {
+    let agent = d.agent_pubkey;
+    let blocked = status_view.peer_blocks_spawn(&agent, &me) && !due.contains(&agent);
+    if blocked {
+        pending_spawns
+            .entry(agent)
+            .or_insert_with(|| Instant::now() + MOVE_HANDOFF_TIMEOUT);
+        return Ok(());
+    }
+    pending_spawns.remove(&agent);
+    substrate.start(&d).await
 }
 
 /// Map an [`Observed`] state to a reportable [`AgentHealth`]; `Absent` is not
@@ -270,6 +367,153 @@ mod tests {
         assert!(
             handle.presence.lock().unwrap().iter().all(|&online| online),
             "the engine never publishes offline until shutdown, which this test never reaches"
+        );
+
+        task.abort();
+    }
+
+    fn status_of(node: &Keys, agent: &Keys, health: AgentHealth) -> AgentNodeStatus {
+        AgentNodeStatus {
+            format: buzz_core::node_status::FORMAT.into(),
+            version: buzz_core::node_status::VERSION,
+            agent_pubkey: agent.public_key().to_hex(),
+            node_pubkey: node.public_key().to_hex(),
+            health,
+            reason: None,
+            updated_at: "2026-08-29T00:00:00Z".into(),
+        }
+    }
+
+    // --- Task 1: bounded stop-before-start move gate (I4) ---
+
+    /// A peer node reporting the agent `running` defers this node's spawn
+    /// until the peer reports `stopped` — proving the move gate is wired
+    /// into the real `run()` loop, not just unit-tested in isolation (see
+    /// `move_gate::tests`).
+    #[tokio::test(start_paused = true)]
+    async fn move_defers_spawn_until_peer_reports_stopped() {
+        let (owner, node_m, node_n, agent) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            cfg(&node_m),
+        ));
+        tokio::task::yield_now().await; // startup resync (empty snapshot)
+
+        // Peer N currently reports the agent running elsewhere.
+        handle.push_status(status_of(&node_n, &agent, AgentHealth::Running));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // The owner now assigns the agent to M.
+        handle.push_desired(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            substrate.starts.lock().unwrap().is_empty(),
+            "must defer while a different node reports the agent running"
+        );
+
+        // Peer N reports stopped -> the deferred spawn fires.
+        handle.push_status(status_of(&node_n, &agent, AgentHealth::Stopped));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *substrate.starts.lock().unwrap(),
+            vec![agent.public_key()],
+            "spawns once the peer reports stopped"
+        );
+
+        task.abort();
+    }
+
+    /// A node's own previously-published status must never block its own
+    /// spawn of the same agent (only a *different* node's status can).
+    #[tokio::test(start_paused = true)]
+    async fn own_status_never_blocks_own_spawn() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            cfg(&node_m),
+        ));
+        tokio::task::yield_now().await;
+
+        handle.push_status(status_of(&node_m, &agent, AgentHealth::Running));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        handle.push_desired(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *substrate.starts.lock().unwrap(),
+            vec![agent.public_key()],
+            "a node's own status must never defer its own spawn"
+        );
+
+        task.abort();
+    }
+
+    /// The deferred spawn fires once [`MOVE_HANDOFF_TIMEOUT`] elapses even
+    /// if the peer never reports `stopped` — a bounded overlap, never a
+    /// permanent double (I4).
+    #[tokio::test(start_paused = true)]
+    async fn deferred_spawn_fires_after_timeout_without_peer_stopping() {
+        let (owner, node_m, node_n, agent) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let engine_cfg = EngineConfig {
+            // Short enough to observe within the test's time budget.
+            reconcile_tick: Duration::from_secs(1),
+            presence_interval: Duration::from_secs(3600),
+            node_pubkey: node_m.public_key(),
+        };
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            engine_cfg,
+        ));
+        tokio::task::yield_now().await;
+
+        handle.push_status(status_of(&node_n, &agent, AgentHealth::Running));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        handle.push_desired(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(substrate.starts.lock().unwrap().is_empty());
+
+        // Advance past the handoff timeout without ever reporting `stopped`;
+        // each reconcile tick re-derives `Start` and re-checks the deadline.
+        tokio::time::advance(MOVE_HANDOFF_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *substrate.starts.lock().unwrap(),
+            vec![agent.public_key()],
+            "spawns anyway once the bounded handoff window elapses"
         );
 
         task.abort();

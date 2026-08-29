@@ -14,6 +14,9 @@ pub mod engine;
 pub mod enroll;
 /// Domain types: desired agents, observed states, actions, errors.
 pub mod model;
+/// Bounded stop-before-start move gate (spec I4): defers a spawn while a
+/// different node still reports the agent alive.
+pub mod move_gate;
 /// The real Nostr `NodeRelay`: dial-out/NIP-42, assignment intake, publish.
 pub mod nostr_relay;
 /// Pure desired-vs-observed reconciliation.

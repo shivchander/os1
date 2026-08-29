@@ -12,7 +12,10 @@ import {
   useUpdateManagedAgentMutation,
 } from "@/features/agents/hooks";
 import { useAgentAccessOwnerOnlyQuery } from "@/features/agents/useAgentAccessOwnerOnly";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  isManagedAgentActive,
+  isNodeHostedAgent,
+} from "@/features/agents/lib/managedAgentControlActions";
 import type {
   ManagedAgent,
   RespondToMode,
@@ -743,22 +746,33 @@ export function AgentInstanceEditDialog({
       // explicitly instead of relying on the user to know the policy.
       if (!isManagedAgentActive(result.agent)) {
         const startedName = result.agent.name;
-        toast(`${startedName} saved while stopped.`, {
-          action: {
-            label: "Start now",
-            onClick: () => {
-              startMutation.mutate(result.agent.pubkey, {
-                onSuccess: () => toast.success(`${startedName} started.`),
-                onError: (error) =>
-                  toast.error(
-                    error instanceof Error
-                      ? `${startedName} failed to start: ${error.message}`
-                      : `${startedName} failed to start.`,
-                  ),
-              });
+        // A node-hosted agent is never locally "active" from this desktop's
+        // perspective (the node runs it) — offering a local "Start now" here
+        // would spawn a second, competing process under the same
+        // identity/key. Its actual start/stop/move is the assignment-based
+        // AgentNodeControls, not this toast.
+        if (isNodeHostedAgent(result.agent)) {
+          toast(
+            `${startedName} saved. It runs on an execution node — use its node controls to start, stop, or move it.`,
+          );
+        } else {
+          toast(`${startedName} saved while stopped.`, {
+            action: {
+              label: "Start now",
+              onClick: () => {
+                startMutation.mutate(result.agent.pubkey, {
+                  onSuccess: () => toast.success(`${startedName} started.`),
+                  onError: (error) =>
+                    toast.error(
+                      error instanceof Error
+                        ? `${startedName} failed to start: ${error.message}`
+                        : `${startedName} failed to start.`,
+                    ),
+                });
+              },
             },
-          },
-        });
+          });
+        }
       }
     } catch {
       // React Query stores the error; keep dialog open and render it inline.

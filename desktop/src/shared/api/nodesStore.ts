@@ -87,6 +87,9 @@ export type AgentAssignmentView = {
   agentPubkey: string;
   nodePubkey: string;
   state: "assigned" | "unassigned";
+  /** The source event's `created_at` — last-writer-wins tiebreak so an
+   * out-of-order-delivered older event can never overwrite a newer one. */
+  createdAt: number;
 };
 
 type NodeAnnounceContent = {
@@ -116,8 +119,29 @@ let currentOwnerPubkey: string | null = null;
 // lazily rebuilt on next read.
 let cachedNodes: NodeView[] | null = null;
 
-let unsubscribeRelay: (() => Promise<void>) | null = null;
-let startPromise: Promise<void> | null = null;
+// The roster (NODE_ANNOUNCE + AGENT_NODE_STATUS) and owner-scoped assignment
+// (AGENT_ASSIGNMENT) subscriptions are tracked as two INDEPENDENT idempotent
+// legs, each with its own "already subscribed" handle and in-flight promise.
+// This is deliberate, not incidental: the assignment leg depends on
+// getIdentity() resolving, which can fail transiently (IPC hiccup) even when
+// the roster leg (which needs no identity) already succeeded. If a single
+// combined flag marked "fully subscribed" once the roster leg alone
+// succeeded, every later ensureNodesRelaySubscription() call would
+// short-circuit on that flag and never retry the failed assignment leg —
+// isNodeHostedAgent would then silently stay false (gate open) for the rest
+// of the community session. Splitting them means a fresh call retries
+// exactly the leg that previously failed, without re-subscribing the one
+// that already succeeded.
+let unsubscribeRoster: (() => Promise<void>) | null = null;
+let rosterStartPromise: Promise<void> | null = null;
+let unsubscribeAssignments: (() => Promise<void>) | null = null;
+let assignmentStartPromise: Promise<void> | null = null;
+// Test-only seam: production always resolves identity via the real
+// getIdentity from @/shared/api/tauriIdentity. Overridable so
+// nodesStore.test.mjs can simulate a transient getIdentity failure and its
+// retry without ESM module-mocking (this repo's test runner does not enable
+// node:test's --experimental-test-module-mocks). Never set outside tests.
+let resolveOwnerIdentity: () => Promise<{ pubkey: string }> = getIdentity;
 // Reconciles the author-scoped presence subscription onto the current set of
 // announced node pubkeys. Created lazily by `ensureNodesRelaySubscription`
 // (not eagerly at module load) so pure-reducer tests that only call
@@ -246,6 +270,7 @@ function parseAgentAssignmentTags(
     agentPubkey: normalizePubkey(agentPubkey),
     nodePubkey: normalizePubkey(nodePubkey),
     state,
+    createdAt: event.created_at,
   };
 }
 
@@ -326,11 +351,30 @@ export function ingestNodeEvent(event: RelayEvent): void {
       }
       const assignment = parseAgentAssignmentTags(event);
       if (!assignment) return;
+      // Last-writer-wins by created_at: an out-of-order-delivered stale
+      // "unassigned" must never overwrite a newer "assigned" — that would
+      // silently re-enable local Start/Restart for a still-node-hosted
+      // agent, undoing the whole point of isNodeHostedAgent. Ties favor the
+      // newly-ingested event (consistent with the announce/status reducers
+      // above, which have no ordering guard at all — this one is stricter
+      // because getting it wrong here reopens the double-spawn hazard, not
+      // just a display staleness).
+      const existing = assignmentByAgent.get(assignment.agentPubkey);
+      if (existing && existing.createdAt > assignment.createdAt) {
+        return;
+      }
       assignmentByAgent.set(assignment.agentPubkey, assignment);
-      // Assignments don't change the NodeView roster (name/os/runtimes/
-      // online/agentCount all derive from announce+status+presence only) —
-      // no invalidateSnapshot(), just wake subscribers so
-      // getAgentAssignment/isAgentNodeHosted reads see the update.
+      // invalidateSnapshot(): NodeView's own fields (name/os/runtimes/online/
+      // agentCount) never depend on assignment data, but getNodesSnapshot()'s
+      // returned reference is the reactivity signal every
+      // useSyncExternalStore(subscribeNodes, getNodesSnapshot) caller relies
+      // on (React bails out of re-rendering when getSnapshot() returns an
+      // Object.is-equal value even after the listener fires) — including
+      // isNodeHostedAgent-gated UI (AgentPersonaCard/StandaloneAgentCard).
+      // Without this, notifyListeners() alone does not reliably repaint the
+      // gate when an assignment changes. Mirrors why the status case above
+      // already invalidates (agentCount derives from status).
+      invalidateSnapshot();
       notifyListeners();
       return;
     }
@@ -414,32 +458,19 @@ export function subscribeNodes(listener: () => void): () => void {
 }
 
 /**
- * Open the live subscriptions feeding this store if they aren't already
- * open: the roster subscription (NODE_ANNOUNCE + AGENT_NODE_STATUS, unscoped
- * — both are addressable and roster-sized), the presence reconciler
+ * Idempotent roster leg: NODE_ANNOUNCE + AGENT_NODE_STATUS, unscoped (both
+ * are addressable and roster-sized), plus the presence reconciler
  * (author-scoped to the announced node pubkeys, growing as the roster
- * grows), and this owner's own AGENT_ASSIGNMENT feed (author-scoped to the
- * resolved identity — that kind carries no `p` tag, so an unscoped filter
- * would leak every community member's assignment records). Idempotent and
- * safe to call from multiple mounted consumers (mirrors
- * `ensureRelayObserverSubscription`). Errors are logged, not thrown — the
- * panel should still render whatever the store already has.
- *
- * The assignment feed's identity resolution is best-effort: if `getIdentity`
- * fails, the roster subscription above is unaffected (it doesn't depend on
- * identity) and `isAgentNodeHosted` simply stays `false` for everything —
- * the same fail-open posture `useCommunityInit.ts` already takes on an
- * identity-resolution failure elsewhere in this app.
+ * grows). Needs no identity, so it has no reason to ever need a retry once
+ * it succeeds.
  */
-export function ensureNodesRelaySubscription(): Promise<void> {
-  if (unsubscribeRelay) {
+function ensureRosterSubscription(activeGeneration: number): Promise<void> {
+  if (unsubscribeRoster) {
     return Promise.resolve();
   }
-  if (startPromise) {
-    return startPromise;
+  if (rosterStartPromise) {
+    return rosterStartPromise;
   }
-
-  const activeGeneration = generation;
 
   if (!presenceReconciler) {
     presenceReconciler = new PresenceSubscriptionReconciler({
@@ -459,37 +490,59 @@ export function ensureNodesRelaySubscription(): Promise<void> {
     reconcilePresenceAuthors();
   }
 
-  startPromise = (async () => {
-    const unsubscribers: Array<() => Promise<void>> = [];
-    try {
-      const unsubscribeRoster = await relayClient.subscribeLive(
-        {
-          kinds: [KIND_NODE_ANNOUNCE, KIND_AGENT_NODE_STATUS],
-          limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
-        },
-        (event) => {
-          if (activeGeneration !== generation) return;
-          ingestNodeEvent(event);
-        },
-      );
+  rosterStartPromise = relayClient
+    .subscribeLive(
+      {
+        kinds: [KIND_NODE_ANNOUNCE, KIND_AGENT_NODE_STATUS],
+        limit: NODES_LIVE_SUBSCRIPTION_LIMIT,
+      },
+      (event) => {
+        if (activeGeneration !== generation) return;
+        ingestNodeEvent(event);
+      },
+    )
+    .then((unsubscribe) => {
       if (activeGeneration !== generation) {
-        void unsubscribeRoster();
+        void unsubscribe();
         return;
       }
-      unsubscribers.push(unsubscribeRoster);
-      unsubscribeRelay = async () => {
-        await Promise.all(unsubscribers.map((unsubscribe) => unsubscribe()));
-      };
-    } catch (error) {
+      unsubscribeRoster = unsubscribe;
+    })
+    .catch((error) => {
       console.error("Failed to subscribe to the execution-node roster:", error);
-      return;
-    }
+    })
+    .finally(() => {
+      if (activeGeneration === generation) {
+        rosterStartPromise = null;
+      }
+    });
 
+  return rosterStartPromise;
+}
+
+/**
+ * Idempotent, independently-retryable assignment leg: this owner's own
+ * AGENT_ASSIGNMENT feed (author-scoped to the resolved identity — that kind
+ * carries no `p` tag, so an unscoped filter would leak every community
+ * member's assignment records). Kept separate from the roster leg so a
+ * transient `getIdentity`/`subscribeLive` failure here doesn't get masked by
+ * the roster leg's own success — see the module-level comment above
+ * `unsubscribeRoster` for why a single combined flag was the bug.
+ */
+function ensureAssignmentSubscription(activeGeneration: number): Promise<void> {
+  if (unsubscribeAssignments) {
+    return Promise.resolve();
+  }
+  if (assignmentStartPromise) {
+    return assignmentStartPromise;
+  }
+
+  assignmentStartPromise = (async () => {
     try {
-      const identity = await getIdentity();
+      const identity = await resolveOwnerIdentity();
       if (activeGeneration !== generation) return;
       currentOwnerPubkey = normalizePubkey(identity.pubkey);
-      const unsubscribeAssignments = await relayClient.subscribeLive(
+      const unsubscribe = await relayClient.subscribeLive(
         {
           kinds: [KIND_AGENT_ASSIGNMENT],
           authors: [currentOwnerPubkey],
@@ -501,13 +554,17 @@ export function ensureNodesRelaySubscription(): Promise<void> {
         },
       );
       if (activeGeneration !== generation) {
-        void unsubscribeAssignments();
+        void unsubscribe();
         return;
       }
-      unsubscribers.push(unsubscribeAssignments);
+      unsubscribeAssignments = unsubscribe;
     } catch (error) {
-      // Degrades to isAgentNodeHosted always false — logged, not thrown, and
-      // does not tear down the roster subscription established above.
+      // Degrades to isAgentNodeHosted staying false — logged, not thrown,
+      // and does not touch the roster leg. Left retryable: since
+      // unsubscribeAssignments stays null, the NEXT
+      // ensureNodesRelaySubscription() call (from any newly-mounted
+      // consumer, or a deliberate re-check) re-attempts this leg from
+      // scratch, including re-resolving identity.
       console.error(
         "Failed to subscribe to this owner's node assignments:",
         error,
@@ -515,19 +572,38 @@ export function ensureNodesRelaySubscription(): Promise<void> {
     }
   })().finally(() => {
     if (activeGeneration === generation) {
-      startPromise = null;
+      assignmentStartPromise = null;
     }
   });
 
-  return startPromise;
+  return assignmentStartPromise;
+}
+
+/**
+ * Open the live subscriptions feeding this store if they aren't already
+ * open. Idempotent and safe to call from multiple mounted consumers (mirrors
+ * `ensureRelayObserverSubscription`) — see `ensureRosterSubscription`/
+ * `ensureAssignmentSubscription` for why they're two independently-retryable
+ * legs rather than one. Errors are logged, not thrown — the panel should
+ * still render whatever the store already has.
+ */
+export async function ensureNodesRelaySubscription(): Promise<void> {
+  const activeGeneration = generation;
+  await Promise.all([
+    ensureRosterSubscription(activeGeneration),
+    ensureAssignmentSubscription(activeGeneration),
+  ]);
 }
 
 /** Tear down the module-level store. Call from `resetCommunityState()`. */
 export function resetNodesStore(): void {
   generation += 1;
-  const unsubscribe = unsubscribeRelay;
-  unsubscribeRelay = null;
-  startPromise = null;
+  const unsubRoster = unsubscribeRoster;
+  unsubscribeRoster = null;
+  rosterStartPromise = null;
+  const unsubAssignments = unsubscribeAssignments;
+  unsubscribeAssignments = null;
+  assignmentStartPromise = null;
   const reconciler = presenceReconciler;
   presenceReconciler = null;
   currentOwnerPubkey = null;
@@ -537,6 +613,20 @@ export function resetNodesStore(): void {
   assignmentByAgent.clear();
   invalidateSnapshot();
   notifyListeners();
-  void unsubscribe?.();
+  void unsubRoster?.();
+  void unsubAssignments?.();
   reconciler?.dispose();
+}
+
+/**
+ * Test-only: override the identity resolver the assignment leg uses, so
+ * `nodesStore.test.mjs` can simulate a transient `getIdentity` failure (and
+ * its retry on a later `ensureNodesRelaySubscription()` call) without ESM
+ * module-mocking. Pass `null` to restore the real `getIdentity`. Never call
+ * this outside a test.
+ */
+export function __setIdentityResolverForTests(
+  resolver: (() => Promise<{ pubkey: string }>) | null,
+): void {
+  resolveOwnerIdentity = resolver ?? getIdentity;
 }

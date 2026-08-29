@@ -25,6 +25,7 @@ import {
   type ImetaMedia,
 } from "@/features/messages/lib/imetaMediaMarkdown";
 import { useActivePreparedLinkPreviews } from "./useActivePreparedLinkPreviews";
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
@@ -175,7 +176,17 @@ export function useMentionSendFlow({
               (isProviderBackedAgent(readyAgent) &&
                 readyAgent.status !== "deployed") ||
               (!isProviderBackedAgent(readyAgent) &&
-                !isManagedAgentRunning(readyAgent))
+                !isManagedAgentRunning(readyAgent) &&
+                // A node-hosted agent is never "running" from this
+                // desktop's perspective (spawnAfterCreate:false — the
+                // node runs it). Auto-starting it here on mention would
+                // spawn a second, competing local process under the same
+                // identity/key. It already runs on its node and will pick
+                // up the mention over the relay — simply skip the start,
+                // don't route it through startManagedAgentWithRules (which
+                // would throw and surface as a mention-send error for
+                // something that isn't actually a failure).
+                !isAgentNodeHosted(readyAgent.pubkey))
             ) {
               await startAgentMutation.mutateAsync(readyAgent.pubkey);
             }

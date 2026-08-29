@@ -194,7 +194,16 @@ export async function submitProjectAgentMessage<Ch extends { id: string }>({
   openDm,
   send,
 }: {
-  agent: { pubkey: string; isManaged: boolean; isActive: boolean };
+  agent: {
+    pubkey: string;
+    isManaged: boolean;
+    isActive: boolean;
+    /** True for a managed agent with an active node assignment — the node
+     * runs it, so it must never be locally started here (a second,
+     * competing process under the same identity/key). Always false for a
+     * non-managed (relay) agent, which this function never starts anyway. */
+    isNodeHosted: boolean;
+  };
   conversation: { channel: Ch; opener: ProjectsConversationOpener } | null;
   content: string;
   mentionPubkeys: string[];
@@ -229,7 +238,7 @@ export async function submitProjectAgentMessage<Ch extends { id: string }>({
 }): Promise<{ channel: Ch; sent: { eventId: string; createdAt: number } }> {
   const expectedRelayUrl = relayScope ?? undefined;
   const expectedSignerPubkey = signerScope ?? undefined;
-  if (agent.isManaged && !agent.isActive) {
+  if (agent.isManaged && !agent.isActive && !agent.isNodeHosted) {
     await startAgent({
       pubkey: agent.pubkey,
       expectedRelayUrl,

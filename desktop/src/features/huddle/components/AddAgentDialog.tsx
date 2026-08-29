@@ -5,6 +5,7 @@ import * as React from "react";
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { Dialog } from "@/shared/ui/dialog";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
 import type { ManagedAgentBackend } from "@/shared/api/types";
 
 type ManagedAgentSummary = {
@@ -82,10 +83,17 @@ export function AddAgentDialog({
     let startedForAdd = false;
     try {
       const isLocal = agent.backend.type === "local";
+      // A node-hosted agent (local-backend record, but assigned to an
+      // execution node) is never locally "running" from this desktop's
+      // perspective — that's expected, not a reason to spawn a second,
+      // competing local process under the same identity/key. It already
+      // runs on its node; adding it to the huddle here doesn't need a local
+      // start at all.
+      const isNodeHosted = isLocal && isAgentNodeHosted(agent.pubkey);
       const needsStart = isLocal
         ? agent.status !== "running"
         : agent.status !== "deployed";
-      if (needsStart && isLocal) {
+      if (needsStart && isLocal && !isNodeHosted) {
         await invoke("start_managed_agent", { pubkey: agent.pubkey });
         startedForAdd = true;
       }

@@ -661,3 +661,72 @@ test("follow-ups reply to the opener so same-second id ordering cannot hide them
   };
   assert.equal(isAtOrAfterConversationOpener(asSentReply, OPENER), true);
 });
+
+// ── Phase 4 fix-round-2 Critical: node-hosted agents must never be locally
+// started from a project conversation ─────────────────────────────────────
+//
+// Root cause: a node-hosted agent (backend:local + an active node
+// assignment) is never "active" from this desktop's perspective — the node
+// runs it. Before this fix, `agent.isManaged && !agent.isActive` alone
+// triggered `startAgent`, which spawned a second, competing local process
+// under the same identity/key on the first Projects message.
+
+test("a node-hosted managed agent is never locally started, even though isManaged && !isActive", async () => {
+  const backend = makeScopedBackend("wss://tenant-a.example");
+  let startCalled = false;
+  await submitProjectAgentMessage({
+    agent: {
+      pubkey: AGENT_PUBKEY,
+      isManaged: true,
+      isActive: false,
+      isNodeHosted: true,
+    },
+    conversation: null,
+    content: "hello from a node-hosted agent's first message",
+    mentionPubkeys: [AGENT_PUBKEY],
+    relayScope: "wss://tenant-a.example",
+    signerScope: SELF_PUBKEY,
+    startAgent: async (input) => {
+      startCalled = true;
+      return backend.startAgent(input);
+    },
+    openDm: backend.openDm,
+    send: backend.send,
+  });
+
+  assert.equal(
+    startCalled,
+    false,
+    "startAgent must never be called for a node-hosted agent",
+  );
+  assert.deepEqual(backend.state.starts, []);
+  // The message itself still sends normally — only the local start is
+  // skipped, not the conversation.
+  assert.equal(backend.state.sends.length, 1);
+});
+
+test("an ordinary (non-node-hosted) inactive managed agent is still auto-started", async () => {
+  const backend = makeScopedBackend("wss://tenant-a.example");
+  await submitProjectAgentMessage({
+    agent: {
+      pubkey: AGENT_PUBKEY,
+      isManaged: true,
+      isActive: false,
+      isNodeHosted: false,
+    },
+    conversation: null,
+    content: "hello",
+    mentionPubkeys: [AGENT_PUBKEY],
+    relayScope: "wss://tenant-a.example",
+    signerScope: SELF_PUBKEY,
+    startAgent: backend.startAgent,
+    openDm: backend.openDm,
+    send: backend.send,
+  });
+
+  assert.equal(
+    backend.state.starts.length,
+    1,
+    "the isNodeHosted gate must not suppress a genuinely-inactive local agent's normal auto-start",
+  );
+});

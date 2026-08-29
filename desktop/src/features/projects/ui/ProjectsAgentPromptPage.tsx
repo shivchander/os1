@@ -19,7 +19,10 @@ import {
   getMentionableAgentPubkeys,
   getSharedChannelIds,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  isManagedAgentActive,
+  isNodeHostedAgent,
+} from "@/features/agents/lib/managedAgentControlActions";
 import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
 import { normalizeRelayUrl } from "@/features/communities/communityStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
@@ -65,6 +68,7 @@ import {
   writeStoredProjectsAgentConversation,
 } from "@/features/projects/lib/projectAgentConversationStorage";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { getNodesSnapshot, subscribeNodes } from "@/shared/api/nodesStore";
 import { sendChannelMessage } from "@/shared/api/tauriMessages";
 import type { Channel } from "@/shared/api/types";
 import {
@@ -91,6 +95,10 @@ export type AgentCandidate = {
   /** Managed agents can be auto-started before the prompt is sent. */
   isManaged: boolean;
   isActive: boolean;
+  /** True for a managed agent with an active node assignment — the node
+   * runs it, so submitProjectAgentMessage must never locally start it.
+   * Always false for a non-managed (relay) candidate. */
+  isNodeHosted: boolean;
 };
 
 type ProjectAgentConversation = {
@@ -162,7 +170,19 @@ export function useAgentCandidates() {
   const managedAgentsQuery = useManagedAgentsQuery();
   const relayAgentsQuery = useRelayAgentsQuery();
   const channelsQuery = useChannelsQuery();
+  // Re-render when nodesStore changes (assignment state, in particular) —
+  // isNodeHostedAgent below is a plain read with no reactivity of its own.
+  const nodesSnapshot = React.useSyncExternalStore(
+    subscribeNodes,
+    getNodesSnapshot,
+  );
 
+  // nodesSnapshot is a deliberate reactivity trigger for isNodeHostedAgent (a
+  // nodesStore-backed pure function called inside this memo): its value isn't
+  // read directly, but the memo must recompute whenever the store's
+  // assignment state changes, or isNodeHosted would go stale for this
+  // component's lifetime (mirrors the same pattern in useCommunityInit.ts).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: nodesSnapshot is intentionally a dep — see comment above
   return React.useMemo(() => {
     const managed = managedAgentsQuery.data ?? [];
     const relayAgents = relayAgentsQuery.data ?? [];
@@ -183,6 +203,7 @@ export function useAgentCandidates() {
       personaId: agent.personaId,
       isManaged: true,
       isActive: isManagedAgentActive(agent),
+      isNodeHosted: isNodeHostedAgent(agent),
     }));
     for (const agent of relayAgents) {
       const pubkey = normalizePubkey(agent.pubkey);
@@ -192,6 +213,7 @@ export function useAgentCandidates() {
         name: agent.name,
         isManaged: false,
         isActive: agent.status !== "offline",
+        isNodeHosted: false,
       });
     }
 
@@ -205,6 +227,7 @@ export function useAgentCandidates() {
     identityQuery.data?.pubkey,
     managedAgentsQuery.data,
     relayAgentsQuery.data,
+    nodesSnapshot,
   ]);
 }
 

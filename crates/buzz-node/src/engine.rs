@@ -373,8 +373,17 @@ async fn start_gated(
     // Force an immediate smoke probe on the next reporting pass rather than
     // waiting out any stale `last_probe` timestamp left over from before a
     // crash/stop — spec §9 wants a real round-trip right after a spawn is
-    // first observed running, not just on the periodic cadence.
+    // first observed running, not just on the periodic cadence. Clear
+    // `last_probe_result` too, not just `last_probe`: today the two happen
+    // to move together (clearing `last_probe` alone already makes the very
+    // next reporting pass re-probe immediately, which overwrites
+    // `last_probe_result` before it's ever read) — but that's an implicit
+    // cross-field invariant a future refactor of the "is a fresh probe due"
+    // logic could silently break. Clearing both here means a stale latched
+    // failure can never survive a fresh spawn regardless of how that logic
+    // evolves (defense in depth; Batch B review follow-up).
     state.last_probe.remove(&agent);
+    state.last_probe_result.remove(&agent);
     Ok(())
 }
 
@@ -945,6 +954,50 @@ mod tests {
             "a breaker cooldown must not be reported as a fresh crash"
         );
         assert_eq!(s.reason.as_deref(), Some("breaker-open"));
+    }
+
+    /// Defense-in-depth (Batch B review follow-up): `start_gated` must clear
+    /// BOTH `last_probe` and `last_probe_result` on a successful start, not
+    /// just `last_probe`. Exercises `start_gated` directly (rather than
+    /// through the full `run()` loop) specifically so it can seed a stale
+    /// `last_probe_result` WITHOUT a fresh probe cycle in between getting a
+    /// chance to overwrite it first — proving the clear itself, independent
+    /// of today's incidental "the next reporting pass always re-probes
+    /// anyway" behavior that a future refactor could change.
+    #[tokio::test]
+    async fn start_gated_clears_both_probe_bookkeeping_fields_not_just_last_probe() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate: Arc<dyn Substrate> = Arc::new(FakeSubstrate::new());
+        let status_view = PeerStatusView::default();
+        let mut state = LoopState::default();
+        // Seed stale bookkeeping as if a previous incarnation of this agent
+        // had been probed and found unhealthy.
+        state.last_probe.insert(a.public_key(), Instant::now());
+        state.last_probe_result.insert(a.public_key(), false);
+
+        let d = fake_desired(&a, &n, &o, Assigned);
+        let due = HashSet::new();
+        start_gated(
+            &substrate,
+            &status_view,
+            &mut state,
+            n.public_key(),
+            &due,
+            d,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !state.last_probe.contains_key(&a.public_key()),
+            "must clear last_probe on a successful start"
+        );
+        assert!(
+            !state.last_probe_result.contains_key(&a.public_key()),
+            "must also clear last_probe_result on a successful start -- a stale \
+             latched failure must never survive a fresh spawn even if some \
+             future refactor changes when the next probe actually runs"
+        );
     }
 
     // --- Batch A review fix round: Task 1 x Task 3 interaction ---

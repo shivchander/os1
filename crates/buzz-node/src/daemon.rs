@@ -444,6 +444,7 @@ mod tests {
             owner_pubkey: "o".into(),
             relay_url: "wss://r".into(),
             workspace_root: "/tmp/x".into(),
+            providers: Vec::new(),
         }
     }
 

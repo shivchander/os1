@@ -29,6 +29,9 @@ pub mod reconcile;
 pub mod relay;
 /// The `AgentRuntime` seam (D7) and its ACP implementation.
 pub mod runtime;
+/// At-rest secret storage for provider API keys (OS keychain), distinct
+/// from `enroll`'s node-signing-key store.
+pub mod secret_store;
 /// The substrate abstraction: the real `LocalProcessSubstrate` plus an
 /// in-memory fake for tests.
 pub mod substrate;

@@ -35,6 +35,31 @@ pub struct NodeConfig {
     pub relay_url: String,
     /// Root directory under which per-agent workspaces are created.
     pub workspace_root: PathBuf,
+    /// Names of providers this node has a stored API key for (e.g.
+    /// `"anthropic"`). Names only — the key VALUES live in the OS keychain
+    /// via [`crate::secret_store::ProviderSecretStore`]
+    /// ([`crate::secret_store::provider_secret_key`] derives the keychain
+    /// key from the name), never here. `#[serde(default)]` so a config
+    /// persisted before this field existed still loads.
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+#[cfg(test)]
+impl NodeConfig {
+    /// Build a sample config that references one provider by NAME only —
+    /// for tests asserting the on-disk config never carries secret material
+    /// (Phase 5 Task 5). The provider's actual key belongs in a
+    /// [`crate::secret_store::ProviderSecretStore`], never here.
+    pub(crate) fn sample_with_provider(provider: &str) -> Self {
+        Self {
+            node_pubkey: "n".into(),
+            owner_pubkey: "o".into(),
+            relay_url: "wss://r".into(),
+            workspace_root: "/tmp/x".into(),
+            providers: vec![provider.to_string()],
+        }
+    }
 }
 
 /// Unambiguous alphabet for human-typed pairing codes: excludes `0`/`O` and
@@ -353,6 +378,7 @@ pub async fn enroll(
         owner_pubkey: enrollment.owner_pubkey,
         relay_url: relay_url.to_string(),
         workspace_root: PathBuf::from(&caps.workspace_root),
+        providers: Vec::new(),
     };
     save_node_config(&cfg)?;
     Ok(cfg)
@@ -387,6 +413,7 @@ mod tests {
             owner_pubkey: "o".into(),
             relay_url: "wss://r".into(),
             workspace_root: "/tmp/x".into(),
+            providers: Vec::new(),
         }
     }
 

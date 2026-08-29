@@ -71,6 +71,11 @@ pub enum NodeError {
     /// Invalid engine/agent configuration.
     #[error("configuration error: {0}")]
     Config(String),
+    /// A provider secret store operation failed (`crate::secret_store`).
+    /// Never carries the secret value itself — only a key name and/or the
+    /// underlying backend's own error text.
+    #[error("secret store: {0}")]
+    Secret(String),
 }
 
 #[cfg(test)]

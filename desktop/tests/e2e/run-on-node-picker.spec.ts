@@ -261,3 +261,112 @@ test("creating an agent with a node target assigns it and gates the local Start 
   await expect(startButton).toBeVisible();
   await expect(startButton).toBeDisabled();
 });
+
+/**
+ * Phase 4 fix-round-3 Critical finding: the test above creates from the
+ * standalone Agents library, which carries NO channel context at all —
+ * attachManagedAgentToChannel is never reached, so that test could not have
+ * caught this. The real bypass is specifically a node-targeted create WITH a
+ * channel context: `useCreatedAgentChannelAttachment.presentCreatedAgent`
+ * (called unconditionally by both `useAgentManagement.submitCreate` and
+ * `usePersonaActions.handleSubmit` whenever a target channel is known) used
+ * to call `attachManagedAgentToChannel` with `ensureRunning: true`
+ * unconditionally — locally spawning the just-created agent right after
+ * creation, deterministically, regardless of whether `nodesStore` had
+ * already caught up with the (asynchronously echoed) `AGENT_ASSIGNMENT`.
+ * That timing gap is real even in production: publishing the assignment only
+ * waits for the relay to accept the event, never for that same event to
+ * echo back through this client's own live subscription (see the test
+ * above's header comment, which has to seed that echo by hand for the exact
+ * same reason) — so a purely `nodesStore`-driven guard would still lose this
+ * race. The fix instead threads the create's own node intent synchronously
+ * into `presentCreatedAgent`'s `ensureRunning` option, with no dependency on
+ * `nodesStore` timing at all.
+ *
+ * This exercises the actual human-reachable channel-targeted create path
+ * (channel-intro-action-create-agent → add-channel-create-agent →
+ * RequestedAgentCreateDialogs), which is what usePersonaActions.handleSubmit
+ * threads its `targetChannel` argument for.
+ */
+test("creating a node-targeted agent from within a channel attaches it without a local spawn", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+  await page.getByTestId("channel-intro-action-create-agent").click();
+  await page.getByTestId("add-channel-create-agent").click();
+  await expect(page).toHaveURL(/#\/channels\//);
+
+  const dialog = page.getByTestId("persona-dialog");
+  await expect(dialog).toBeVisible({ timeout: 10_000 });
+  await waitForSeedHook(page);
+  await page.evaluate(
+    (events) => {
+      window.__BUZZ_E2E_SEED_NODE_EVENTS__?.(events);
+    },
+    [
+      announceEvent(ONLINE_NODE_PUBKEY, 1),
+      presenceEvent(ONLINE_NODE_PUBKEY, "online", 2),
+    ],
+  );
+
+  const agentName = `Channel Node Agent ${Date.now()}`;
+  await dialog.locator("#persona-display-name").fill(agentName);
+
+  // Same local-mode AI-config gate as the test above.
+  await dialog.getByRole("tab", { name: "Customize for this agent" }).click();
+  const llmProvider = dialog.locator("#persona-llm-provider");
+  await expect(llmProvider).toBeVisible({ timeout: 10_000 });
+  await llmProvider.press("Enter");
+  await page
+    .getByRole("menuitemradio", { exact: true, name: "Buzz shared compute" })
+    .click();
+
+  const advanced = dialog.getByRole("button", {
+    name: "Advanced",
+    exact: true,
+  });
+  await expect(dialog.locator("#agent-run-on")).toHaveCount(0);
+  await advanced.click();
+  await expect(advanced).toHaveAttribute("aria-expanded", "true");
+  const runOnTrigger = dialog.locator("#agent-run-on");
+  await runOnTrigger.press("Enter");
+  await page
+    .getByRole("menuitemradio", { name: ONLINE_NODE_PUBKEY, exact: true })
+    .press("Enter");
+  await expect(runOnTrigger).toContainText(ONLINE_NODE_PUBKEY);
+
+  await dialog.getByTestId("persona-dialog-submit").click();
+  const createdToast = page
+    .locator("[data-sonner-toast][data-removed='false']")
+    .filter({ hasText: "Agent created" });
+  await expect(createdToast).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  const outcome = await page.evaluate(() => {
+    const log = window.__BUZZ_E2E_COMMAND_LOG__ ?? [];
+    const assignment = log.find(
+      (entry) => entry.command === "publish_agent_assignment",
+    )?.payload as
+      | { agentId: string; nodePubkey: string; assigned: boolean }
+      | undefined;
+    const addMembers = log.find(
+      (entry) => entry.command === "add_channel_members",
+    )?.payload as { pubkeys: string[] } | undefined;
+    const startCount = log.filter(
+      (entry) => entry.command === "start_managed_agent",
+    ).length;
+    return { assignment, addMembers, startCount };
+  });
+
+  expect(outcome.assignment).toBeTruthy();
+  expect(outcome.assignment?.nodePubkey).toBe(ONLINE_NODE_PUBKEY);
+  expect(outcome.assignment?.assigned).toBe(true);
+  // Still attached: membership must not be dropped for a node-hosted agent.
+  expect(outcome.addMembers?.pubkeys).toContain(outcome.assignment?.agentId);
+  // The core assertion: never a local spawn for a node-targeted agent, not
+  // even transiently before the assignment echoes back into nodesStore.
+  expect(outcome.startCount).toBe(0);
+});

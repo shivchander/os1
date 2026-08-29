@@ -249,6 +249,14 @@ export function usePersonaActions() {
           await createdAgentAttachment.presentCreatedAgent(
             created,
             targetChannel,
+            // Known synchronously from this create's own start intent, not
+            // from nodesStore: the node assignment below hasn't even been
+            // published yet at this point, let alone echoed back through
+            // this client's own live subscription (see
+            // useCreatedAgentChannelAttachment's PresentCreatedAgentOptions
+            // doc comment) — attach-to-channel must never locally start a
+            // node-targeted agent regardless of that timing.
+            { ensureRunning: startIntent?.type !== "node" },
           );
           if (created.spawnError) {
             setPersonaErrorMessage(

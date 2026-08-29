@@ -6,6 +6,7 @@ import {
   resolveReusableAgentAccessPolicy,
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
+import { isNodeHostedAgent } from "@/features/agents/lib/managedAgentControlActions";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { resolveManagedAgentAvatarUrl } from "@/features/agents/ui/managedAgentAvatar";
 import {
@@ -167,7 +168,14 @@ export async function attachManagedAgentToChannel(
   let agent = input.agent;
   let started = false;
 
-  if (ensureRunning) {
+  // Membership (above) is unconditional — a node-hosted agent is still a real
+  // channel member, and the node's own copy participates over the relay.
+  // Only the local ensure-running/spawn step below is skipped for one: this
+  // function's caller may be reached from a node-targeted agent create (or an
+  // "add existing member" / channel-preset flow) with zero node awareness of
+  // its own, and starting it here would spawn a second, competing process
+  // under the same identity/key that the target node is already running.
+  if (ensureRunning && !isNodeHostedAgent(input.agent)) {
     // Running agents (local or provider) auto-discover new channel membership
     // via the harness's membership notifications — no restart needed. Only
     // not-yet-running agents need a start/deploy call before the first mention

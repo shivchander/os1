@@ -241,10 +241,21 @@ export function useAgentManagement() {
         const targetChannel = (channelsQuery.data ?? []).find(
           (channel) => channel.id === request.request.channelId,
         );
-        await createdAgentAttachment.presentCreatedAgent(created, {
-          id: request.request.channelId,
-          name: targetChannel?.name ?? "this channel",
-        });
+        await createdAgentAttachment.presentCreatedAgent(
+          created,
+          {
+            id: request.request.channelId,
+            name: targetChannel?.name ?? "this channel",
+          },
+          // Known synchronously from this create's own backend intent, not
+          // from nodesStore: the assignment publish above only guarantees
+          // the relay accepted the event, not that it has already echoed
+          // back through this client's own live subscription (see
+          // useCreatedAgentChannelAttachment's PresentCreatedAgentOptions
+          // doc comment) — attach-to-channel must never locally start a
+          // node-targeted agent, regardless of that timing.
+          { ensureRunning: backendIntent?.type !== "node" },
+        );
       }
 
       await Promise.all([

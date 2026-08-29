@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach, beforeEach } from "node:test";
 
+import { ingestNodeEvent, resetNodesStore } from "@/shared/api/nodesStore";
+import { KIND_AGENT_ASSIGNMENT } from "@/shared/constants/kinds";
 import {
   areWelcomeTeammatesOnline,
   buildWelcomeKickoffCloser,
@@ -9,6 +11,7 @@ import {
   classifyWelcomeKickoffResolution,
   createWelcomeKickoffCoordinator,
   mergeKickoffEvents,
+  restartWelcomeTeammate,
   resolveWelcomeAgentSet,
   selectWelcomeKickoffIntroTeammates,
   waitForWelcomeKickoffBeat,
@@ -27,6 +30,30 @@ function agent(name, personaId, pubkey) {
     lastError: null,
     lastStartedAt: null,
   };
+}
+
+beforeEach(() => {
+  resetNodesStore();
+});
+
+afterEach(() => {
+  resetNodesStore();
+});
+
+function assign(agentPubkey, state = "assigned") {
+  ingestNodeEvent({
+    id: `assign-${agentPubkey}-${state}`,
+    kind: KIND_AGENT_ASSIGNMENT,
+    pubkey: "owner1",
+    created_at: 1,
+    tags: [
+      ["d", agentPubkey],
+      ["node", "node1"],
+      ["state", state],
+    ],
+    sig: "sig",
+    content: "encrypted-marker",
+  });
 }
 
 const fizz = agent("Fizz", "builtin:fizz", "f".repeat(64));
@@ -467,4 +494,60 @@ test("merging the opener subtree never double-counts an already-visible reply", 
 test("merging with no subtree replies leaves the channel events untouched", () => {
   const channelEvents = [kickoffOpener];
   assert.equal(mergeKickoffEvents(channelEvents, []), channelEvents);
+});
+
+// ── restartWelcomeTeammate / node-hosted skip (Phase 4 fix-round-3) ───────
+//
+// A node-hosted teammate's target execution node runs it, not the desktop —
+// restarting it here would spawn a second, competing process under the same
+// identity/key. Stopping a stale local copy is still safe and still runs
+// (mirrors managedAgentControlActions.ts's stopManagedAgentWithRules: a stop
+// can only reduce, never cause, a double-run).
+
+test("restartWelcomeTeammate stops a running node-hosted teammate but does not restart it locally", async () => {
+  const hostedAgent = { ...honey, status: "running" };
+  assign(hostedAgent.pubkey, "assigned");
+  let stopCalled = false;
+  let startCalled = false;
+  let onStoppedCalled = false;
+
+  const result = await restartWelcomeTeammate(hostedAgent, {
+    stopAgent: async () => {
+      stopCalled = true;
+    },
+    startAgent: async () => {
+      startCalled = true;
+    },
+    onStopped: () => {
+      onStoppedCalled = true;
+    },
+  });
+
+  assert.equal(stopCalled, true, "a stale local copy must still be stopped");
+  assert.equal(onStoppedCalled, true);
+  assert.equal(
+    startCalled,
+    false,
+    "must never restart a node-hosted teammate locally",
+  );
+  assert.equal(result, hostedAgent);
+});
+
+test("restartWelcomeTeammate restarts a non-hosted running teammate as before", async () => {
+  const localAgent = { ...honey, status: "running" };
+  let stopCalled = false;
+  let startCalled = false;
+
+  await restartWelcomeTeammate(localAgent, {
+    stopAgent: async () => {
+      stopCalled = true;
+    },
+    startAgent: async () => {
+      startCalled = true;
+      return localAgent;
+    },
+  });
+
+  assert.equal(stopCalled, true);
+  assert.equal(startCalled, true);
 });

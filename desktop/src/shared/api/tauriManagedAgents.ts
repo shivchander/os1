@@ -1,3 +1,4 @@
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
 import {
   fromRawManagedAgent,
   invokeTauri,
@@ -8,6 +9,15 @@ import type {
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
 
+/**
+ * Fail-closed backstop: a node-hosted agent (an active `AGENT_ASSIGNMENT` —
+ * see `nodesStore.ts`) is run by its target execution node, not the desktop.
+ * Starting it here would spawn a second, competing process under the same
+ * identity/key. Every known caller already skips its own `startManagedAgent`
+ * call for a node-hosted agent (see `managedAgentControlActions.ts`,
+ * `channelAgents.ts`, `welcomeKickoff.ts`, etc.) — this throw exists so a
+ * future ungated caller fails loudly instead of silently double-spawning.
+ */
 export async function startManagedAgent(
   pubkey: string,
   options?: {
@@ -20,6 +30,11 @@ export async function startManagedAgent(
     expectedSignerPubkey?: string;
   },
 ): Promise<ManagedAgent> {
+  if (isAgentNodeHosted(pubkey)) {
+    throw new Error(
+      "This agent runs on an execution node — node-hosted agents must not be started locally.",
+    );
+  }
   const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
     pubkey,
     expectedRelayUrl: options?.expectedRelayUrl ?? null,

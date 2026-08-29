@@ -6,6 +6,7 @@ import {
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
+import { isNodeHostedAgent } from "@/features/agents/lib/managedAgentControlActions";
 import {
   startManagedAgent,
   stopManagedAgent,
@@ -77,6 +78,7 @@ export function useAutoRestartPolicy() {
         workingSource: working.source,
         connected: observer.connectionState === "open",
         isLocalBackend: agent.backend.type === "local",
+        isNodeHosted: isNodeHostedAgent(agent),
         isRunning,
         edgeConsumed: edge.consumed,
         quiescentForMs: edge.armedAt === null ? 0 : now - edge.armedAt,

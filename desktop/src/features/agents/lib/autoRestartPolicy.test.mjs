@@ -23,6 +23,7 @@ function greenInputs(overrides = {}) {
     workingSource: "none",
     connected: true,
     isLocalBackend: true,
+    isNodeHosted: false,
     isRunning: true,
     edgeConsumed: false,
     quiescentForMs: AUTO_RESTART_QUIESCENCE_MS,
@@ -55,6 +56,10 @@ const NEVER_FIRE_ROWS = [
   ["typing source alone defers", { workingSource: "typing" }],
   ["observer relay not connected", { connected: false }],
   ["remote backend", { isLocalBackend: false }],
+  [
+    "node-hosted agent (target node owns its process, even if the local record still reads running)",
+    { isNodeHosted: true },
+  ],
   ["agent not running", { isRunning: false }],
   [
     "edge already consumed (one attempt per rising edge)",

@@ -21,6 +21,7 @@ import {
 import { isWelcomeChannel } from "@/features/onboarding/welcome";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { useThreadReplies } from "@/features/messages/useThreadReplies";
+import { isAgentNodeHosted } from "@/shared/api/nodesStore";
 import {
   startManagedAgent,
   stopManagedAgent,
@@ -464,6 +465,12 @@ export async function restartWelcomeTeammate(
     await stopAgent(agent.pubkey);
     options.onStopped?.();
   }
+  // A node-hosted agent's target node runs it, not the desktop — stopping a
+  // stale local copy above is still correct, but restarting it here would
+  // spawn a second, competing process under the same identity/key.
+  if (isAgentNodeHosted(agent.pubkey)) {
+    return agent;
+  }
   return startAgent(agent.pubkey);
 }
 
@@ -627,7 +634,13 @@ export function useWelcomeKickoff(
                 onStopped: () => clearActiveTurnsForAgentOnStop(agent.pubkey),
               });
             }
-            return agent.status === "running" || agent.status === "deployed"
+            // A node-hosted teammate is run by its target node, not the
+            // desktop — treat it like an already-running agent so it is
+            // never locally spawned a second time (see restartWelcomeTeammate
+            // above for the same principle applied to the restart path).
+            return agent.status === "running" ||
+              agent.status === "deployed" ||
+              isAgentNodeHosted(agent.pubkey)
               ? Promise.resolve(agent)
               : startManagedAgent(agent.pubkey);
           }),

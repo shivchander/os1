@@ -18,6 +18,8 @@ import type {
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { AgentConfigPanel } from "./AgentConfigPanel";
+import { AgentNodeControls } from "./AgentNodeControls";
+import { AgentNodeStatusBadge } from "./AgentNodeStatusBadge";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
@@ -120,6 +122,7 @@ export function ManagedAgentRow({
                 presenceStatus={presenceStatus}
               />
               <StatusBlock
+                agentPubkey={agent.pubkey}
                 friendlyError={friendlyError}
                 isWorking={isWorking}
                 presenceLoaded={presenceLoaded}
@@ -143,6 +146,7 @@ export function ManagedAgentRow({
                 presenceStatus={presenceStatus}
               />
               <StatusBlock
+                agentPubkey={agent.pubkey}
                 friendlyError={friendlyError}
                 isWorking={isWorking}
                 presenceLoaded={presenceLoaded}
@@ -165,6 +169,7 @@ export function ManagedAgentRow({
               restartDiff={agent.restartDiff}
             />
           ) : null}
+          <AgentNodeControls agent={agent} />
           <Button
             onClick={() => onOpenProfile(agent.pubkey)}
             size="sm"
@@ -354,6 +359,7 @@ function WorkingBadge({
 }
 
 function StatusBlock({
+  agentPubkey,
   friendlyError,
   isWorking,
   presenceLoaded,
@@ -361,6 +367,7 @@ function StatusBlock({
   processDetail,
   status,
 }: {
+  agentPubkey: string;
   friendlyError: ReturnType<typeof friendlyAgentLastError>;
   isWorking: boolean;
   presenceLoaded: boolean;
@@ -377,6 +384,7 @@ function StatusBlock({
         presenceStatus={presenceStatus}
         status={status}
       />
+      <AgentNodeStatusBadge agentPubkey={agentPubkey} />
       <p className="text-xs text-muted-foreground">{processDetail}</p>
       {friendlyError ? (
         <p

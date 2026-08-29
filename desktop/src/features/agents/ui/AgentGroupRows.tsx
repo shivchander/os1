@@ -1,3 +1,6 @@
+import * as React from "react";
+
+import { ensureNodesRelaySubscription } from "@/shared/api/nodesStore";
 import type { ManagedAgent, PresenceLookup } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { ManagedAgentRow } from "./ManagedAgentRow";
@@ -31,6 +34,14 @@ export function AgentGroupRows({
   onOpenProfile,
   onSelectLogAgent,
 }: AgentGroupRowsProps) {
+  // Agent cards read node status/roster from nodesStore (AgentNodeStatusBadge,
+  // AgentNodeControls); ensure its live subscription is running whenever the
+  // agent list is on screen, even if the Nodes panel itself was never
+  // visited. Idempotent — safe alongside NodesPanel's own call.
+  React.useEffect(() => {
+    void ensureNodesRelaySubscription();
+  }, []);
+
   return (
     <div className="divide-y divide-border/50 border-t border-border/50">
       {agents.map((agent) => (

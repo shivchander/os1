@@ -11,12 +11,15 @@ import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlA
 import { pickProfileAgent } from "@/features/agents/lib/pickProfileAgent";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
 import { useUserProfileQuery } from "@/features/profile/hooks";
+import { ensureNodesRelaySubscription } from "@/shared/api/nodesStore";
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
 import type { ProfilePanelOpenOptions } from "@/shared/context/ProfilePanelContext";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { Badge } from "@/shared/ui/badge";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
+import { AgentNodeControls } from "./AgentNodeControls";
+import { AgentNodeStatusBadge } from "./AgentNodeStatusBadge";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { PersonaActionsMenu } from "./PersonaActionsMenu";
@@ -95,6 +98,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onDeletePersona,
   } = props;
 
+  // Agent cards read node status/roster from nodesStore (AgentNodeStatusBadge,
+  // AgentNodeControls below); ensure its live subscription is running
+  // whenever the agents view is on screen, even if the Nodes panel was never
+  // visited. Idempotent — safe alongside NodesPanel's own call.
+  React.useEffect(() => {
+    void ensureNodesRelaySubscription();
+  }, []);
+
   const isArchived = useIsArchivedPredicate();
   const { groups, ungrouped, unknown } = React.useMemo(
     () => buildUnifiedGroups(personas, agents, isArchived),
@@ -135,21 +146,30 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               return (
                 <AgentPersonaCard
                   actions={(effectiveAvatarUrl, isEffectiveAvatarLoading) => (
-                    <PersonaActionsMenu
-                      isActionPending={
-                        isActionPending || isEffectiveAvatarLoading
-                      }
-                      isPending={isPersonasPending}
-                      persona={group.persona}
-                      linkedAgent={profileAgent}
-                      onDeactivate={onDeactivatePersona}
-                      onDelete={onDeletePersona}
-                      onDuplicate={onDuplicatePersona}
-                      onEdit={onEditPersona}
-                      onShare={(persona, linkedAgent) =>
-                        onSharePersona(persona, linkedAgent, effectiveAvatarUrl)
-                      }
-                    />
+                    <div className="flex items-center gap-1">
+                      {profileAgent ? (
+                        <AgentNodeControls agent={profileAgent} />
+                      ) : null}
+                      <PersonaActionsMenu
+                        isActionPending={
+                          isActionPending || isEffectiveAvatarLoading
+                        }
+                        isPending={isPersonasPending}
+                        persona={group.persona}
+                        linkedAgent={profileAgent}
+                        onDeactivate={onDeactivatePersona}
+                        onDelete={onDeletePersona}
+                        onDuplicate={onDuplicatePersona}
+                        onEdit={onEditPersona}
+                        onShare={(persona, linkedAgent) =>
+                          onSharePersona(
+                            persona,
+                            linkedAgent,
+                            effectiveAvatarUrl,
+                          )
+                        }
+                      />
+                    </div>
                   )}
                   agent={profileAgent}
                   defaultModel={defaultModel}
@@ -326,11 +346,16 @@ function AgentPersonaCard({
         onOpenPersonaProfile(persona);
       }}
       statusBadge={
-        agent?.personaOrphaned ? (
-          <Badge className="gap-1" variant="warning">
-            <AlertTriangle className="h-3 w-3" />
-            Configuration missing
-          </Badge>
+        agent ? (
+          <div className="flex flex-col gap-0.5">
+            {agent.personaOrphaned ? (
+              <Badge className="w-fit gap-1" variant="warning">
+                <AlertTriangle className="h-3 w-3" />
+                Configuration missing
+              </Badge>
+            ) : null}
+            <AgentNodeStatusBadge agentPubkey={agent.pubkey} />
+          </div>
         ) : null
       }
     />
@@ -368,6 +393,7 @@ function StandaloneAgentCard({
 
   return (
     <AgentIdentityCard
+      actions={<AgentNodeControls agent={agent} />}
       ariaLabel={`${title} agent profile`}
       avatar={
         <AgentRuntimeAvatarControl
@@ -407,12 +433,15 @@ function StandaloneAgentCard({
         );
       }}
       statusBadge={
-        agent.personaOrphaned ? (
-          <Badge className="gap-1" variant="warning">
-            <AlertTriangle className="h-3 w-3" />
-            Configuration missing
-          </Badge>
-        ) : null
+        <div className="flex flex-col gap-0.5">
+          {agent.personaOrphaned ? (
+            <Badge className="w-fit gap-1" variant="warning">
+              <AlertTriangle className="h-3 w-3" />
+              Configuration missing
+            </Badge>
+          ) : null}
+          <AgentNodeStatusBadge agentPubkey={agent.pubkey} />
+        </div>
       }
     />
   );

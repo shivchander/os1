@@ -29,13 +29,46 @@ committed piece will actually pass its tests.
 
 ## Phase checklist
 - [x] Plans written & committed (all 5 phase plans; contract-consistent)
-- [ ] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` green)
-- [ ] Phase 2 — buzz-node reconciler core + engine vs fakes (`cargo test -p buzz-node` green)
-- [ ] Phase 3 — real substrate + relay wiring + daemon (unit green; e2e written, infra-gated)
+- [x] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` 276/276, clippy -D warnings + fmt clean; reviewed ✅)
+- [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
+- [x] Phase 3 — real substrate + relay wiring + daemon (buzz-node builds; 65 tests/2 gated, clippy+fmt clean; Groups A/B reviewed, Group C accepted on verified-green + deferred to final review)
 - [ ] Phase 4 — desktop Nodes surface + Run-on picker + status (desktop gates green)
 - [ ] Phase 5 — move/resilience + two-node e2e (unit green; e2e written, infra-gated)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 3 ✅ COMPLETE — 3 of 3 groups): Group C = `buzz-node` daemon binary (detached
+  `up`, PID/status singleton guard, `autostart`, CLI) wiring enroll + NostrNodeRelay +
+  LocalProcessSubstrate + AcpRuntime + engine::run, with graceful shutdown that AWAITS a final
+  offline-presence publish; + gated enroll→assign→running e2e (#[ignore]). daemon.rs split into
+  daemon/{cli,singleton,autostart}. 65 tests/2 gated, clippy+fmt clean, binary builds. Note: both
+  Group-C reviewer subagents wedged at the report step (environmental, not a code signal) — Group C
+  ACCEPTED on controller-verified green + deferred to the final whole-branch review. **The whole
+  relay-side + node runtime (Phases 1-3) is implemented and on the fork.** → Phase 4 (desktop UI).
+- 2026-08-29 (Phase 3 Group B ✅ — 2 of 3): NostrNodeRelay (dial-out/NIP-42/reconnect, assignment
+  intake via decrypt_for_node→DesiredAgent, status/announce/presence publish) + enrollment (pairing
+  code, keychain node key behind a SecretStore trait, NODE_ENROLLMENT wait). Review + fix round 1
+  closed a real relay-outage bug (decoupled publish so a down relay no longer freezes crash-recovery)
+  and documented enrollment TOFU. 46 tests / 2 gated, clippy + fmt clean. Pushed. → Group C (daemon
+  binary + gated e2e) = last of Phase 3.
+- 2026-08-29 (Phase 3 Group A ✅ — 1 of 3): buzz-node real process layer — AgentRuntime seam +
+  AcpRuntime (env from decrypted nsec, zeroized; own process group) + LocalProcessSubstrate
+  (per-agent workspaces, 3-crash/60s breaker, graceful process-group SIGTERM→SIGKILL). Review
+  Approved; fix round 1 closed 2 Important (per-agent `start()` containment so one bad agent can't
+  kill the whole node loop; a proven descendant-reaping test) + a `.lock().expect()` cleanup.
+  29/29 tests, clippy -D warnings + fmt clean, no orphan processes. Pushed. → Group B
+  (NostrNodeRelay + enrollment), then Group C (daemon + gated e2e).
+- 2026-08-29 (Phase 2 ✅ done & reviewed): `buzz-node` crate — pure `reconcile()` (13 transition
+  tests) + `Substrate`/`NodeRelay` traits + in-memory fakes + `engine::run` loop (assign→start,
+  unassign→stop, crash→restart). 21/21 tests, clippy -D warnings + fmt clean; review Approved
+  (reviewer independently re-ran test/clippy/fmt + hand-enumerated the decision table). 6 commits
+  pushed. 1 minor deferred (sort test robustness). → Phase 3 (real substrate + relay + daemon),
+  run as 3 sequential groups; its live-relay e2e stays #[ignore] (infra-gated).
+- 2026-08-29 (Phase 1 ✅ done & reviewed): buzz-core codecs — 4 kinds 39500-39503
+  (NODE_ANNOUNCE / NODE_ENROLLMENT / AGENT_ASSIGNMENT[nsec NIP-44-encrypted to the target node] /
+  AGENT_NODE_STATUS). 276/276 tests, clippy -D warnings + fmt clean; task review Approved (crypto
+  tests independently re-run by the reviewer). 5 commits pushed to origin. 2 minors deferred
+  (ALL_KINDS registry entry; ciphertext-length bound). → dispatching Phase 2 (buzz-node reconciler
+  + engine against fakes).
 - 2026-08-29 (docs complete): All 5 phase plans written and consistency-checked — core contract
   (`DesiredAgent`/`Observed`/`Action`/`Substrate`/`NodeRelay`/`reconcile`/`Engine`/`AgentRuntime`)
   consistent across phases. **Phase 2's implemented interfaces are authoritative**; minor Phase-5

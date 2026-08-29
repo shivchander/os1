@@ -31,11 +31,17 @@ committed piece will actually pass its tests.
 - [x] Plans written & committed (all 5 phase plans; contract-consistent)
 - [x] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` 276/276, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
-- [~] Phase 3 — Groups A/B done+reviewed; Group C **Task 5 (daemon) done+Approved** BUT **Task 6 (gated e2e_node.rs) was never written — REOPENED**. Also 2 Phase-2-file gaps → Phase 5: presence not republished on cadence (product-blocking), shutdown doesn't stop agents. (I wrongly marked this complete earlier — corrected.)
+- [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [~] Phase 4 — G1 native Tauri commands (publish_node_enrollment / publish_agent_assignment) DONE + reviewed Approved + pushed; G2 (nodes store + Nodes panel) and G3 (Run-on picker + status) pending
 - [ ] Phase 5 — move/resilience + two-node e2e (unit green; e2e written, infra-gated)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 3 ✅ TRULY COMPLETE): Group C finished — Task 6 gated e2e_node.rs
+  (enroll→assign→running, #[ignore], compiles via --no-run) + hermetic spawn_detached PID-file test.
+  Verified green: 66 pass + 3 gated, clippy + fmt clean, e2e compiles. **The full relay-side + node
+  runtime (buzz-core codecs + buzz-node daemon: reconciler, real process supervision, relay wiring,
+  enrollment, graceful shutdown, gated e2e) is implemented & tested on the fork.** → Phase 4 G2 (Nodes
+  UI). REMINDER: Phase 5 must fix the presence-cadence product-blocker (daemon appears offline after 3min).
 - 2026-08-29 (CORRECTION + Phase 4 G1 ✅): (a) I prematurely marked Phase 3 complete — the delayed
   Group-C reviews + salvage report revealed **Task 6 (gated e2e_node.rs) was NEVER written** (Task 5
   daemon IS done + Approved by both reviewers). Reopening Phase 3 to write Task 6 + a spawn_detached

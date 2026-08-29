@@ -32,10 +32,20 @@ committed piece will actually pass its tests.
 - [x] Phase 1 — buzz-core protocol codecs (`cargo test -p buzz-core` 276/276, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
-- [~] Phase 4 — G1 native Tauri commands (publish_node_enrollment / publish_agent_assignment) DONE + reviewed Approved + pushed; G2 (nodes store + Nodes panel) and G3 (Run-on picker + status) pending
+- [~] Phase 4 — G1 (native Tauri commands) + G2 (nodes live store + Nodes panel + enrollment approval, presence author-scoped) DONE + reviewed + pushed; G3 (Run-on picker + agent-card status/controls) pending
 - [ ] Phase 5 — move/resilience + two-node e2e (unit green; e2e written, infra-gated)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 4 G2 ✅): Nodes live store + Nodes panel + enrollment approval; review caught +
+  fix closed the unscoped-presence bug (now author-scoped to node pubkeys via the shared
+  PresenceSubscriptionReconciler). tsc/biome/playwright green, full suite 5788/5788. Pushed. → next:
+  PRESENCE-CADENCE fix (Phase 5 #3, product-blocker), then Phase 4 G3.
+- 2026-08-29 (owner awake — steering): decisions: (1) CONTINUE autonomous loop; (2) NEW PRIORITY —
+  after the in-flight G2 presence-scope fix pushes, do the **Phase-5 presence-CADENCE fix (#3, the
+  product-blocker: engine.rs must republish kind:20001 every ≤60s vs the relay's 180s TTL)** NEXT,
+  ahead of Phase 4 G3. Then G3, then the rest of Phase 5 (#4 shutdown-stops-agents, move-flow,
+  two-node e2e). Status at handoff: Phases 1-3 + Phase 4 G1 pushed & reviewed-green; G2 committed
+  locally (ahead 2), review Needs-fixes (unscoped presence sub) → fix round 1 in flight.
 - 2026-08-29 (Phase 3 ✅ TRULY COMPLETE): Group C finished — Task 6 gated e2e_node.rs
   (enroll→assign→running, #[ignore], compiles via --no-run) + hermetic spawn_detached PID-file test.
   Verified green: 66 pass + 3 gated, clippy + fmt clean, e2e compiles. **The full relay-side + node

@@ -7,6 +7,8 @@
 
 /// NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
 pub mod agent_turn_metric;
+/// `AGENT_ASSIGNMENT` codec: owner-signed, node-encrypted agent→node assignment.
+pub mod assignment;
 /// Channel and membership enums shared across crates.
 pub mod channel;
 /// NIP-AE Agent Engrams — slug grammar, conversation key, d-tag derivation,

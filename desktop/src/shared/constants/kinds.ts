@@ -82,6 +82,20 @@ export const KIND_GIT_STATUS_DRAFT = 1633;
 // h-tags = currently-hidden DM channel ids).
 export const KIND_DM_VISIBILITY = 30622;
 
+// Execution nodes (39500-39503). Mirrors buzz-core/src/kind.rs exactly —
+// keep both in sync. All four are parameterized-replaceable; liveness for a
+// node is carried separately via presence (KIND_PRESENCE_UPDATE), keyed by
+// the node's own pubkey as author.
+// Node self-announcement (capabilities + workspace root); d = node pubkey.
+export const KIND_NODE_ANNOUNCE = 39500;
+// Owner-signed trust link authorizing a node; d = node pubkey.
+export const KIND_NODE_ENROLLMENT = 39501;
+// Owner-signed agent->node desired-state assignment; d = agent pubkey. The
+// agent nsec + launch env travel NIP-44-encrypted to the target node.
+export const KIND_AGENT_ASSIGNMENT = 39502;
+// Node-authored observed per-agent health; d = agent pubkey.
+export const KIND_AGENT_NODE_STATUS = 39503;
+
 // Human-visible "new content" message kinds. Used as the unread trigger set
 // (sidebar badges, catch-up queries) and as the Home-feed mention query.
 // Reactions, edits, diffs, deletions, and system messages are deliberately

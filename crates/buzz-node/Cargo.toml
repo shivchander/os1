@@ -1,0 +1,23 @@
+[package]
+name = "buzz-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buzz-core = { path = "../buzz-core" }
+nostr = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+# Exposes the in-memory FakeSubstrate/FakeRelay for cross-crate tests (Phase 5 e2e).
+test-utils = []
+
+[dev-dependencies]
+tokio = { workspace = true }

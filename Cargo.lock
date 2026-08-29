@@ -1158,6 +1158,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-node"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "buzz-core",
+ "chrono",
+ "nostr 0.44.7",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "buzz-pair-relay"
 version = "0.1.0"
 dependencies = [

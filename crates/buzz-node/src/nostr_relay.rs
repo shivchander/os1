@@ -5,7 +5,7 @@
 //! has no reconnect of its own — this module owns that). Publishes run on a
 //! background task (see [`NostrNodeRelay::spawn_publish`]) so a down relay
 //! never blocks the node's local reconcile loop.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,6 +92,87 @@ struct Conn {
     ws: NostrWsConnection,
 }
 
+/// Distinguishes independent publish streams for [`PublishCoalescer`]: the
+/// Nostr event kind plus its NIP-33 `d`-tag identifier, if any (`None` for
+/// non-addressable kinds like presence). Two different agents'
+/// `AGENT_NODE_STATUS` streams (same kind, different `d`) must stay
+/// independent — coalescing across them would silently drop a distinct
+/// agent's status update, not just a repeated one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PublishKey {
+    kind: u16,
+    identifier: Option<String>,
+}
+
+impl PublishKey {
+    fn for_event(event: &Event) -> Self {
+        Self {
+            kind: event.kind.as_u16(),
+            identifier: event.tags.identifier().map(str::to_string),
+        }
+    }
+}
+
+/// Coalesces repeated publishes of the same logical stream (see
+/// [`PublishKey`]) into at most one in-flight background task per key.
+///
+/// Without this, a long relay outage during which the engine republishes an
+/// agent's status on every reconcile tick (any `Observed` state but
+/// `Absent` is "worth reporting" — see `crate::health::classify`) would
+/// have [`NostrNodeRelay::spawn_publish`] `tokio::spawn` a brand new task
+/// on every tick, each independently retrying `Inner::ensure_connected`'s
+/// reconnect-forever loop — an unbounded number of parked tasks for the
+/// duration of the outage (Phase 3 residual). With this, a publish call
+/// that arrives while a task is already in flight for its key REPLACES the
+/// payload that task will send next, rather than spawning a second one:
+/// newest always wins, and any earlier not-yet-sent replacement is simply
+/// dropped.
+#[derive(Default)]
+struct PublishCoalescer {
+    /// A present key means a task is currently claimed for it. The value is
+    /// the next payload queued for that task to send once its current send
+    /// completes (`None` = nothing queued yet — the claiming send is still
+    /// in progress).
+    inflight: HashMap<PublishKey, Option<Event>>,
+}
+
+impl PublishCoalescer {
+    /// Offer `event` (whose coalescing key is `key`) for publish. Returns
+    /// `Some(event)` if no task is currently running for `key` — the caller
+    /// has just claimed the slot and must spawn a task, starting with
+    /// `event`. Returns `None` if a task is already in flight for `key`:
+    /// `event` has been queued as the payload that task will send next
+    /// (replacing any earlier not-yet-sent replacement), and the caller
+    /// must NOT spawn anything.
+    fn offer(&mut self, key: PublishKey, event: Event) -> Option<Event> {
+        match self.inflight.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(None);
+                Some(event)
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.insert(Some(event));
+                None
+            }
+        }
+    }
+
+    /// Called once an in-flight task finishes sending `key`'s current
+    /// event. Returns the next event to send — keep looping the same task —
+    /// if one was queued while it worked, or `None` if the slot has been
+    /// released (a future `offer` for this key will spawn a fresh task).
+    fn next_or_release(&mut self, key: &PublishKey) -> Option<Event> {
+        let slot = self.inflight.get_mut(key)?;
+        match slot.take() {
+            Some(next) => Some(next),
+            None => {
+                self.inflight.remove(key);
+                None
+            }
+        }
+    }
+}
+
 /// Shared connection state, wrapped in an `Arc` so the background publish
 /// task spawned by [`NostrNodeRelay::spawn_publish`] can outlive the
 /// `&self` call that spawned it.
@@ -114,9 +195,22 @@ struct Inner {
     /// connect" (already covered by `reconnected`'s pre-seed) from a real
     /// reconnect for `ensure_connected`'s `reconnected`-arming logic.
     has_connected_once: std::sync::atomic::AtomicBool,
+    /// Coalescing state for [`NostrNodeRelay::spawn_publish`] — see
+    /// [`PublishCoalescer`].
+    coalescer: std::sync::Mutex<PublishCoalescer>,
 }
 
 impl Inner {
+    /// Lock `self.coalescer`, recovering from a poisoned mutex rather than
+    /// panicking (mirrors `NostrNodeRelay::lock_desired`'s precedent):
+    /// another call already panicked while holding it, which must not
+    /// additionally crash *this* caller.
+    fn lock_coalescer(&self) -> std::sync::MutexGuard<'_, PublishCoalescer> {
+        self.coalescer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Ensure `*guard` holds a live, authenticated, subscribed connection,
     /// (re)connecting with the [`backoff_delay`] ladder until it succeeds.
     /// Never gives up: a down relay is a condition this daemon must ride
@@ -241,8 +335,10 @@ pub struct NostrNodeRelay {
 /// latest stored copy, but `seen_created_at` defends this client-side
 /// accumulation against an older event reaching us after a newer one — e.g.
 /// a live-tail event racing a concurrent [`NostrNodeRelay::query_desired`]
-/// resync — from clobbering already-applied newer state.
-#[derive(Default)]
+/// resync — from clobbering already-applied newer state. `Clone` so
+/// [`NostrNodeRelay::query_desired`] can seed a resync from the current
+/// state instead of rebuilding from scratch — see its doc comment.
+#[derive(Default, Clone)]
 struct DesiredState {
     desired: BTreeMap<PublicKey, DesiredAgent>,
     seen_created_at: BTreeMap<PublicKey, u64>,
@@ -307,6 +403,7 @@ impl NostrNodeRelay {
                 conn: Mutex::new(None),
                 reconnected: std::sync::atomic::AtomicBool::new(true),
                 has_connected_once: std::sync::atomic::AtomicBool::new(false),
+                coalescer: std::sync::Mutex::new(PublishCoalescer::default()),
             }),
             desired: std::sync::Mutex::new(DesiredState::default()),
         }
@@ -366,11 +463,31 @@ impl NostrNodeRelay {
     /// newer one, never corrupt relay state. A background failure (e.g. an
     /// explicit relay rejection) is only logged — there is no caller left
     /// awaiting this task's result to propagate it to.
+    ///
+    /// Coalesced through [`PublishCoalescer`] (Phase 5 cleanup): if a task
+    /// is already in flight for `event`'s key (e.g. still retrying against
+    /// a down relay), `event` just replaces that task's next payload
+    /// instead of spawning a second concurrent one — see
+    /// [`PublishCoalescer`]'s doc comment for why an uncoalesced version of
+    /// this would accumulate an unbounded number of parked tasks over a
+    /// long outage.
     fn spawn_publish(&self, event: Event) {
+        let key = PublishKey::for_event(&event);
+        let Some(mut current) = self.inner.lock_coalescer().offer(key.clone(), event) else {
+            // A task is already in flight for this key; `event` was queued
+            // as its next payload above -- nothing more to do here.
+            return;
+        };
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            if let Err(e) = inner.publish_with_retry(event).await {
-                tracing::warn!(error = %e, "background publish failed");
+            loop {
+                if let Err(e) = inner.publish_with_retry(current).await {
+                    tracing::warn!(error = %e, "background publish failed");
+                }
+                match inner.lock_coalescer().next_or_release(&key) {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
         });
     }
@@ -499,7 +616,21 @@ impl NodeRelay for NostrNodeRelay {
 
     async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError> {
         let events = self.fetch_assignment_backlog().await?;
-        let mut fresh = DesiredState::default();
+        // Seed from a CLONE of the current live-tail state, not
+        // `DesiredState::default()`: an empty base has no `seen_created_at`
+        // watermarks to compare backlog events against, so a backlog
+        // snapshot that happens to lag the live tail's more current view
+        // (e.g. relay read-after-write lag, or a publish landing just after
+        // this resync's query started) could apply a stale event over
+        // already-applied newer state — a real LWW regression — and/or
+        // silently drop an agent this snapshot omits but the live tail
+        // already knows is still assigned (which `reconcile` would then
+        // wrongly read as "no longer assigned" and `Stop`). Replaying the
+        // backlog on top via the same `apply_assignment_event` LWW logic
+        // still lets any genuinely newer backlog event win normally; it
+        // only stops a resync from being able to regress or drop what the
+        // live tail already correctly applied.
+        let mut fresh = self.lock_desired().clone();
         for event in &events {
             apply_assignment_event(
                 &mut fresh,
@@ -826,6 +957,97 @@ mod tests {
         );
     }
 
+    // --- query_desired's resync seed (Batch A deferred #5: watermark
+    // carry-forward) ---
+    //
+    // `query_desired` itself needs a live relay to exercise end to end (see
+    // the "NostrNodeRelay (live I/O)" section below), so these characterize
+    // its fix at the level that's actually pure and unit-testable: how
+    // `apply_assignment_event` behaves depending on what `DesiredState` a
+    // resync is seeded from. `query_desired`'s only change is exactly this
+    // seed (`self.lock_desired().clone()` instead of `DesiredState::default()`).
+
+    #[test]
+    fn resync_seeded_from_prior_state_does_not_regress_past_a_newer_live_tail_watermark() {
+        // Simulate the live tail having already applied a NEWER assignment
+        // than anything the upcoming "backlog" (applied directly here) will
+        // return -- e.g. a backlog snapshot that lags the live tail's more
+        // current view.
+        let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut live_tail_state = DesiredState::default();
+        let newer = make_assignment_at(&owner, &agent, &node, AssignState::Assigned, 5_000);
+        assert!(apply_assignment_event(
+            &mut live_tail_state,
+            &newer,
+            &node,
+            &owner.public_key()
+        ));
+
+        // The fix: seed the fresh resync state from a CLONE of the current
+        // live-tail state, not `DesiredState::default()`, before replaying
+        // the backlog on top.
+        let mut fresh = live_tail_state.clone();
+        // The "backlog" returns only a STALE, older event for the same
+        // agent (the regression scenario).
+        let stale = make_assignment_at(&owner, &agent, &node, AssignState::Unassigned, 1_000);
+        assert!(
+            !apply_assignment_event(&mut fresh, &stale, &node, &owner.public_key()),
+            "a stale backlog event must not apply over the seeded newer watermark"
+        );
+        assert_eq!(
+            fresh.desired.get(&agent.public_key()).map(|d| d.state),
+            Some(AssignState::Assigned),
+            "the resync must not regress past state the live tail already applied"
+        );
+    }
+
+    #[test]
+    fn resync_seeded_from_default_would_have_regressed_without_the_fix() {
+        // Characterizes the bug this fixes: seeding from
+        // `DesiredState::default()` (the old behavior) lets a stale backlog
+        // event apply unopposed, because there is no watermark yet to
+        // compare it against.
+        let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut fresh = DesiredState::default(); // old behavior: empty base
+        let stale = make_assignment_at(&owner, &agent, &node, AssignState::Unassigned, 1_000);
+        assert!(apply_assignment_event(
+            &mut fresh,
+            &stale,
+            &node,
+            &owner.public_key()
+        ));
+        assert_eq!(
+            fresh.desired.get(&agent.public_key()).map(|d| d.state),
+            Some(AssignState::Unassigned),
+            "demonstrates the pre-fix hazard: an empty-seeded resync has no \
+             watermark to reject a stale event with"
+        );
+    }
+
+    #[test]
+    fn resync_seeded_from_prior_state_preserves_an_agent_the_backlog_snapshot_omits() {
+        let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut live_tail_state = DesiredState::default();
+        let assigned = make_assignment_at(&owner, &agent, &node, AssignState::Assigned, 5_000);
+        assert!(apply_assignment_event(
+            &mut live_tail_state,
+            &assigned,
+            &node,
+            &owner.public_key()
+        ));
+
+        // The "backlog" this resync fetches happens to return NOTHING at
+        // all for this agent (e.g. a momentarily lagging query) -- seeding
+        // from the prior state means it survives instead of silently
+        // vanishing from the rebuilt desired set (which `reconcile` would
+        // otherwise read as "no longer assigned" and wrongly `Stop`).
+        let fresh = live_tail_state.clone(); // no backlog events applied on top
+        assert_eq!(
+            fresh.desired.get(&agent.public_key()).map(|d| d.state),
+            Some(AssignState::Assigned)
+        );
+    }
+
     // --- backoff_delay (pure) ---
 
     use super::backoff_delay;
@@ -844,6 +1066,142 @@ mod tests {
             Duration::from_secs(30),
             "ladder must cap, not index-panic, past its last rung"
         );
+    }
+
+    // --- PublishCoalescer / PublishKey (pure — no relay required) ---
+
+    use super::{PublishCoalescer, PublishKey};
+
+    /// A signed `AGENT_NODE_STATUS` event for `agent`, distinguishable from
+    /// another call's event by `created_at` alone — enough to prove
+    /// coalescing keeps only the latest without needing a real relay.
+    fn status_event(node: &Keys, agent: &Keys, created_at: u64) -> nostr::Event {
+        let s = buzz_core::AgentNodeStatus {
+            format: buzz_core::node_status::FORMAT.into(),
+            version: buzz_core::node_status::VERSION,
+            agent_pubkey: agent.public_key().to_hex(),
+            node_pubkey: node.public_key().to_hex(),
+            health: buzz_core::AgentHealth::Running,
+            reason: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        buzz_core::node_status::build_status(node, &s, created_at).expect("build status event")
+    }
+
+    #[test]
+    fn publish_key_distinguishes_agents_by_d_tag() {
+        let node = Keys::generate();
+        let (agent_a, agent_b) = (Keys::generate(), Keys::generate());
+        let status_a1 = status_event(&node, &agent_a, 1);
+        let status_a2 = status_event(&node, &agent_a, 2);
+        let status_b = status_event(&node, &agent_b, 1);
+
+        assert_eq!(
+            PublishKey::for_event(&status_a1),
+            PublishKey::for_event(&status_a2),
+            "the SAME agent's status stream must coalesce across ticks regardless of content"
+        );
+        assert_ne!(
+            PublishKey::for_event(&status_a1),
+            PublishKey::for_event(&status_b),
+            "DIFFERENT agents must never coalesce into each other"
+        );
+    }
+
+    #[test]
+    fn coalescer_bounds_pending_to_one_slot_per_key_under_repeated_offers() {
+        let mut c = PublishCoalescer::default();
+        let (node, agent) = (Keys::generate(), Keys::generate());
+        let first = status_event(&node, &agent, 1);
+        let key = PublishKey::for_event(&first);
+
+        assert!(
+            c.offer(key.clone(), first).is_some(),
+            "the first offer for a key must claim (spawn)"
+        );
+
+        // Flood 100 more offers for the SAME key while a task is still
+        // claimed (never drained via `next_or_release`, simulating an
+        // in-flight send stuck retrying against a down relay) -- every one
+        // must coalesce, never claim a second task.
+        for i in 0..100u64 {
+            let e = status_event(&node, &agent, i + 2);
+            assert!(
+                c.offer(key.clone(), e).is_none(),
+                "must coalesce, not claim, while a task is already in flight for this key"
+            );
+        }
+        assert_eq!(
+            c.inflight.len(),
+            1,
+            "must never accumulate more than one pending slot per key, no matter how many offers arrive"
+        );
+    }
+
+    #[test]
+    fn coalescer_keeps_only_the_latest_queued_replacement() {
+        let mut c = PublishCoalescer::default();
+        let (node, agent) = (Keys::generate(), Keys::generate());
+        let first = status_event(&node, &agent, 1);
+        let key = PublishKey::for_event(&first);
+        let second = status_event(&node, &agent, 2);
+        let third = status_event(&node, &agent, 3);
+
+        assert!(c.offer(key.clone(), first).is_some(), "claims");
+        assert!(c.offer(key.clone(), second).is_none(), "coalesced");
+        assert!(
+            c.offer(key.clone(), third.clone()).is_none(),
+            "replaces the earlier queued replacement"
+        );
+
+        assert_eq!(
+            c.next_or_release(&key),
+            Some(third),
+            "must return the LATEST offer once drained, dropping the intermediate one"
+        );
+        assert_eq!(
+            c.next_or_release(&key),
+            None,
+            "the slot must be released once nothing more is queued"
+        );
+        assert!(c.inflight.is_empty());
+    }
+
+    #[test]
+    fn coalescer_lets_a_fresh_offer_claim_again_once_released() {
+        let mut c = PublishCoalescer::default();
+        let (node, agent) = (Keys::generate(), Keys::generate());
+        let first = status_event(&node, &agent, 1);
+        let key = PublishKey::for_event(&first);
+
+        assert!(c.offer(key.clone(), first).is_some());
+        assert_eq!(
+            c.next_or_release(&key),
+            None,
+            "nothing was queued -- releases immediately"
+        );
+
+        let later = status_event(&node, &agent, 2);
+        assert!(
+            c.offer(key, later).is_some(),
+            "a fresh offer after release must claim (spawn) again"
+        );
+    }
+
+    #[test]
+    fn coalescer_tracks_independent_keys_independently() {
+        let mut c = PublishCoalescer::default();
+        let node = Keys::generate();
+        let (agent_a, agent_b) = (Keys::generate(), Keys::generate());
+        let a = status_event(&node, &agent_a, 1);
+        let b = status_event(&node, &agent_b, 1);
+
+        assert!(c.offer(PublishKey::for_event(&a), a).is_some());
+        assert!(
+            c.offer(PublishKey::for_event(&b), b).is_some(),
+            "a different agent's key must claim its own task, not coalesce into agent A's"
+        );
+        assert_eq!(c.inflight.len(), 2);
     }
 
     // --- NostrNodeRelay (live I/O — requires a real relay) ---
@@ -903,6 +1261,35 @@ mod tests {
             .await
             .expect("publish_presence must return promptly (enqueue-and-return), not block on the relay being unreachable");
         result.expect("building/enqueueing the presence event must still succeed synchronously");
+    }
+
+    /// Phase 3 G-B deferred: `publish_announce` was previously untested for
+    /// this property, unlike its `publish_status`/`publish_presence`
+    /// siblings above — all three go through the same
+    /// [`NostrNodeRelay::spawn_publish`] enqueue-and-return path.
+    #[tokio::test]
+    async fn publish_announce_returns_promptly_when_relay_is_unreachable() {
+        let node = Keys::generate();
+        let owner = Keys::generate();
+        let relay = NostrNodeRelay::new(
+            UNREACHABLE_RELAY_URL.into(),
+            node.clone(),
+            owner.public_key(),
+        );
+        let caps = buzz_core::NodeCapabilities {
+            format: buzz_core::node::FORMAT.into(),
+            version: buzz_core::node::VERSION,
+            node_pubkey: node.public_key().to_hex(),
+            os: "test".into(),
+            runtimes: vec![],
+            workspace_root: "/tmp".into(),
+            max_agents: None,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(2), relay.publish_announce(&caps))
+            .await
+            .expect("publish_announce must return promptly (enqueue-and-return), not block on the relay being unreachable");
+        result.expect("building/enqueueing the announce event must still succeed synchronously");
     }
 
     #[tokio::test]

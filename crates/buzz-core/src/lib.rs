@@ -34,6 +34,8 @@ pub mod nip10;
 pub mod node;
 /// Shared codec helpers for execution-node event kinds (parse/validate primitives).
 pub mod node_codec;
+/// `AGENT_NODE_STATUS` codec: node-authored observed per-agent health.
+pub mod node_status;
 /// Agent observer frame helpers.
 pub mod observer;
 /// NIP-AB device pairing — crypto primitives, message types, and errors.

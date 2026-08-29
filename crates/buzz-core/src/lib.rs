@@ -28,6 +28,8 @@ pub mod kind;
 pub mod network;
 /// NIP-10 thread-marker parsing — shared `root`/`reply` marker resolver.
 pub mod nip10;
+/// `NODE_ANNOUNCE` and `NODE_ENROLLMENT` codecs for execution nodes.
+pub mod node;
 /// Shared codec helpers for execution-node event kinds (parse/validate primitives).
 pub mod node_codec;
 /// Agent observer frame helpers.

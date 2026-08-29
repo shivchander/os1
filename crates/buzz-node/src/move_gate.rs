@@ -29,23 +29,45 @@ pub const MOVE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub struct PeerStatusView {
     latest: HashMap<PublicKey, (PublicKey, AgentHealth)>,
+    /// Last-seen `updated_at` per agent, guarding [`Self::record`] against
+    /// an out-of-order (older) status undoing a newer one already applied —
+    /// the same class of hazard Task 3 closed for assignments. Not
+    /// consulted by [`Self::record_parts`], which is a test-only seam with
+    /// no timestamp to compare.
+    seen_at: HashMap<PublicKey, chrono::DateTime<chrono::FixedOffset>>,
 }
 
 impl PeerStatusView {
-    /// Record a validated status event's meaning. Fails only if the
-    /// status's own pubkey fields are not valid hex — callers that already
-    /// ran the status through [`buzz_core::node_status::validate_status`]
-    /// should not normally see this.
+    /// Record a validated status event's meaning. Ignores (returns `Ok`
+    /// without changing anything) a status older than the last one seen
+    /// for that agent, per its `updated_at` — reordered delivery must never
+    /// let a stale `running` undo a newer `stopped` (or vice versa). Fails
+    /// only if the status's own pubkey or timestamp fields are malformed —
+    /// callers that already ran the status through
+    /// [`buzz_core::node_status::validate_status`] should not normally see
+    /// this.
     pub fn record(&mut self, s: &AgentNodeStatus) -> Result<(), CodecError> {
         let agent = PublicKey::from_hex(&s.agent_pubkey)
             .map_err(|_| CodecError::InvalidPayload("agent_pubkey".into()))?;
         let node = PublicKey::from_hex(&s.node_pubkey)
             .map_err(|_| CodecError::InvalidPayload("node_pubkey".into()))?;
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&s.updated_at)
+            .map_err(|_| CodecError::InvalidPayload("updated_at".into()))?;
+        if self
+            .seen_at
+            .get(&agent)
+            .is_some_and(|&prev| updated_at < prev)
+        {
+            return Ok(()); // stale out-of-order status; ignore
+        }
+        self.seen_at.insert(agent, updated_at);
         self.record_parts(agent, node, s.health);
         Ok(())
     }
 
-    /// Test/seam helper: record already-parsed parts directly.
+    /// Test/seam helper: record already-parsed parts directly, bypassing
+    /// the recency guard [`Self::record`] applies (there is no timestamp to
+    /// compare here) — for tests that want to set up state directly.
     pub fn record_parts(&mut self, agent: PublicKey, node: PublicKey, health: AgentHealth) {
         self.latest.insert(agent, (node, health));
     }
@@ -151,5 +173,81 @@ mod tests {
             updated_at: "2026-08-29T00:00:00Z".into(),
         };
         assert!(view.record(&bad).is_err());
+    }
+
+    fn status_at(
+        agent: &PublicKey,
+        node: &PublicKey,
+        health: AgentHealth,
+        updated_at: &str,
+    ) -> AgentNodeStatus {
+        AgentNodeStatus {
+            format: buzz_core::node_status::FORMAT.into(),
+            version: buzz_core::node_status::VERSION,
+            agent_pubkey: agent.to_hex(),
+            node_pubkey: node.to_hex(),
+            health,
+            reason: None,
+            updated_at: updated_at.into(),
+        }
+    }
+
+    #[test]
+    fn record_rejects_unparseable_timestamp() {
+        let (node, agent) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let mut view = PeerStatusView::default();
+        let bad = status_at(&agent, &node, AgentHealth::Running, "not-a-timestamp");
+        assert!(view.record(&bad).is_err());
+    }
+
+    #[test]
+    fn record_applies_in_order_updates() {
+        let me = Keys::generate().public_key();
+        let (peer, agent) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let mut view = PeerStatusView::default();
+        view.record(&status_at(
+            &agent,
+            &peer,
+            AgentHealth::Running,
+            "2026-08-29T00:00:00Z",
+        ))
+        .unwrap();
+        assert!(view.peer_blocks_spawn(&agent, &me));
+        view.record(&status_at(
+            &agent,
+            &peer,
+            AgentHealth::Stopped,
+            "2026-08-29T00:01:00Z",
+        ))
+        .unwrap();
+        assert!(!view.peer_blocks_spawn(&agent, &me));
+    }
+
+    #[test]
+    fn record_ignores_a_stale_out_of_order_status() {
+        // A reordered older `running` arriving after a newer `stopped` must
+        // not wrongly re-block a spawn -- the same class of hazard Task 3
+        // closed for assignments via `seen_created_at`.
+        let me = Keys::generate().public_key();
+        let (peer, agent) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let mut view = PeerStatusView::default();
+        view.record(&status_at(
+            &agent,
+            &peer,
+            AgentHealth::Stopped,
+            "2026-08-29T00:01:00Z",
+        ))
+        .unwrap();
+        view.record(&status_at(
+            &agent,
+            &peer,
+            AgentHealth::Running,
+            "2026-08-29T00:00:00Z",
+        ))
+        .unwrap();
+        assert!(
+            !view.peer_blocks_spawn(&agent, &me),
+            "a stale, older 'running' must not undo the newer 'stopped'"
+        );
     }
 }

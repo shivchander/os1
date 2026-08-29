@@ -75,6 +75,9 @@ pub struct FakeRelayHandle {
     snapshot: Shared<Vec<DesiredAgent>>,
     /// Backing flag for `take_reconnected`.
     reconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot error the next `query_desired` call returns instead of a
+    /// snapshot, then clears — see [`FakeRelayHandle::fail_next_query_desired`].
+    query_error: Shared<Option<String>>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -108,6 +111,13 @@ impl FakeRelayHandle {
         self.reconnected
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Make the next `query_desired` call fail with `message` instead of
+    /// returning a snapshot — simulates a transient relay error (e.g. a
+    /// connection reset mid-backlog) during a resync. One-shot: cleared
+    /// after that single call, so a later resync succeeds normally.
+    pub fn fail_next_query_desired(&self, message: impl Into<String>) {
+        *self.query_error.lock().expect("lock") = Some(message.into());
+    }
 }
 
 /// In-memory [`NodeRelay`]: yields a scripted sequence of desired-sets, then
@@ -130,6 +140,7 @@ pub struct FakeRelay {
     _desired_tx_keepalive: tokio::sync::mpsc::UnboundedSender<Vec<DesiredAgent>>,
     snapshot: Shared<Vec<DesiredAgent>>,
     reconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    query_error: Shared<Option<String>>,
     handle: FakeRelayHandle,
     /// When `true`, `next_desired` pends forever once `script` is exhausted
     /// instead of returning `None`. Set via [`FakeRelay::new_hanging`] for
@@ -164,6 +175,7 @@ impl FakeRelay {
         let (desired_tx, desired_rx) = tokio::sync::mpsc::unbounded_channel();
         let snapshot = Shared::default();
         let reconnected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let query_error: Shared<Option<String>> = Shared::default();
         let handle = FakeRelayHandle {
             statuses: Log::default(),
             announces: Log::default(),
@@ -172,6 +184,7 @@ impl FakeRelay {
             desired_tx: desired_tx.clone(),
             snapshot: snapshot.clone(),
             reconnected: reconnected.clone(),
+            query_error: query_error.clone(),
         };
         (
             Self {
@@ -182,6 +195,7 @@ impl FakeRelay {
                 _desired_tx_keepalive: desired_tx,
                 snapshot,
                 reconnected,
+                query_error,
                 handle: handle.clone(),
                 hang_when_exhausted,
             },
@@ -206,6 +220,9 @@ impl NodeRelay for FakeRelay {
         }
     }
     async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError> {
+        if let Some(message) = self.query_error.lock().expect("lock").take() {
+            return Err(NodeError::Relay(message));
+        }
         Ok(self.snapshot.lock().expect("lock").clone())
     }
     async fn next_status(&self) -> Option<AgentNodeStatus> {

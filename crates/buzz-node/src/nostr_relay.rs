@@ -100,11 +100,20 @@ struct Inner {
     owner_pubkey: PublicKey,
     relay_url: String,
     conn: Mutex<Option<Conn>>,
-    /// Backing flag for [`NostrNodeRelay::take_reconnected`]: set whenever
-    /// [`Inner::ensure_connected`] (re)establishes the connection, including
-    /// the very first connect — so the engine's first check also drives its
-    /// startup resync.
+    /// Backing flag for [`NostrNodeRelay::take_reconnected`]. Pre-seeded
+    /// `true` at construction so the engine's very first check (before any
+    /// connection exists) drives the startup resync;
+    /// [`Inner::ensure_connected`] re-arms it on every later reconnect —
+    /// but deliberately NOT on the very first successful connect (see
+    /// `has_connected_once`), since that first connect happens *inside*
+    /// the startup resync's own `query_desired` call: re-arming there too
+    /// would make the engine immediately run a second, redundant resync
+    /// right after the first.
     reconnected: std::sync::atomic::AtomicBool,
+    /// Set on the first successful connect; distinguishes "first ever
+    /// connect" (already covered by `reconnected`'s pre-seed) from a real
+    /// reconnect for `ensure_connected`'s `reconnected`-arming logic.
+    has_connected_once: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -146,8 +155,19 @@ impl Inner {
                     {
                         Ok(()) => {
                             *guard = Some(Conn { ws });
-                            self.reconnected
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            // Only a genuine RECONNECT re-arms `reconnected`
+                            // — the very first connect is already covered
+                            // by its constructor pre-seed, and this first
+                            // connect happens inside that very resync's own
+                            // query, so re-arming here too would trigger an
+                            // immediate, redundant second resync.
+                            if self
+                                .has_connected_once
+                                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                self.reconnected
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
                             return;
                         }
                         Err(e) => tracing::warn!(
@@ -286,6 +306,7 @@ impl NostrNodeRelay {
                 relay_url,
                 conn: Mutex::new(None),
                 reconnected: std::sync::atomic::AtomicBool::new(true),
+                has_connected_once: std::sync::atomic::AtomicBool::new(false),
             }),
             desired: std::sync::Mutex::new(DesiredState::default()),
         }
@@ -767,6 +788,42 @@ mod tests {
             &owner.public_key()
         ));
         assert!(state.desired.is_empty());
+    }
+
+    #[test]
+    fn tampered_reassignment_from_a_non_owner_does_not_remove_the_existing_entry() {
+        // The riskiest spot in this batch: a forged "reassigned away" event
+        // must never be able to evict a legitimate assignment.
+        // `validate_envelope`'s author check should reject it outright, so
+        // `apply_assignment_event` never even reaches the retarget-removal
+        // branch. This locks that property in rather than just trusting it.
+        let (owner, attacker, agent, node_m, node_n) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let mut state = DesiredState::default();
+        let to_m = make_assignment_at(&owner, &agent, &node_m, AssignState::Assigned, 1_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &to_m,
+            &node_m,
+            &owner.public_key()
+        ));
+        assert!(state.desired.contains_key(&agent.public_key()));
+
+        // Forged: signed by `attacker`, not `owner`, "reassigning" A to N.
+        let forged = make_assignment_at(&attacker, &agent, &node_n, AssignState::Assigned, 2_000);
+        assert!(
+            !apply_assignment_event(&mut state, &forged, &node_m, &owner.public_key()),
+            "a non-owner-signed event must not be applied at all"
+        );
+        assert!(
+            state.desired.contains_key(&agent.public_key()),
+            "the legitimate assignment must survive a forged reassignment attempt"
+        );
     }
 
     // --- backoff_delay (pure) ---

@@ -11,7 +11,7 @@ use nostr::{Keys, PublicKey};
 // tokio clock in tests.
 use tokio::time::Instant;
 
-use buzz_core::{AgentHealth, AgentNodeStatus};
+use buzz_core::{AgentHealth, AgentNodeStatus, AssignState};
 
 use crate::model::{Action, DesiredAgent, NodeError, Observed};
 use crate::move_gate::{self, PeerStatusView, MOVE_HANDOFF_TIMEOUT};
@@ -148,6 +148,17 @@ pub async fn run(
 /// the way `crate::daemon::singleton::live_daemon_pid` already does for the
 /// node's own PID) — a substantive `Substrate`-level change, intentionally
 /// out of scope for this batch; see the Phase 5 batch A report.
+///
+/// A `query_desired` failure (e.g. a connection reset mid-backlog) does
+/// NOT propagate out of this function: every other relay-facing path in
+/// this loop is insulated from killing `run()` (`ensure_connected` retries
+/// forever, `next_desired` swallows read errors, publishes are
+/// fire-and-forget) — a resync is no different, and the alternative of
+/// reconciling against a partial/empty snapshot would risk emitting a
+/// wrong `Stop` for agents that are actually still assigned to us. On
+/// failure this logs and skips the pass entirely, leaving `current`
+/// untouched; the next tick, live update, or reconnect gets another
+/// chance.
 async fn full_resync(
     relay: &dyn NodeRelay,
     substrate: &Arc<dyn Substrate>,
@@ -156,7 +167,16 @@ async fn full_resync(
     pending_spawns: &mut HashMap<PublicKey, Instant>,
     me: PublicKey,
 ) -> Result<(), NodeError> {
-    *current = relay.query_desired().await?;
+    match relay.query_desired().await {
+        Ok(fresh) => *current = fresh,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "full resync failed; leaving desired state unchanged for now"
+            );
+            return Ok(());
+        }
+    }
     reconcile_and_apply(relay, substrate, status_view, pending_spawns, me, current).await
 }
 
@@ -172,6 +192,25 @@ async fn reconcile_and_apply(
     me: PublicKey,
     current: &[DesiredAgent],
 ) -> Result<(), NodeError> {
+    // Prune deferrals for agents no longer desired+Assigned to us. A
+    // deferred (peer-blocked, never-started) agent that leaves `current` —
+    // reassigned to another node, or set Unassigned — would otherwise
+    // never be revisited: it's absent from `observed` (it was never
+    // started) and now absent from `current` too, so `reconcile`'s
+    // universe (desired ∪ observed) excludes it entirely and no action
+    // (Start or Stop) is ever emitted for it again. Its stale
+    // `{agent: past-deadline}` entry would then leak for the rest of this
+    // process's lifetime. If the SAME agent is later reassigned back here
+    // while a *different* node is genuinely still running it, `due_pending`
+    // would see that ancient deadline as already elapsed and `start_gated`
+    // would spawn immediately — silently bypassing the move gate (a real
+    // I4 double-spawn; see batch A review, Task 1 x Task 3 interaction).
+    pending_spawns.retain(|agent, _| {
+        current
+            .iter()
+            .any(|d| d.agent_pubkey == *agent && d.state == AssignState::Assigned)
+    });
+
     let now = Instant::now();
     let due: HashSet<PublicKey> = move_gate::due_pending(pending_spawns, now)
         .into_iter()
@@ -701,5 +740,113 @@ mod tests {
         .unwrap();
 
         assert_eq!(*substrate.stops.lock().unwrap(), vec![agent.public_key()]);
+    }
+
+    // --- Batch A review fix round: Task 1 x Task 3 interaction ---
+
+    /// A deferred (peer-blocked) spawn whose agent then leaves `current`
+    /// entirely (reassigned away, before ever starting here) must not
+    /// leave a stale `pending_spawns` deadline behind. If it did, a later
+    /// re-assignment of the SAME agent back to this node — while a
+    /// *different* node is genuinely still running it — would see that
+    /// ancient deadline as already elapsed and bypass the move gate,
+    /// spawning a second live instance (a real I4 violation).
+    #[tokio::test(start_paused = true)]
+    async fn stale_deferred_spawn_does_not_leak_past_reassignment() {
+        let (owner, node_m, node_n, agent) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            cfg(&node_m),
+        ));
+        tokio::task::yield_now().await;
+
+        // Peer N reports the agent running; the assignment to M arrives ->
+        // deferred (pending_spawns now holds a deadline for this agent).
+        handle.push_status(status_of(&node_n, &agent, AgentHealth::Running));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        handle.push_desired(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(substrate.starts.lock().unwrap().is_empty(), "deferred");
+
+        // The agent is reassigned away from M entirely (M's own
+        // `next_desired` would now omit it, per `nostr_relay::
+        // apply_assignment_event`) -- simulate that snapshot directly,
+        // well before the original 30s handoff window would have elapsed.
+        handle.push_desired(vec![]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Real time passes well beyond the original deferred deadline,
+        // with no further events -- nothing has any reason to revisit
+        // this agent while it's absent from both desired and observed.
+        tokio::time::advance(MOVE_HANDOFF_TIMEOUT * 3).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Reassigned back to M -- while N is STILL genuinely running it.
+        handle.push_desired(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            substrate.starts.lock().unwrap().is_empty(),
+            "a stale pending_spawns deadline from the earlier defer must not \
+             bypass the gate -- the peer is still genuinely running the agent"
+        );
+
+        task.abort();
+    }
+
+    /// A transient `query_desired` failure (e.g. a connection reset
+    /// mid-backlog) during a resync must not crash the whole engine loop —
+    /// every other relay-facing path here is insulated from killing
+    /// `run()`. Proven by observing that a LATER, successful
+    /// reconnect-triggered resync still works: if the earlier error had
+    /// propagated out of `run()`, nothing below would ever spawn.
+    #[tokio::test(start_paused = true)]
+    async fn full_resync_error_does_not_abort_the_engine_loop() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        handle.fail_next_query_desired("simulated connection reset");
+        let engine_cfg = EngineConfig {
+            reconcile_tick: Duration::from_millis(50),
+            presence_interval: Duration::from_secs(3600),
+            node_pubkey: node_m.public_key(),
+        };
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            engine_cfg,
+        ));
+        // The startup resync's query_desired fails.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        handle.set_snapshot(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        handle.simulate_reconnect();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *substrate.starts.lock().unwrap(),
+            vec![agent.public_key()],
+            "a transient resync error must not crash the engine loop"
+        );
+
+        task.abort();
     }
 }

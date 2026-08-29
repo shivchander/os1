@@ -33,9 +33,20 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
-- [~] Phase 5 — presence-cadence + **Batch A (move gate + startup/reconnect resync + LWW one-live-instance, incl AGENT_NODE_STATUS created_at recency) DONE + reviewed + pushed**. Remaining: Batch B (smoke-probe health/classify incl breaker-open Stopped-not-Crashed vocab; at-rest secret store) · Batch C (two-node e2e #[ignore]; process adoption [PID+liveness so resync can't dup-spawn on daemon restart] + node-restart test; real next_status subscription [real moves are 30s-timeout-only until then] + validate_status doc; publish_announce promptness test; per-tick publish coalescing; resync watermark carry-forward)
+- [~] Phase 5 — presence-cadence + **Batch A (move gate + resync + LWW one-live-instance) + Batch B (smoke-probe health/classify incl breaker-open Stopped-not-Crashed vocab + at-rest provider secret store) DONE + reviewed + pushed**. Remaining — Batch C: process adoption [PID+liveness so a daemon restart can't dup-spawn] + node-restart test; real next_status subscription [real cross-node moves are 30s-timeout-only until then] + validate_status doc; per-tick publish coalescing; publish_announce promptness test; resync watermark carry-forward; two-node e2e #[ignore]. Deferred (non-blocking): AcpRuntime real probe RPC (needs buzz-acp control channel); provider-secret retrieval at spawn (build_child_env)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-29 (Phase 5 Batch B ✅): active smoke-probe health classification (classify checks
+  breaker-open FIRST → a breaker-cooldown agent reports Stopped/"breaker-open", not a fresh Crashed) +
+  at-rest OS-keychain secret store for provider API keys (new ProviderSecretStore, distinct from the
+  node-key one; config references providers by NAME only, values in the keychain, verified no plaintext
+  on disk). Review caught a latent probe-flapping bug (probe-failure health wasn't latched across the
+  5s reconcile passes vs the 300s probe interval → would revert to Running; dormant until the real probe
+  lands) — fixed by latching last_probe_result; re-review confirmed the fix + the LoopState refactor
+  behavior-neutral + latch-invalidation-on-restart safe. buzz-node lib 96 tests, clippy+fmt clean;
+  pushed. TWO deferrals recorded (non-blocking): AcpRuntime::probe is still an Ok(())-stub (active
+  liveness needs a buzz-acp control channel), and stored provider secrets aren't yet read back at
+  agent-spawn time. → Batch C (process adoption, real peer-status, two-node e2e).
 - 2026-08-29 (Phase 5 Batch A ✅): move gate (bounded stop-before-start) + startup/reconnect
   full-resync + LWW one-live-instance (assignment created_at dedup + retarget-stop) landed in
   buzz-node, adapting the plan's Engine-struct assumption to the real free-fn run() (added

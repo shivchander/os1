@@ -11,6 +11,8 @@
 pub mod engine;
 /// Domain types: desired agents, observed states, actions, errors.
 pub mod model;
+/// The real Nostr `NodeRelay`: dial-out/NIP-42, assignment intake, publish.
+pub mod nostr_relay;
 /// Pure desired-vs-observed reconciliation.
 pub mod reconcile;
 /// The relay abstraction (desired-state in, status out) + an in-memory fake.

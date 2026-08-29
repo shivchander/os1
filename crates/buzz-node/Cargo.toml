@@ -7,19 +7,36 @@ rust-version.workspace = true
 
 [dependencies]
 buzz-core = { path = "../buzz-core" }
+buzz-ws-client = { path = "../buzz-ws-client" }
 nostr = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 zeroize = { workspace = true }
+rand = { workspace = true }
+# Home-directory resolution for the node config file (`~/.buzz-node/config.json`).
+dirs = "6"
 
 # Process-group signaling for graceful agent-process shutdown (mirrors
 # buzz-dev-mcp's KillGroup use of the same crate/features).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+
+# OS keychain backing for the node's own signing key (never a plaintext file —
+# see `enroll::KeychainStore`). Mirrors `desktop/src-tauri/Cargo.toml`'s
+# per-platform keyring backend + `vendored` feature selection exactly.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "vendored"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native", "vendored"] }
 
 [features]
 # Exposes the in-memory FakeSubstrate/FakeRelay for cross-crate tests (Phase 5 e2e).

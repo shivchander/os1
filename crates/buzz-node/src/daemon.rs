@@ -39,6 +39,11 @@ pub(crate) use cli::Cli;
 /// How often the engine reconciles even without a fresh assignment (self-heal
 /// cadence for `up`'s live daemon).
 const RECONCILE_TICK: Duration = Duration::from_secs(5);
+/// How often the engine re-publishes online presence (heartbeat cadence for
+/// `up`'s live daemon). Must stay comfortably under the relay's presence TTL
+/// (`buzz_pubsub::presence::PRESENCE_TTL_SECS`, 180s) — see
+/// [`engine::EngineConfig::presence_interval`]'s doc comment.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(60);
 /// Upper bound on the final, awaited offline-presence publish during
 /// shutdown. [`NostrNodeRelay::publish_presence_awaited`]'s underlying
 /// reconnect-forever policy is correct for a long-lived background publish
@@ -308,6 +313,7 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
 
     let engine_cfg = engine::EngineConfig {
         reconcile_tick: RECONCILE_TICK,
+        presence_interval: PRESENCE_INTERVAL,
         node_pubkey: node_keys.public_key(),
     };
 

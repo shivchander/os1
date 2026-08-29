@@ -16,6 +16,17 @@ use crate::substrate::Substrate;
 pub struct EngineConfig {
     /// How often to reconcile even without a new desired-set (self-heal cadence).
     pub reconcile_tick: Duration,
+    /// How often to re-publish online presence while the engine runs.
+    ///
+    /// The relay stores presence as a Redis key with a TTL (see
+    /// `buzz_pubsub::presence::PRESENCE_TTL_SECS`, 180s) that is only reset
+    /// by a fresh presence publish. Without a recurring heartbeat, a node
+    /// that publishes presence once at startup and then runs longer than
+    /// that TTL — i.e. any healthy long-lived node — would look OFFLINE to
+    /// the relay (and therefore to owners) despite being perfectly healthy.
+    /// Keep this comfortably under the relay's TTL; the default (60s)
+    /// mirrors the TTL's own "3x the heartbeat" margin.
+    pub presence_interval: Duration,
     /// This node's pubkey (stamped into published status events).
     pub node_pubkey: PublicKey,
 }
@@ -39,6 +50,12 @@ pub async fn run(
     let start = tokio::time::Instant::now() + cfg.reconcile_tick;
     let mut ticker = tokio::time::interval_at(start, cfg.reconcile_tick);
 
+    // Same "first tick one period out" shape: the startup publish above
+    // already covers t=0, so the first heartbeat re-publish should land one
+    // `presence_interval` later, not immediately.
+    let presence_start = tokio::time::Instant::now() + cfg.presence_interval;
+    let mut presence_ticker = tokio::time::interval_at(presence_start, cfg.presence_interval);
+
     loop {
         tokio::select! {
             maybe = relay.next_desired() => match maybe {
@@ -46,6 +63,13 @@ pub async fn run(
                 None => break,
             },
             _ = ticker.tick() => {}
+            _ = presence_ticker.tick() => {
+                // A heartbeat, not a reconcile trigger: refresh the relay's
+                // presence TTL and go straight back to waiting rather than
+                // falling into the observe/reconcile/report pass below.
+                relay.publish_presence(true).await?;
+                continue;
+            }
         }
 
         let observed = substrate.observe().await;
@@ -108,9 +132,10 @@ mod tests {
     use std::time::Duration;
 
     fn cfg(node: &Keys) -> EngineConfig {
-        // Huge tick ⇒ only the scripted desired-sets drive the loop (deterministic).
+        // Huge ticks ⇒ only the scripted desired-sets drive the loop (deterministic).
         EngineConfig {
             reconcile_tick: Duration::from_secs(3600),
+            presence_interval: Duration::from_secs(3600),
             node_pubkey: node.public_key(),
         }
     }
@@ -135,7 +160,22 @@ mod tests {
                 && s.node_pubkey == n.public_key().to_hex()
                 && s.health == AgentHealth::Running
         }));
-        assert_eq!(*handle.presence.lock().unwrap(), vec![true, false]);
+        // Shape, not exact equality: a healthy engine now re-publishes online
+        // presence on a heartbeat cadence (see `presence_heartbeat_republishes_online_on_cadence`
+        // below), so the log may carry extra `true`s beyond the one at
+        // startup — only the first (startup) and last (shutdown) entries are
+        // guaranteed.
+        let presence = handle.presence.lock().unwrap().clone();
+        assert_eq!(
+            presence.first(),
+            Some(&true),
+            "must announce online at startup"
+        );
+        assert_eq!(
+            presence.last(),
+            Some(&false),
+            "must announce offline at shutdown"
+        );
     }
 
     #[tokio::test]
@@ -180,5 +220,58 @@ mod tests {
             substrate.observe().await.get(&a.public_key()),
             Some(&Observed::Running)
         );
+    }
+
+    /// The presence heartbeat re-publishes online on `presence_interval`
+    /// cadence, independent of reconcile/desired-state activity.
+    ///
+    /// Uses `FakeRelay::new_hanging` with an empty script: a plain
+    /// `FakeRelay`'s `next_desired` resolves immediately (`Some`/`None`,
+    /// never pending), so with any finite script the loop races straight
+    /// through it and `break`s before virtual time ever advances, and the
+    /// tickers never get a chance to win the `select!`. Hanging forever once
+    /// the (empty) script is exhausted keeps the loop alive so it is driven
+    /// purely by its tickers, matching a real long-lived, unassigned node —
+    /// deterministic under paused time since only the tickers can ever
+    /// resolve.
+    #[tokio::test(start_paused = true)]
+    async fn presence_heartbeat_republishes_online_on_cadence() {
+        let n = Keys::generate();
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let presence_interval = Duration::from_secs(60);
+        let engine_cfg = EngineConfig {
+            // Long enough it can never fire inside this test's window,
+            // isolating the assertions to the presence heartbeat alone.
+            reconcile_tick: Duration::from_secs(3600),
+            presence_interval,
+            node_pubkey: n.public_key(),
+        };
+        let task = tokio::spawn(run(substrate, Box::new(relay), n.clone(), engine_cfg));
+
+        // Let the spawned task run its synchronous startup
+        // (`publish_presence(true)`) and reach the (now-pending) select loop.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *handle.presence.lock().unwrap(),
+            vec![true],
+            "must publish online once at startup, before any heartbeat"
+        );
+
+        for beats in 1..=3 {
+            tokio::time::advance(presence_interval).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                handle.presence.lock().unwrap().len(),
+                1 + beats,
+                "heartbeat must re-publish online every presence_interval"
+            );
+        }
+        assert!(
+            handle.presence.lock().unwrap().iter().all(|&online| online),
+            "the engine never publishes offline until shutdown, which this test never reaches"
+        );
+
+        task.abort();
     }
 }

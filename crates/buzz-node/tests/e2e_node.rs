@@ -179,6 +179,7 @@ async fn enroll_assign_running() {
     ));
     let engine_cfg = engine::EngineConfig {
         reconcile_tick: Duration::from_secs(2),
+        presence_interval: Duration::from_secs(2),
         node_pubkey: node.public_key(),
     };
     // `engine::run` only returns once its `NodeRelay::next_desired` yields

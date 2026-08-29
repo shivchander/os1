@@ -46,5 +46,8 @@ keyring = { version = "3.6.3", default-features = false, features = ["windows-na
 test-utils = []
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` enables paused-time control (`start_paused`, `time::advance`)
+# for the deterministic presence-heartbeat cadence test in `engine.rs`.
+# Mirrors buzz-acp/buzz-cli's dev-dependency-only `test-util` opt-in.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

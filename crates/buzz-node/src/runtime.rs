@@ -62,9 +62,14 @@ pub fn build_child_env(secret: &AssignmentSecret, relay_url: &str) -> Vec<(Strin
 /// changes.
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
-    /// Spawn the harness in `workspace` with the agent's environment,
-    /// in its own process group. The returned [`Child`] is owned by the
-    /// caller's process table, which observes and terminates it.
+    /// Spawn the harness in `workspace` with the agent's environment. The
+    /// returned [`Child`] is owned by the caller's process table, which
+    /// observes and terminates it.
+    ///
+    /// Contract: the child **must** be spawned into its own new process
+    /// group (Unix: `Command::process_group(0)`, as [`AcpRuntime`] does)
+    /// so that `LocalProcessSubstrate::stop`'s `killpg` on `child.id()`
+    /// reaches the whole tree instead of a group the child never leads.
     async fn spawn(
         &self,
         desired: &DesiredAgent,

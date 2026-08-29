@@ -20,6 +20,9 @@ zeroize = { workspace = true }
 rand = { workspace = true }
 # Home-directory resolution for the node config file (`~/.buzz-node/config.json`).
 dirs = "6"
+# `buzz-node` binary CLI (subcommands: up/enroll/autostart/status/stop).
+# Mirrors buzz-cli/buzz-admin's version pin.
+clap = { version = "4", features = ["derive"] }
 
 # Process-group signaling for graceful agent-process shutdown (mirrors
 # buzz-dev-mcp's KillGroup use of the same crate/features).

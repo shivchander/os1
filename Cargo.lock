@@ -1165,6 +1165,7 @@ dependencies = [
  "buzz-core",
  "buzz-ws-client",
  "chrono",
+ "clap",
  "dirs",
  "keyring",
  "nix 0.31.3",

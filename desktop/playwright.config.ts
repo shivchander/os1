@@ -163,6 +163,9 @@ export default defineConfig({
         "**/needs-restart-screenshots.spec.ts",
         "**/team-catalog-screenshots.spec.ts",
         "**/nodes-panel.spec.ts",
+        "**/run-on-node-picker.spec.ts",
+        "**/agent-node-controls.spec.ts",
+        "**/nodes-screenshots.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

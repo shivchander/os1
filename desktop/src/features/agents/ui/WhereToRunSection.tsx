@@ -3,16 +3,27 @@ import * as React from "react";
 
 import { useBackendProvidersQuery } from "@/features/agents/hooks";
 import { probeBackendProvider } from "@/shared/api/tauri";
+import {
+  ensureNodesRelaySubscription,
+  getNodesSnapshot,
+  subscribeNodes,
+} from "@/shared/api/nodesStore";
 
 import { ProviderConfigFields } from "./ProviderConfigFields";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   applyProbeResult,
   emptyWhereToRunDraft,
+  nodePubkeyFromRunOn,
+  runOnValueForNode,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
 
-/** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
+/**
+ * Optional remote-run selector: "This computer", a discovered
+ * `buzz-backend-*` provider, or an enrolled+online execution node. Buzz
+ * shared compute is an LLM provider, not a run destination.
+ */
 export function WhereToRunSection({
   draft,
   isPending,
@@ -23,6 +34,20 @@ export function WhereToRunSection({
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
+  // This section can mount before anything else has started nodesStore's
+  // live subscription (e.g. RequestedAgentCreateDialogs, opened without the
+  // Agents list ever rendering) — ensure it directly rather than depending
+  // on a sibling's mount order. Idempotent, like NodesPanel's own call.
+  React.useEffect(() => {
+    void ensureNodesRelaySubscription();
+  }, []);
+  // Live roster, not React Query — nodesStore mirrors NODE_ANNOUNCE/presence
+  // straight off the relay (AGENTS.md "Live relay data → feature store").
+  const nodes = React.useSyncExternalStore(subscribeNodes, getNodesSnapshot);
+  const onlineNodes = React.useMemo(
+    () => nodes.filter((node) => node.online),
+    [nodes],
+  );
   const [probeError, setProbeError] = React.useState<string | null>(null);
   const runOnOptions = React.useMemo(
     () => [
@@ -31,14 +56,27 @@ export function WhereToRunSection({
         label: provider.id,
         value: provider.id,
       })),
+      ...onlineNodes.map((node) => ({
+        label: node.name,
+        value: runOnValueForNode(node.nodePubkey),
+      })),
     ],
-    [backendProviders],
+    [backendProviders, onlineNodes],
   );
-  const isProviderMode = draft.runOn !== "local";
+  const selectedNodePubkey = nodePubkeyFromRunOn(draft.runOn);
+  const isProviderMode = draft.runOn !== "local" && !selectedNodePubkey;
   const selectedBackendProvider = React.useMemo(
     () =>
       backendProviders.find((provider) => provider.id === draft.runOn) ?? null,
     [backendProviders, draft.runOn],
+  );
+  const selectedNode = React.useMemo(
+    () =>
+      selectedNodePubkey
+        ? (onlineNodes.find((node) => node.nodePubkey === selectedNodePubkey) ??
+          null)
+        : null,
+    [onlineNodes, selectedNodePubkey],
   );
 
   // Latest-state seam for probe resolution: an Effect Event always sees the
@@ -83,7 +121,7 @@ export function WhereToRunSection({
     };
   }, [selectedBinaryPath, draft.probedProvider]);
 
-  if (backendProviders.length === 0) return null;
+  if (backendProviders.length === 0 && onlineNodes.length === 0) return null;
 
   return (
     <div className="space-y-4">
@@ -133,6 +171,17 @@ export function WhereToRunSection({
               schema={draft.probedProvider.config_schema}
             />
           ) : null}
+        </div>
+      ) : null}
+
+      {selectedNode ? (
+        <div className="flex gap-3 rounded-2xl border border-warning/30 bg-warning-bg px-4 py-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+          <p className="text-sm text-warning">
+            <span className="font-medium">{selectedNode.name}</span> will
+            receive your agent&apos;s private key (encrypted in transit) to run
+            it. Only assign agents to nodes you trust.
+          </p>
         </div>
       ) : null}
     </div>

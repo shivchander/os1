@@ -1,4 +1,4 @@
-import type { NodeView } from "@/features/nodes/lib/nodesStore";
+import type { NodeView } from "@/shared/api/nodesStore";
 import { cn } from "@/shared/lib/cn";
 import { Badge } from "@/shared/ui/badge";
 import { PubKey } from "@/shared/ui/PubKey";

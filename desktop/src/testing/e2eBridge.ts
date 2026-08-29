@@ -31,7 +31,7 @@ import {
   injectObserverEventsForE2E,
   syncAgentObserverEvents,
 } from "@/features/agents/observerRelayStore";
-import { ingestNodeEvent } from "@/features/nodes/lib/nodesStore";
+import { ingestNodeEvent } from "@/shared/api/nodesStore";
 import {
   CUSTOM_EMOJI_SET_D_TAG,
   KIND_EMOJI_SET,

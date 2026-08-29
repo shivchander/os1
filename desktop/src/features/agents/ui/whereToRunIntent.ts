@@ -9,6 +9,26 @@ export type WhereToRunDraft = {
   probedProvider: BackendProviderProbeResult | null;
 };
 
+/**
+ * `runOnOptions` values for an enrolled execution node are `node:<pubkey>` —
+ * a third namespace alongside `"local"` and a bare provider id. Prefixing
+ * (rather than a sibling `WhereToRunDraft.nodePubkey` field) keeps the
+ * selection in the single `runOn` value `PersonaDropdownField` already binds
+ * to, so there is nothing else to keep in sync when the selection changes.
+ */
+const NODE_RUN_ON_PREFIX = "node:";
+
+export function runOnValueForNode(nodePubkey: string): string {
+  return `${NODE_RUN_ON_PREFIX}${nodePubkey}`;
+}
+
+/** The target node pubkey when `runOn` is a `node:*` value, else `null`. */
+export function nodePubkeyFromRunOn(runOn: string): string | null {
+  return runOn.startsWith(NODE_RUN_ON_PREFIX)
+    ? runOn.slice(NODE_RUN_ON_PREFIX.length)
+    : null;
+}
+
 export const emptyWhereToRunDraft: WhereToRunDraft = {
   runOn: "local",
   providerConfig: {},
@@ -45,7 +65,7 @@ export function applyProbeResult(
 }
 
 export function providerConfigComplete(draft: WhereToRunDraft): boolean {
-  if (draft.runOn === "local") return true;
+  if (draft.runOn === "local" || nodePubkeyFromRunOn(draft.runOn)) return true;
   if (!draft.probedProvider) return false;
   const schema = draft.probedProvider.config_schema as
     | Record<string, unknown>
@@ -63,6 +83,8 @@ export function canSubmitWhereToRun(draft: WhereToRunDraft): boolean {
 export function resolveBackendIntent(
   draft: WhereToRunDraft,
 ): BackendIntent | null {
+  const nodePubkey = nodePubkeyFromRunOn(draft.runOn);
+  if (nodePubkey) return { type: "node", nodePubkey };
   if (draft.runOn === "local") return null;
   return {
     type: "provider",

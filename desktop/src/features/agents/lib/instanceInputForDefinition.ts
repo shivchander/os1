@@ -75,6 +75,13 @@ export function resolveStartRuntimeForDefinition(
  *   no local ACP/agent/MCP commands are spawned, so none are set;
  *   `startOnAppLaunch` is forced false (remote agents don't auto-start with
  *   the desktop) and `spawnAfterCreate` true.
+ * - `node`: an enrolled execution node (Phase 4 Run-on picker). The record is
+ *   still a normal local-backend identity (same keygen/keyring path as any
+ *   other agent), but neither the desktop's own child process nor the
+ *   provider-deploy path should start it — the caller publishes an
+ *   `AGENT_ASSIGNMENT` to `nodePubkey` right after creation
+ *   (`publishNodeAssignmentForCreatedAgent`), and the *node* spawns the
+ *   process from there. See `docs/superpowers/specs/2026-08-29-execution-nodes-design.md` §10.
  * - `mesh`: relay-mesh compute. The preset patch carries the instance
  *   commands/env the legacy dialog fanned into its field state; env lands in
  *   record env_vars (the instance-override layer — the dial pointer is
@@ -82,11 +89,9 @@ export function resolveStartRuntimeForDefinition(
  *   is true because the preset commands deliberately override the
  *   definition's runtime preference.
  */
-export type BackendIntent = {
-  type: "provider";
-  id: string;
-  config: Record<string, unknown>;
-};
+export type BackendIntent =
+  | { type: "provider"; id: string; config: Record<string, unknown> }
+  | { type: "node"; nodePubkey: string };
 
 /**
  * The single definition→instance mapping (Phase 1B.3.5 rows 2–4). Every
@@ -136,6 +141,28 @@ export async function buildInstanceInputForDefinition(
         id: backendIntent.id,
         config: backendIntent.config,
       },
+    };
+  }
+
+  if (backendIntent?.type === "node") {
+    return {
+      ...base,
+      acpCommand: "buzz-acp",
+      agentCommand: runtime.command,
+      agentArgs: [],
+      mcpCommand: runtime.mcpCommand ?? "",
+      harnessOverride: !persona.runtime || persona.runtime === runtime.id,
+      model: persona.model ?? undefined,
+      provider: persona.provider ?? undefined,
+      // The target node starts the process (via the AGENT_ASSIGNMENT the
+      // caller publishes right after this record is created) — this desktop
+      // must not also spawn a competing local child for the same identity.
+      // `spawnAfterCreate:false` + `backend:local` is the same "create the
+      // identity without starting it" combination channelAgents.ts and
+      // welcomeGuide.ts already rely on, not a new code path.
+      spawnAfterCreate: false,
+      startOnAppLaunch: false,
+      backend: { type: "local" },
     };
   }
 

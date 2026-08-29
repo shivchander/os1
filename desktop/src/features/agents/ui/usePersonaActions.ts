@@ -63,6 +63,7 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
+import { publishNodeAssignmentForCreatedAgent } from "../lib/publishNodeAssignmentForCreatedAgent";
 
 type PersonaFeedbackSurface = "catalog" | "library";
 
@@ -258,6 +259,21 @@ export function usePersonaActions() {
             setPersonaErrorMessage(
               `${created.agent.name} was created, but profile sync failed: ${created.profileSyncError}`,
             );
+          }
+          if (startIntent?.type === "node") {
+            try {
+              await publishNodeAssignmentForCreatedAgent(
+                startIntent,
+                created.agent,
+                identityQuery.data?.pubkey,
+              );
+            } catch (assignError) {
+              setPersonaErrorMessage(
+                assignError instanceof Error
+                  ? `${persona.displayName} was created, but assigning it to the node failed: ${assignError.message}`
+                  : `${persona.displayName} was created, but assigning it to the node failed.`,
+              );
+            }
           }
         } catch (error) {
           setPersonaErrorMessage(

@@ -22,7 +22,9 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "./lib/instanceInputForDefinition";
+import { publishNodeAssignmentForCreatedAgent } from "./lib/publishNodeAssignmentForCreatedAgent";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import { classifyAgentManagementOrigin } from "./agentManagementBuffer";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { resolveManagedAgentAvatarUrl } from "./ui/managedAgentAvatar";
@@ -59,6 +61,7 @@ function updateInputFromRequest(
 
 export function useAgentManagement() {
   const queryClient = useQueryClient();
+  const identityQuery = useIdentityQuery();
   const personasQuery = usePersonasQuery();
   const managedAgentsQuery = useManagedAgentsQuery();
   const channelsQuery = useChannelsQuery();
@@ -214,6 +217,11 @@ export function useAgentManagement() {
           ),
         );
         if (created.spawnError) throw new Error(created.spawnError);
+        await publishNodeAssignmentForCreatedAgent(
+          backendIntent,
+          created.agent,
+          identityQuery.data?.pubkey,
+        );
         const targetChannel = (channelsQuery.data ?? []).find(
           (channel) => channel.id === request.request.channelId,
         );

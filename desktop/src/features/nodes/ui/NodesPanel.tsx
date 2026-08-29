@@ -6,7 +6,7 @@ import {
   ensureNodesRelaySubscription,
   getNodesSnapshot,
   subscribeNodes,
-} from "@/features/nodes/lib/nodesStore";
+} from "@/shared/api/nodesStore";
 import { NodeRow } from "@/features/nodes/ui/NodeRow";
 import { publishNodeEnrollment } from "@/shared/api/nodes";
 import { PageHeader } from "@/shared/ui/PageHeader";

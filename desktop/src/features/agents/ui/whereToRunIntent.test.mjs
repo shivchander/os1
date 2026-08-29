@@ -5,8 +5,10 @@ import {
   applyProbeResult,
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
+  nodePubkeyFromRunOn,
   providerConfigComplete,
   resolveBackendIntent,
+  runOnValueForNode,
 } from "./whereToRunIntent.ts";
 
 const probed = {
@@ -58,6 +60,37 @@ test("provider draft resolves with coerced config values", () => {
     type: "provider",
     id: "blox",
     config: { region: "us", size: 3 },
+  });
+});
+
+// ── node targets (Phase 4 Run-on picker) ─────────────────────────────────────
+
+function nodeDraft(nodePubkey, overrides = {}) {
+  return {
+    ...emptyWhereToRunDraft,
+    runOn: runOnValueForNode(nodePubkey),
+    ...overrides,
+  };
+}
+
+test("runOnValueForNode/nodePubkeyFromRunOn round-trip", () => {
+  assert.equal(nodePubkeyFromRunOn(runOnValueForNode("node-abc")), "node-abc");
+});
+
+test("a bare provider id is not mistaken for a node target", () => {
+  assert.equal(nodePubkeyFromRunOn("blox"), null);
+  assert.equal(nodePubkeyFromRunOn("local"), null);
+});
+
+test("node selection never gates submit — no provider probe applies", () => {
+  assert.equal(canSubmitWhereToRun(nodeDraft("node-abc")), true);
+  assert.equal(providerConfigComplete(nodeDraft("node-abc")), true);
+});
+
+test("node draft resolves to a node intent, not a provider intent", () => {
+  assert.deepEqual(resolveBackendIntent(nodeDraft("node-abc")), {
+    type: "node",
+    nodePubkey: "node-abc",
   });
 });
 

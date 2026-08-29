@@ -165,11 +165,20 @@ with a TypeScript lookup table or an id comparison in a component.
    `update_managed_agent`; persona behavior remains the definition default, but
    must never bypass the instance command's stop, persist, publish, and restart
    boundary.** An unknown location falls back to the local wording — never hedge
-   with "computer or server". A remote host requires an
-   installed `buzz-backend-*` provider, and without one `WhereToRunSection`
-   never renders, so "server" would name a concept the owner has never been
-   shown; when it *is* remote they picked that host from the selector
-   themselves. Never synthesize a run location a surface doesn't have. Don't
+   with "computer or server". A remote host requires either an installed
+   `buzz-backend-*` provider or an enrolled, online execution node (Phase 4 —
+   `nodesStore.getNodesSnapshot()`); without either, `WhereToRunSection` never
+   renders, so "server" would name a concept the owner has never been shown;
+   when it *is* remote they picked that host from the selector themselves. A
+   `node:<pubkey>` `runOn` value resolves as `remote` through both resolvers,
+   same as a provider id — `resolveBackendIntent` returns a distinct
+   `{type:"node", nodePubkey}` `BackendIntent`, and
+   `buildInstanceInputForDefinition`'s node branch keeps
+   `backend:{type:"local"}` (a normal local identity) but forces
+   `spawnAfterCreate:false`: the target node starts the process via the
+   `AGENT_ASSIGNMENT` the create flow publishes right after creation
+   (`publishNodeAssignmentForCreatedAgent.ts`), never this desktop. Never
+   synthesize a run location a surface doesn't have. Don't
    expose `respond-to`, `allowlist`, Nostr, or harness jargon in primary UI
    copy. **The owner-only-access build capability is backend-independent.** When
    `getAgentAccessOwnerOnly()` is true, every managed agent's access control is

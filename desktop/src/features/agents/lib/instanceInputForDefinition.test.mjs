@@ -230,6 +230,28 @@ test("provider intent forces startOnAppLaunch off and omits local commands", asy
   assert.equal(input.systemPrompt, "prompt");
 });
 
+test("node intent keeps a local-backend record but suppresses both spawn flags", async () => {
+  const input = await buildInstanceInputForDefinition(
+    persona(),
+    gooseRuntime,
+    undefined,
+    { type: "node", nodePubkey: "node-abc" },
+  );
+  // Still a normal local identity — the node, not this desktop, starts the
+  // process (via the AGENT_ASSIGNMENT the caller publishes separately).
+  assert.deepEqual(input.backend, { type: "local" });
+  assert.equal(
+    input.spawnAfterCreate,
+    false,
+    "the desktop must not also spawn a competing local process",
+  );
+  assert.equal(input.startOnAppLaunch, false);
+  assert.equal(input.acpCommand, "buzz-acp");
+  assert.equal(input.agentCommand, "goose-cmd");
+  assert.deepEqual(input.agentArgs, []);
+  assert.equal(input.mcpCommand, "goose-mcp");
+});
+
 test("row 1: refuses when the configured runtime is not available", () => {
   assert.throws(
     () =>

@@ -6,6 +6,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use buzz_core::assignment::AssignmentSecret;
+use nostr::PublicKey;
 use tokio::process::{Child, Command};
 use zeroize::Zeroize;
 
@@ -76,6 +77,14 @@ pub trait AgentRuntime: Send + Sync {
         workspace: &Path,
         relay_url: &str,
     ) -> Result<Child, NodeError>;
+
+    /// Actively probe a previously spawned agent for liveness — a real
+    /// round-trip beyond mere OS-process existence (spec §9 active
+    /// smoke-probe). `Err` means the probe itself failed (the agent is
+    /// unresponsive even though its process may still be running), which
+    /// [`crate::health::classify`] surfaces as `AgentHealth::Crashed`/
+    /// `"probe-failed"`.
+    async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError>;
 }
 
 /// ACP runtime: spawns `buzz-acp` (or a bundled `sprig`) with the injected
@@ -140,6 +149,19 @@ impl AgentRuntime for AcpRuntime {
             agent: desired.agent_pubkey.to_hex(),
             reason: e.to_string(),
         })
+    }
+
+    async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+        // v1 LIMITATION (tracked as a Phase 5 follow-up, not silently
+        // papered over): `buzz-acp` exposes no control-channel/health RPC
+        // yet, and `AcpRuntime` is stateless — it hands the spawned `Child`
+        // to the substrate's process table and keeps no reference to it, so
+        // there is no in-process handle here to round-trip against. This
+        // reports healthy unconditionally; OS-level liveness is still fully
+        // covered by `Substrate::observe`'s `try_wait` polling. Closing this
+        // gap needs a real control-channel ping added to `buzz-acp` (e.g. an
+        // ACP `session/probe`-style round trip) threaded through here.
+        Ok(())
     }
 }
 

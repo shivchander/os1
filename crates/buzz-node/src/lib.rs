@@ -12,6 +12,10 @@ pub mod engine;
 /// Node enrollment: keypair bootstrap, keychain-backed secret storage,
 /// pairing code, and the owner-discovery handshake.
 pub mod enroll;
+/// Active smoke-probe health classification (spec §9): combines observed
+/// process state, probe outcome, and breaker state into a reportable
+/// `AgentHealth` + reason.
+pub mod health;
 /// Domain types: desired agents, observed states, actions, errors.
 pub mod model;
 /// Bounded stop-before-start move gate (spec I4): defers a spawn while a

@@ -22,6 +22,16 @@ pub trait Substrate: Send + Sync {
     async fn start(&self, desired: &DesiredAgent) -> Result<(), NodeError>;
     /// Stop the given agent.
     async fn stop(&self, agent: &PublicKey) -> Result<(), NodeError>;
+    /// True if `agent`'s crash-restart breaker currently forbids a start —
+    /// a deliberate cooldown after repeated crashes, not a fresh unexpected
+    /// failure. Consulted by [`crate::health::classify`] so a breaker-open
+    /// agent reports `Stopped`/`"breaker-open"` rather than `Crashed` (spec
+    /// §9; carried Batch A/B review finding).
+    fn breaker_open(&self, agent: &PublicKey) -> bool;
+    /// Actively probe a running agent for liveness beyond mere OS-process
+    /// existence (spec §9 active smoke-probe) — delegates to the underlying
+    /// [`crate::runtime::AgentRuntime::probe`].
+    async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError>;
 }
 
 /// Crash-restart circuit breaker: crashes within this window count toward
@@ -137,17 +147,6 @@ impl LocalProcessSubstrate {
             table: std::sync::Mutex::new(BTreeMap::new()),
             breaker: std::sync::Mutex::new(BTreeMap::new()),
         }
-    }
-
-    /// True if `agent`'s crash-restart breaker currently forbids a start.
-    /// Consulted by [`Substrate::start`] before spawning.
-    pub fn breaker_open(&self, agent: &PublicKey) -> bool {
-        self.breaker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(*agent)
-            .or_default()
-            .is_open()
     }
 
     /// Lock the process table, mapping mutex poisoning to a [`NodeError`]
@@ -305,6 +304,19 @@ impl Substrate for LocalProcessSubstrate {
         self.lock_table()?.insert(*agent, AgentSlot::Stopped);
         Ok(())
     }
+
+    fn breaker_open(&self, agent: &PublicKey) -> bool {
+        self.breaker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*agent)
+            .or_default()
+            .is_open()
+    }
+
+    async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError> {
+        self.runtime.probe(agent).await
+    }
 }
 
 /// Terminate the process group rooted at `pid` (mirrors
@@ -365,6 +377,14 @@ pub struct FakeSubstrate {
     pub starts: std::sync::Mutex<Vec<PublicKey>>,
     /// Pubkeys passed to `stop`, in order.
     pub stops: std::sync::Mutex<Vec<PublicKey>>,
+    /// Pubkeys passed to `probe`, in order.
+    pub probes: std::sync::Mutex<Vec<PublicKey>>,
+    /// Agents currently scripted as having an open crash-restart breaker —
+    /// see [`Self::set_breaker_open`].
+    open_breakers: std::sync::Mutex<std::collections::BTreeSet<PublicKey>>,
+    /// Per-agent scripted `probe` outcome; absent = succeeds. See
+    /// [`Self::set_probe`].
+    probe_results: std::sync::Mutex<BTreeMap<PublicKey, bool>>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -377,6 +397,22 @@ impl FakeSubstrate {
     pub fn set(&self, agent: PublicKey, observed: Observed) {
         self.inner.lock().expect("lock").insert(agent, observed);
     }
+    /// Script whether `agent`'s crash-restart breaker reports open —
+    /// mirrors [`LocalProcessSubstrate::breaker_open`]'s effect on `start`
+    /// (a refused start leaves the process table untouched).
+    pub fn set_breaker_open(&self, agent: PublicKey, open: bool) {
+        let mut breakers = self.open_breakers.lock().expect("lock");
+        if open {
+            breakers.insert(agent);
+        } else {
+            breakers.remove(&agent);
+        }
+    }
+    /// Script the outcome of subsequent `probe` calls for `agent`.
+    /// `ok = false` makes `probe` return an `Err`.
+    pub fn set_probe(&self, agent: PublicKey, ok: bool) {
+        self.probe_results.lock().expect("lock").insert(agent, ok);
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -386,6 +422,11 @@ impl Substrate for FakeSubstrate {
         self.inner.lock().expect("lock").clone()
     }
     async fn start(&self, desired: &DesiredAgent) -> Result<(), NodeError> {
+        if self.breaker_open(&desired.agent_pubkey) {
+            // Mirrors `LocalProcessSubstrate::start`: refuse silently,
+            // leaving the process table untouched.
+            return Ok(());
+        }
         self.starts.lock().expect("lock").push(desired.agent_pubkey);
         self.inner
             .lock()
@@ -400,6 +441,16 @@ impl Substrate for FakeSubstrate {
             .expect("lock")
             .insert(*agent, Observed::Stopped);
         Ok(())
+    }
+    fn breaker_open(&self, agent: &PublicKey) -> bool {
+        self.open_breakers.lock().expect("lock").contains(agent)
+    }
+    async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError> {
+        self.probes.lock().expect("lock").push(*agent);
+        match self.probe_results.lock().expect("lock").get(agent) {
+            Some(false) => Err(NodeError::Substrate("simulated probe failure".into())),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -440,6 +491,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fake_substrate_scripts_breaker_open_and_probe_outcome() {
+        let a = Keys::generate().public_key();
+        let s = FakeSubstrate::new();
+        assert!(!s.breaker_open(&a), "closed by default");
+        s.set_breaker_open(a, true);
+        assert!(s.breaker_open(&a));
+        s.set_breaker_open(a, false);
+        assert!(!s.breaker_open(&a));
+
+        assert!(s.probe(&a).await.is_ok(), "succeeds by default");
+        s.set_probe(a, false);
+        assert!(s.probe(&a).await.is_err());
+        assert_eq!(
+            *s.probes.lock().unwrap(),
+            vec![a, a],
+            "every probe call is logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_substrate_start_refuses_while_breaker_open() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let s = FakeSubstrate::new();
+        s.set_breaker_open(a.public_key(), true);
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+
+        s.start(&d).await.unwrap();
+
+        assert!(
+            s.starts.lock().unwrap().is_empty(),
+            "must not record a start while the breaker is open"
+        );
+        assert_eq!(
+            s.observe().await.get(&a.public_key()),
+            None,
+            "table must be untouched by a refused start"
+        );
+    }
+
     // --- LocalProcessSubstrate ---
 
     struct SleepRuntime;
@@ -463,6 +554,9 @@ mod tests {
             cmd.process_group(0);
             cmd.spawn()
                 .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
+        }
+        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+            Ok(())
         }
     }
 
@@ -533,6 +627,9 @@ mod tests {
                     .store(pid, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(child)
+        }
+        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+            Ok(())
         }
     }
 
@@ -610,6 +707,9 @@ mod tests {
             cmd.process_group(0);
             cmd.spawn()
                 .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
+        }
+        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+            Ok(())
         }
     }
 
@@ -723,6 +823,63 @@ mod tests {
             cmd.spawn()
                 .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
         }
+        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
+            Ok(())
+        }
+    }
+
+    /// Records every `probe()` call and can be scripted to fail — proves
+    /// `LocalProcessSubstrate::probe` genuinely delegates to the underlying
+    /// `AgentRuntime::probe` rather than being a no-op stub.
+    #[derive(Default)]
+    struct ProbeRuntime {
+        probes: std::sync::Mutex<Vec<PublicKey>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for ProbeRuntime {
+        async fn spawn(
+            &self,
+            _desired: &DesiredAgent,
+            workspace: &std::path::Path,
+            _relay_url: &str,
+        ) -> Result<tokio::process::Child, NodeError> {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 5"])
+                .current_dir(workspace)
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.spawn()
+                .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
+        }
+        async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError> {
+            self.probes.lock().expect("lock").push(*agent);
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(NodeError::Substrate("simulated probe failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn substrate_probe_delegates_to_the_agent_runtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = std::sync::Arc::new(ProbeRuntime::default());
+        let sub = LocalProcessSubstrate::new(runtime.clone(), "wss://r".into(), dir.path().into());
+        let agent = Keys::generate().public_key();
+
+        sub.probe(&agent).await.expect("probe ok");
+        assert_eq!(*runtime.probes.lock().unwrap(), vec![agent]);
+
+        runtime
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            sub.probe(&agent).await.is_err(),
+            "a probe failure must propagate through the substrate"
+        );
     }
 
     #[tokio::test]

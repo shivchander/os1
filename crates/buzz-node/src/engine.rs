@@ -11,8 +11,9 @@ use nostr::{Keys, PublicKey};
 // tokio clock in tests.
 use tokio::time::Instant;
 
-use buzz_core::{AgentHealth, AgentNodeStatus, AssignState};
+use buzz_core::{AgentNodeStatus, AssignState};
 
+use crate::health;
 use crate::model::{Action, DesiredAgent, NodeError, Observed};
 use crate::move_gate::{self, PeerStatusView, MOVE_HANDOFF_TIMEOUT};
 use crate::reconcile::reconcile;
@@ -53,6 +54,12 @@ pub async fn run(
     let mut current: Vec<DesiredAgent> = Vec::new();
     let mut status_view = PeerStatusView::default();
     let mut pending_spawns: HashMap<PublicKey, Instant> = HashMap::new();
+    // Last time each Running agent got an active smoke probe (spec §9); an
+    // agent absent from this map is treated as due immediately, which is
+    // also how a freshly (re)spawned agent gets probed right away rather
+    // than waiting out `SMOKE_PROBE_INTERVAL` — see `start_gated`, which
+    // clears an agent's entry the moment it actually starts.
+    let mut last_probe: HashMap<PublicKey, Instant> = HashMap::new();
 
     relay.publish_presence(true).await?;
 
@@ -78,6 +85,7 @@ pub async fn run(
                 &mut current,
                 &status_view,
                 &mut pending_spawns,
+                &mut last_probe,
                 me,
             )
             .await?;
@@ -114,6 +122,7 @@ pub async fn run(
             &substrate,
             &status_view,
             &mut pending_spawns,
+            &mut last_probe,
             me,
             &current,
         )
@@ -165,6 +174,7 @@ async fn full_resync(
     current: &mut Vec<DesiredAgent>,
     status_view: &PeerStatusView,
     pending_spawns: &mut HashMap<PublicKey, Instant>,
+    last_probe: &mut HashMap<PublicKey, Instant>,
     me: PublicKey,
 ) -> Result<(), NodeError> {
     match relay.query_desired().await {
@@ -177,7 +187,16 @@ async fn full_resync(
             return Ok(());
         }
     }
-    reconcile_and_apply(relay, substrate, status_view, pending_spawns, me, current).await
+    reconcile_and_apply(
+        relay,
+        substrate,
+        status_view,
+        pending_spawns,
+        last_probe,
+        me,
+        current,
+    )
+    .await
 }
 
 /// Observe the substrate, reconcile against `current`, apply the resulting
@@ -189,6 +208,7 @@ async fn reconcile_and_apply(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
     pending_spawns: &mut HashMap<PublicKey, Instant>,
+    last_probe: &mut HashMap<PublicKey, Instant>,
     me: PublicKey,
     current: &[DesiredAgent],
 ) -> Result<(), NodeError> {
@@ -218,20 +238,43 @@ async fn reconcile_and_apply(
 
     let observed = substrate.observe().await;
     for action in reconcile(current, &observed) {
-        apply_action(substrate, status_view, pending_spawns, me, &due, action).await?;
+        apply_action(
+            substrate,
+            status_view,
+            pending_spawns,
+            last_probe,
+            me,
+            &due,
+            action,
+        )
+        .await?;
     }
 
-    // Report observed status after applying actions.
+    // Report observed status after applying actions — actively probing each
+    // Running agent whose last probe is stale (or absent, e.g. just spawned)
+    // before classifying (spec §9 active smoke-probe health).
     let after = substrate.observe().await;
+    let now = Instant::now();
     for (pk, obs) in &after {
-        if let Some(health) = health_of(*obs) {
+        let probe_ok = if matches!(obs, Observed::Running)
+            && last_probe
+                .get(pk)
+                .is_none_or(|&t| now.saturating_duration_since(t) >= health::SMOKE_PROBE_INTERVAL)
+        {
+            last_probe.insert(*pk, now);
+            Some(substrate.probe(pk).await.is_ok())
+        } else {
+            None
+        };
+        let breaker_open = substrate.breaker_open(pk);
+        if let Some((health, reason)) = health::classify(obs, probe_ok, breaker_open) {
             let status = AgentNodeStatus {
                 format: buzz_core::node_status::FORMAT.to_string(),
                 version: buzz_core::node_status::VERSION,
                 agent_pubkey: pk.to_hex(),
                 node_pubkey: me.to_hex(),
                 health,
-                reason: None,
+                reason,
                 updated_at: chrono::Utc::now().to_rfc3339(),
             };
             relay.publish_status(&status).await?;
@@ -246,21 +289,43 @@ async fn apply_action(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
     pending_spawns: &mut HashMap<PublicKey, Instant>,
+    last_probe: &mut HashMap<PublicKey, Instant>,
     me: PublicKey,
     due: &HashSet<PublicKey>,
     action: Action,
 ) -> Result<(), NodeError> {
     match action {
-        Action::Start(d) => start_gated(substrate, status_view, pending_spawns, me, due, *d).await,
+        Action::Start(d) => {
+            start_gated(
+                substrate,
+                status_view,
+                pending_spawns,
+                last_probe,
+                me,
+                due,
+                *d,
+            )
+            .await
+        }
         Action::Restart(d) => {
             substrate.stop(&d.agent_pubkey).await?;
-            start_gated(substrate, status_view, pending_spawns, me, due, *d).await
+            start_gated(
+                substrate,
+                status_view,
+                pending_spawns,
+                last_probe,
+                me,
+                due,
+                *d,
+            )
+            .await
         }
         Action::Stop(pk) => {
             // Clear any stale deferral so a later re-assignment of this
             // agent starts its own fresh handoff window rather than
             // inheriting a leftover deadline.
             pending_spawns.remove(&pk);
+            last_probe.remove(&pk);
             substrate.stop(&pk).await
         }
         Action::Noop(_) => Ok(()),
@@ -279,6 +344,7 @@ async fn start_gated(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
     pending_spawns: &mut HashMap<PublicKey, Instant>,
+    last_probe: &mut HashMap<PublicKey, Instant>,
     me: PublicKey,
     due: &HashSet<PublicKey>,
     d: DesiredAgent,
@@ -292,19 +358,13 @@ async fn start_gated(
         return Ok(());
     }
     pending_spawns.remove(&agent);
-    substrate.start(&d).await
-}
-
-/// Map an [`Observed`] state to a reportable [`AgentHealth`]; `Absent` is not
-/// reported.
-fn health_of(obs: Observed) -> Option<AgentHealth> {
-    match obs {
-        Observed::Starting => Some(AgentHealth::Starting),
-        Observed::Running => Some(AgentHealth::Running),
-        Observed::Stopped => Some(AgentHealth::Stopped),
-        Observed::Crashed { .. } => Some(AgentHealth::Crashed),
-        Observed::Absent => None,
-    }
+    substrate.start(&d).await?;
+    // Force an immediate smoke probe on the next reporting pass rather than
+    // waiting out any stale `last_probe` timestamp left over from before a
+    // crash/stop — spec §9 wants a real round-trip right after a spawn is
+    // first observed running, not just on the periodic cadence.
+    last_probe.remove(&agent);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -624,12 +684,14 @@ mod tests {
         let mut current = Vec::new();
         let status_view = PeerStatusView::default();
         let mut pending = HashMap::new();
+        let mut last_probe = HashMap::new();
         full_resync(
             &relay,
             &substrate_dyn,
             &mut current,
             &status_view,
             &mut pending,
+            &mut last_probe,
             node_m.public_key(),
         )
         .await
@@ -740,6 +802,92 @@ mod tests {
         .unwrap();
 
         assert_eq!(*substrate.stops.lock().unwrap(), vec![agent.public_key()]);
+    }
+
+    // --- Task 4: active smoke-probe health ---
+
+    #[tokio::test]
+    async fn failed_probe_on_running_agent_publishes_crashed_probe_failed() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        substrate.set(a.public_key(), Observed::Running);
+        substrate.set_probe(a.public_key(), false);
+        let (relay, handle) = FakeRelay::new(vec![]);
+        handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
+
+        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
+            .await
+            .unwrap();
+
+        let statuses = handle.statuses.lock().unwrap();
+        let s = statuses
+            .iter()
+            .find(|s| s.agent_pubkey == a.public_key().to_hex())
+            .expect("status published for the probed agent");
+        assert_eq!(s.health, AgentHealth::Crashed);
+        assert_eq!(s.reason.as_deref(), Some("probe-failed"));
+    }
+
+    #[tokio::test]
+    async fn healthy_running_agent_is_probed_and_published_with_no_reason() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        substrate.set(a.public_key(), Observed::Running);
+        let (relay, handle) = FakeRelay::new(vec![]);
+        handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
+
+        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *substrate.probes.lock().unwrap(),
+            vec![a.public_key()],
+            "a running assigned agent must be actively probed"
+        );
+        let statuses = handle.statuses.lock().unwrap();
+        let s = statuses
+            .iter()
+            .find(|s| s.agent_pubkey == a.public_key().to_hex())
+            .expect("status published");
+        assert_eq!(s.health, AgentHealth::Running);
+        assert_eq!(s.reason, None);
+    }
+
+    /// The carried Batch A/B review finding, proven end-to-end: a breaker
+    /// held open by repeated crashes must report as `Stopped`/"breaker-open",
+    /// never as a fresh `Crashed`.
+    #[tokio::test]
+    async fn breaker_open_agent_reports_stopped_with_cooldown_reason_not_crashed() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        // A stale Crashed record from whatever run tripped the breaker -- the
+        // point of this test is that it must not be re-surfaced as a fresh
+        // crash while the breaker holds it in cooldown.
+        substrate.set(a.public_key(), Observed::Crashed { code: Some(1) });
+        substrate.set_breaker_open(a.public_key(), true);
+        let (relay, handle) = FakeRelay::new(vec![]);
+        handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
+
+        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
+            .await
+            .unwrap();
+
+        assert!(
+            substrate.starts.lock().unwrap().is_empty(),
+            "the open breaker must actually have prevented a start"
+        );
+        let statuses = handle.statuses.lock().unwrap();
+        let s = statuses
+            .iter()
+            .find(|s| s.agent_pubkey == a.public_key().to_hex())
+            .expect("status published for the breaker-open agent");
+        assert_eq!(
+            s.health,
+            AgentHealth::Stopped,
+            "a breaker cooldown must not be reported as a fresh crash"
+        );
+        assert_eq!(s.reason.as_deref(), Some("breaker-open"));
     }
 
     // --- Batch A review fix round: Task 1 x Task 3 interaction ---

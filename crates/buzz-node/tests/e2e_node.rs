@@ -86,6 +86,10 @@ impl AgentRuntime for SleepRuntime {
         cmd.spawn()
             .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
     }
+
+    async fn probe(&self, _agent: &nostr::PublicKey) -> Result<(), NodeError> {
+        Ok(())
+    }
 }
 
 /// Build the owner-authored assignment secret for `agent`, targeting `node`.

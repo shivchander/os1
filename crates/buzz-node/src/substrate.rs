@@ -24,10 +24,22 @@ pub trait Substrate: Send + Sync {
     async fn stop(&self, agent: &PublicKey) -> Result<(), NodeError>;
     /// True if `agent`'s crash-restart breaker currently forbids a start —
     /// a deliberate cooldown after repeated crashes, not a fresh unexpected
-    /// failure. Consulted by [`crate::health::classify`] so a breaker-open
-    /// agent reports `Stopped`/`"breaker-open"` rather than `Crashed` (spec
-    /// §9; carried Batch A/B review finding).
+    /// failure (spec §9). **Consuming**: once the cooldown has elapsed, this
+    /// call itself performs the one-time open→half-open transition that
+    /// allows exactly one probe start through (see [`Circuit::is_open`]) —
+    /// call this ONLY from an actual start attempt
+    /// ([`Substrate::start`]). Anything else (e.g. health reporting) must
+    /// use [`Substrate::breaker_open_peek`] instead, or it will silently
+    /// consume `start`'s one-time allowance without ever attempting a start
+    /// (Batch B review finding).
     fn breaker_open(&self, agent: &PublicKey) -> bool;
+    /// Non-mutating peek at whether `agent`'s breaker currently reports
+    /// open — the same true/false answer as [`Substrate::breaker_open`] at
+    /// this instant, but never performs the open→half-open transition. Safe
+    /// to call repeatedly and from a path that isn't actually attempting a
+    /// start, e.g. [`crate::health::classify`]'s breaker check in the
+    /// engine's status-reporting loop.
+    fn breaker_open_peek(&self, agent: &PublicKey) -> bool;
     /// Actively probe a running agent for liveness beyond mere OS-process
     /// existence (spec §9 active smoke-probe) — delegates to the underlying
     /// [`crate::runtime::AgentRuntime::probe`].
@@ -85,6 +97,14 @@ impl Circuit {
             }
             None => false,
         }
+    }
+
+    /// Non-mutating peek: true iff currently within the cooldown window.
+    /// Unlike [`Self::is_open`], never performs the open→half-open
+    /// transition — safe to call from a path that isn't actually attempting
+    /// a start (see [`Substrate::breaker_open_peek`]).
+    fn is_open_peek(&self) -> bool {
+        matches!(self.open_until, Some(until) if Instant::now() < until)
     }
 }
 
@@ -314,6 +334,14 @@ impl Substrate for LocalProcessSubstrate {
             .is_open()
     }
 
+    fn breaker_open_peek(&self, agent: &PublicKey) -> bool {
+        self.breaker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent)
+            .is_some_and(Circuit::is_open_peek)
+    }
+
     async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError> {
         self.runtime.probe(agent).await
     }
@@ -443,6 +471,14 @@ impl Substrate for FakeSubstrate {
         Ok(())
     }
     fn breaker_open(&self, agent: &PublicKey) -> bool {
+        self.open_breakers.lock().expect("lock").contains(agent)
+    }
+    fn breaker_open_peek(&self, agent: &PublicKey) -> bool {
+        // The fake models breaker state as a simple sticky flag rather than
+        // a timed cooldown with a consuming half-open transition, so peek
+        // and the consuming check are identical here — the distinction only
+        // matters against the real `Circuit`, exercised by
+        // `substrate::tests::circuit_peek_does_not_consume_the_half_open_transition`.
         self.open_breakers.lock().expect("lock").contains(agent)
     }
     async fn probe(&self, agent: &PublicKey) -> Result<(), NodeError> {
@@ -902,6 +938,41 @@ mod tests {
             runtime.spawns.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "start() must not spawn while the breaker is open"
+        );
+    }
+
+    /// Batch B review finding: `Circuit::is_open` performs a one-time,
+    /// consuming open→half-open transition once the cooldown has elapsed
+    /// (clearing `open_until` and pre-seeding `crash_times`) — meant to be
+    /// triggered only by an actual start attempt. `is_open_peek` must report
+    /// the same answer without ever performing that transition, so a
+    /// read-only caller (health reporting) can't silently eat the
+    /// allowance a real `start()` was supposed to consume.
+    #[test]
+    fn circuit_peek_does_not_consume_the_half_open_transition() {
+        let mut c = Circuit {
+            // An already-expired cooldown, as if BREAKER_COOLDOWN had
+            // elapsed in the past.
+            open_until: Some(Instant::now() - Duration::from_millis(1)),
+            crash_times: Vec::new(),
+        };
+
+        assert!(
+            !c.is_open_peek(),
+            "peek must see an expired cooldown as no longer open"
+        );
+        assert!(
+            !c.is_open_peek(),
+            "peek must be repeatable without side effects"
+        );
+        // `open_until` must be untouched by the peeks above -- if the real
+        // (consuming) check still performs its own one-time transition
+        // afterward, peek could not have already consumed it.
+        assert!(!c.is_open());
+        assert_eq!(
+            c.crash_times.len(),
+            BREAKER_THRESHOLD - 1,
+            "is_open()'s own half-open transition must still fire after any number of peeks"
         );
     }
 }

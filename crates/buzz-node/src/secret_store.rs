@@ -9,6 +9,11 @@
 //! by name from the persisted [`crate::enroll::NodeConfig`] — the on-disk
 //! config carries only the provider name (see [`provider_secret_key`]); the
 //! key value lives here, never on disk.
+//!
+//! v1 LIMITATION: this module only provides the store + the name/key
+//! mapping. Nothing yet reads a configured provider's secret back out at
+//! agent-spawn time — that consumption (e.g. threading it into
+//! `runtime::build_child_env`'s injected environment) is follow-on work.
 use crate::model::NodeError;
 
 /// Default keychain service namespace for provider secrets — distinct from

@@ -41,6 +41,13 @@ pub struct NodeConfig {
     /// ([`crate::secret_store::provider_secret_key`] derives the keychain
     /// key from the name), never here. `#[serde(default)]` so a config
     /// persisted before this field existed still loads.
+    ///
+    /// v1 LIMITATION: recording a name here does not yet make the
+    /// corresponding secret available to a running agent — nothing reads
+    /// `providers` back out at spawn time (e.g. into
+    /// `runtime::build_child_env`'s injected environment). That wiring is
+    /// follow-on work; today this field only proves the on-disk config can
+    /// name a provider without ever carrying its secret value.
     #[serde(default)]
     pub providers: Vec<String>,
 }

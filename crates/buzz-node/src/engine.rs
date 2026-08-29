@@ -39,6 +39,32 @@ pub struct EngineConfig {
     pub node_pubkey: PublicKey,
 }
 
+/// Mutable per-agent bookkeeping threaded through `full_resync` /
+/// `reconcile_and_apply` / `apply_action` / `start_gated`, bundled into one
+/// struct so passing it around doesn't keep growing each function's own
+/// parameter list as later batches add more per-agent maps (Batch B review
+/// finding — clippy's `too_many_arguments` tripped once a 3rd map joined
+/// `pending_spawns`).
+#[derive(Default)]
+struct LoopState {
+    /// Deferred (move-gate-blocked) spawns awaiting either the peer
+    /// reporting `stopped` or [`MOVE_HANDOFF_TIMEOUT`] elapsing (spec I4).
+    pending_spawns: HashMap<PublicKey, Instant>,
+    /// Last time each `Running` agent got an active smoke probe (spec §9);
+    /// an agent absent from this map is treated as due immediately, which
+    /// is also how a freshly (re)spawned agent gets probed right away
+    /// rather than waiting out `SMOKE_PROBE_INTERVAL` — see `start_gated`,
+    /// which clears an agent's entry the moment it actually starts.
+    last_probe: HashMap<PublicKey, Instant>,
+    /// Latched result of each agent's last actual probe (Batch B review
+    /// finding): on a reconcile pass where a fresh probe isn't due,
+    /// `reconcile_and_apply` feeds this latched result into `classify`
+    /// instead of `None` — otherwise a real probe failure would silently
+    /// heal back to `Running` on the very next non-probing pass, for lack
+    /// of new evidence rather than any actual recovery.
+    last_probe_result: HashMap<PublicKey, bool>,
+}
+
 /// Run the node engine until the relay's desired-state stream ends (`None`).
 pub async fn run(
     substrate: Arc<dyn Substrate>,
@@ -53,13 +79,7 @@ pub async fn run(
 
     let mut current: Vec<DesiredAgent> = Vec::new();
     let mut status_view = PeerStatusView::default();
-    let mut pending_spawns: HashMap<PublicKey, Instant> = HashMap::new();
-    // Last time each Running agent got an active smoke probe (spec §9); an
-    // agent absent from this map is treated as due immediately, which is
-    // also how a freshly (re)spawned agent gets probed right away rather
-    // than waiting out `SMOKE_PROBE_INTERVAL` — see `start_gated`, which
-    // clears an agent's entry the moment it actually starts.
-    let mut last_probe: HashMap<PublicKey, Instant> = HashMap::new();
+    let mut state = LoopState::default();
 
     relay.publish_presence(true).await?;
 
@@ -84,8 +104,7 @@ pub async fn run(
                 &substrate,
                 &mut current,
                 &status_view,
-                &mut pending_spawns,
-                &mut last_probe,
+                &mut state,
                 me,
             )
             .await?;
@@ -121,8 +140,7 @@ pub async fn run(
             relay.as_ref(),
             &substrate,
             &status_view,
-            &mut pending_spawns,
-            &mut last_probe,
+            &mut state,
             me,
             &current,
         )
@@ -173,8 +191,7 @@ async fn full_resync(
     substrate: &Arc<dyn Substrate>,
     current: &mut Vec<DesiredAgent>,
     status_view: &PeerStatusView,
-    pending_spawns: &mut HashMap<PublicKey, Instant>,
-    last_probe: &mut HashMap<PublicKey, Instant>,
+    state: &mut LoopState,
     me: PublicKey,
 ) -> Result<(), NodeError> {
     match relay.query_desired().await {
@@ -187,16 +204,7 @@ async fn full_resync(
             return Ok(());
         }
     }
-    reconcile_and_apply(
-        relay,
-        substrate,
-        status_view,
-        pending_spawns,
-        last_probe,
-        me,
-        current,
-    )
-    .await
+    reconcile_and_apply(relay, substrate, status_view, state, me, current).await
 }
 
 /// Observe the substrate, reconcile against `current`, apply the resulting
@@ -207,8 +215,7 @@ async fn reconcile_and_apply(
     relay: &dyn NodeRelay,
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
-    pending_spawns: &mut HashMap<PublicKey, Instant>,
-    last_probe: &mut HashMap<PublicKey, Instant>,
+    state: &mut LoopState,
     me: PublicKey,
     current: &[DesiredAgent],
 ) -> Result<(), NodeError> {
@@ -225,29 +232,20 @@ async fn reconcile_and_apply(
     // would see that ancient deadline as already elapsed and `start_gated`
     // would spawn immediately — silently bypassing the move gate (a real
     // I4 double-spawn; see batch A review, Task 1 x Task 3 interaction).
-    pending_spawns.retain(|agent, _| {
+    state.pending_spawns.retain(|agent, _| {
         current
             .iter()
             .any(|d| d.agent_pubkey == *agent && d.state == AssignState::Assigned)
     });
 
     let now = Instant::now();
-    let due: HashSet<PublicKey> = move_gate::due_pending(pending_spawns, now)
+    let due: HashSet<PublicKey> = move_gate::due_pending(&state.pending_spawns, now)
         .into_iter()
         .collect();
 
     let observed = substrate.observe().await;
     for action in reconcile(current, &observed) {
-        apply_action(
-            substrate,
-            status_view,
-            pending_spawns,
-            last_probe,
-            me,
-            &due,
-            action,
-        )
-        .await?;
+        apply_action(substrate, status_view, state, me, &due, action).await?;
     }
 
     // Report observed status after applying actions — actively probing each
@@ -256,17 +254,37 @@ async fn reconcile_and_apply(
     let after = substrate.observe().await;
     let now = Instant::now();
     for (pk, obs) in &after {
-        let probe_ok = if matches!(obs, Observed::Running)
-            && last_probe
+        let probe_ok = if matches!(obs, Observed::Running) {
+            let due_for_probe = state
+                .last_probe
                 .get(pk)
-                .is_none_or(|&t| now.saturating_duration_since(t) >= health::SMOKE_PROBE_INTERVAL)
-        {
-            last_probe.insert(*pk, now);
-            Some(substrate.probe(pk).await.is_ok())
+                .is_none_or(|&t| now.saturating_duration_since(t) >= health::SMOKE_PROBE_INTERVAL);
+            if due_for_probe {
+                let ok = substrate.probe(pk).await.is_ok();
+                state.last_probe.insert(*pk, now);
+                state.last_probe_result.insert(*pk, ok);
+                Some(ok)
+            } else {
+                // Not due for a fresh probe this cycle: latch the last
+                // known result rather than passing `None`, which
+                // `classify` treats as "healthy" — without this, a real
+                // probe failure would silently heal back to `Running` on
+                // the very next non-probing pass, for lack of new
+                // evidence rather than any actual recovery (Batch B
+                // review finding). Only a truly never-probed agent (no
+                // entry yet) falls through to `None`.
+                state.last_probe_result.get(pk).copied()
+            }
         } else {
             None
         };
-        let breaker_open = substrate.breaker_open(pk);
+        // Non-mutating peek (`breaker_open` itself performs a one-time,
+        // consuming open→half-open transition meant for an actual start
+        // attempt — see `Substrate::start`; using it here would silently
+        // eat that allowance on every reporting pass for a Crashed-and-
+        // no-longer-desired agent, since `Noop` never calls `start()` to
+        // consume it properly).
+        let breaker_open = substrate.breaker_open_peek(pk);
         if let Some((health, reason)) = health::classify(obs, probe_ok, breaker_open) {
             let status = AgentNodeStatus {
                 format: buzz_core::node_status::FORMAT.to_string(),
@@ -288,44 +306,24 @@ async fn reconcile_and_apply(
 async fn apply_action(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
-    pending_spawns: &mut HashMap<PublicKey, Instant>,
-    last_probe: &mut HashMap<PublicKey, Instant>,
+    state: &mut LoopState,
     me: PublicKey,
     due: &HashSet<PublicKey>,
     action: Action,
 ) -> Result<(), NodeError> {
     match action {
-        Action::Start(d) => {
-            start_gated(
-                substrate,
-                status_view,
-                pending_spawns,
-                last_probe,
-                me,
-                due,
-                *d,
-            )
-            .await
-        }
+        Action::Start(d) => start_gated(substrate, status_view, state, me, due, *d).await,
         Action::Restart(d) => {
             substrate.stop(&d.agent_pubkey).await?;
-            start_gated(
-                substrate,
-                status_view,
-                pending_spawns,
-                last_probe,
-                me,
-                due,
-                *d,
-            )
-            .await
+            start_gated(substrate, status_view, state, me, due, *d).await
         }
         Action::Stop(pk) => {
             // Clear any stale deferral so a later re-assignment of this
             // agent starts its own fresh handoff window rather than
             // inheriting a leftover deadline.
-            pending_spawns.remove(&pk);
-            last_probe.remove(&pk);
+            state.pending_spawns.remove(&pk);
+            state.last_probe.remove(&pk);
+            state.last_probe_result.remove(&pk);
             substrate.stop(&pk).await
         }
         Action::Noop(_) => Ok(()),
@@ -343,8 +341,7 @@ async fn apply_action(
 async fn start_gated(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
-    pending_spawns: &mut HashMap<PublicKey, Instant>,
-    last_probe: &mut HashMap<PublicKey, Instant>,
+    state: &mut LoopState,
     me: PublicKey,
     due: &HashSet<PublicKey>,
     d: DesiredAgent,
@@ -352,18 +349,19 @@ async fn start_gated(
     let agent = d.agent_pubkey;
     let blocked = status_view.peer_blocks_spawn(&agent, &me) && !due.contains(&agent);
     if blocked {
-        pending_spawns
+        state
+            .pending_spawns
             .entry(agent)
             .or_insert_with(|| Instant::now() + MOVE_HANDOFF_TIMEOUT);
         return Ok(());
     }
-    pending_spawns.remove(&agent);
+    state.pending_spawns.remove(&agent);
     substrate.start(&d).await?;
     // Force an immediate smoke probe on the next reporting pass rather than
     // waiting out any stale `last_probe` timestamp left over from before a
     // crash/stop — spec §9 wants a real round-trip right after a spawn is
     // first observed running, not just on the periodic cadence.
-    last_probe.remove(&agent);
+    state.last_probe.remove(&agent);
     Ok(())
 }
 
@@ -683,15 +681,13 @@ mod tests {
         let substrate_dyn: Arc<dyn Substrate> = substrate.clone();
         let mut current = Vec::new();
         let status_view = PeerStatusView::default();
-        let mut pending = HashMap::new();
-        let mut last_probe = HashMap::new();
+        let mut state = LoopState::default();
         full_resync(
             &relay,
             &substrate_dyn,
             &mut current,
             &status_view,
-            &mut pending,
-            &mut last_probe,
+            &mut state,
             node_m.public_key(),
         )
         .await
@@ -852,6 +848,54 @@ mod tests {
             .expect("status published");
         assert_eq!(s.health, AgentHealth::Running);
         assert_eq!(s.reason, None);
+    }
+
+    /// Batch B review finding: a probe failure must stay latched across a
+    /// later reconcile pass where no fresh probe is due, not silently heal
+    /// back to `Running` for lack of new evidence. Drives the engine through
+    /// TWO reconcile passes for the same still-`Running` agent (a 2-entry
+    /// `FakeRelay` script, each entry consumed by one loop iteration) so the
+    /// 2nd pass's `probe_ok` comes from the latch, not a fresh probe.
+    #[tokio::test]
+    async fn probe_failure_health_is_latched_across_non_probing_reconcile_passes() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        substrate.set_probe(a.public_key(), false);
+        let (relay, handle) = FakeRelay::new(vec![
+            vec![fake_desired(&a, &n, &o, Assigned)],
+            vec![fake_desired(&a, &n, &o, Assigned)],
+        ]);
+
+        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
+            .await
+            .unwrap();
+
+        let statuses: Vec<_> = handle
+            .statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.agent_pubkey == a.public_key().to_hex())
+            .cloned()
+            .collect();
+        assert_eq!(
+            statuses.len(),
+            2,
+            "expected one status publish per reconcile pass"
+        );
+        for (i, s) in statuses.iter().enumerate() {
+            assert_eq!(
+                s.health,
+                AgentHealth::Crashed,
+                "pass {i}: a probe failure must stay latched, not heal back to Running"
+            );
+            assert_eq!(s.reason.as_deref(), Some("probe-failed"));
+        }
+        assert_eq!(
+            *substrate.probes.lock().unwrap(),
+            vec![a.public_key()],
+            "the 2nd pass must reuse the latched result, not issue a redundant probe"
+        );
     }
 
     /// The carried Batch A/B review finding, proven end-to-end: a breaker

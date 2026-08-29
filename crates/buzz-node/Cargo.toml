@@ -14,6 +14,12 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+zeroize = { workspace = true }
+
+# Process-group signaling for graceful agent-process shutdown (mirrors
+# buzz-dev-mcp's KillGroup use of the same crate/features).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 
 [features]
 # Exposes the in-memory FakeSubstrate/FakeRelay for cross-crate tests (Phase 5 e2e).
@@ -21,3 +27,4 @@ test-utils = []
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"

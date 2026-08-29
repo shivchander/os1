@@ -1164,11 +1164,14 @@ dependencies = [
  "async-trait",
  "buzz-core",
  "chrono",
+ "nix 0.31.3",
  "nostr 0.44.7",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

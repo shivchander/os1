@@ -15,5 +15,8 @@ pub mod model;
 pub mod reconcile;
 /// The relay abstraction (desired-state in, status out) + an in-memory fake.
 pub mod relay;
-/// The substrate abstraction (local process table) + an in-memory fake.
+/// The `AgentRuntime` seam (D7) and its ACP implementation.
+pub mod runtime;
+/// The substrate abstraction: the real `LocalProcessSubstrate` plus an
+/// in-memory fake for tests.
 pub mod substrate;

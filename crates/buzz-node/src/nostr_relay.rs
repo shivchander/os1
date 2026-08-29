@@ -2,8 +2,11 @@
 //! `AGENT_ASSIGNMENT` intake (decrypt + target-node filter), and
 //! status/announce/presence publish. Mirrors the dial-out/NIP-42/reconnect
 //! pattern in `crates/buzz-acp/src/relay.rs`, built on `buzz-ws-client` (which
-//! has no reconnect of its own — this module owns that).
+//! has no reconnect of its own — this module owns that). Publishes run on a
+//! background task (see [`NostrNodeRelay::spawn_publish`]) so a down relay
+//! never blocks the node's local reconcile loop.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -77,45 +80,36 @@ struct Conn {
     ws: NostrWsConnection,
 }
 
-/// Real [`NodeRelay`]: dials `relay_url`, NIP-42 authenticates as the node,
-/// subscribes to the owner's `AGENT_ASSIGNMENT` stream, and publishes
-/// status/announce/presence — all over one lazily-established, reconnecting
-/// connection. `buzz-ws-client` itself has no reconnect logic; this type
-/// owns that (mirrors `crates/buzz-acp/src/relay.rs`'s dial-out pattern).
-pub struct NostrNodeRelay {
+/// Shared connection state, wrapped in an `Arc` so the background publish
+/// task spawned by [`NostrNodeRelay::spawn_publish`] can outlive the
+/// `&self` call that spawned it.
+struct Inner {
     node_keys: Keys,
     owner_pubkey: PublicKey,
     relay_url: String,
     conn: Mutex<Option<Conn>>,
-    /// Latest known desired-state per agent (last-writer-wins by the
-    /// underlying addressable event's `created_at`, enforced relay-side by
-    /// NIP-33). Mutated only from `next_desired`, which holds `&mut self`.
-    desired: BTreeMap<PublicKey, DesiredAgent>,
 }
 
-impl NostrNodeRelay {
-    /// Build a relay client for `node_keys`, scoped to `owner_pubkey`'s
-    /// assignments. Dialing happens lazily on first use (`next_desired` or
-    /// any `publish_*` call), not in this constructor.
-    pub fn new(relay_url: String, node_keys: Keys, owner_pubkey: PublicKey) -> Self {
-        Self {
-            node_keys,
-            owner_pubkey,
-            relay_url,
-            conn: Mutex::new(None),
-            desired: BTreeMap::new(),
-        }
-    }
-
+impl Inner {
     /// Ensure `*guard` holds a live, authenticated, subscribed connection,
     /// (re)connecting with the [`backoff_delay`] ladder until it succeeds.
     /// Never gives up: a down relay is a condition this daemon must ride
     /// out, not a fatal error — there is no shutdown signal wired through
     /// the [`NodeRelay`] trait other than `next_desired` returning `None`,
-    /// which this type never does on its own. Agents already running are
-    /// unaffected by an outage here (they are owned by the `Substrate`, not
-    /// the relay connection), so blocking a `publish_*` call until the
-    /// relay comes back does not stop or restart anything.
+    /// which this type never does on its own.
+    ///
+    /// Called from two places with different blocking implications.
+    /// `next_desired` awaits this directly, which is safe because
+    /// `engine::run` races `next_desired` against its own reconcile ticker
+    /// via `select!` — a long reconnect wait there just means the ticker
+    /// branch wins that loop iteration instead of the assignment-read
+    /// branch. The publish path never awaits this on the caller's task at
+    /// all: [`NostrNodeRelay::spawn_publish`] runs it inside a
+    /// `tokio::spawn`ed background task precisely so a down relay can't
+    /// block `engine::run`'s per-agent `relay.publish_status(...).await?`
+    /// — which would otherwise stall the whole reconcile loop before it
+    /// ever reaches the next `substrate.observe()`, leaving a mid-outage
+    /// agent crash undetected and un-restarted until the relay reconnects.
     async fn ensure_connected(&self, guard: &mut Option<Conn>) {
         if guard.is_some() {
             return;
@@ -156,11 +150,13 @@ impl NostrNodeRelay {
         }
     }
 
-    /// Publish a pre-built, signed event, retrying transport failures behind
-    /// the same reconnect-forever policy as [`Self::ensure_connected`]. An
-    /// explicit relay rejection (`OK false`) is NOT retried — that is a
-    /// policy/validation outcome retrying can't fix.
-    async fn publish(&self, event: Event) -> Result<(), NodeError> {
+    /// The actual send-with-retry loop: (re)connects via
+    /// [`Self::ensure_connected`] and sends `event`, retrying transport
+    /// failures behind the same reconnect-forever policy. An explicit relay
+    /// rejection (`OK false`) is NOT retried — that is a policy/validation
+    /// outcome retrying can't fix. Always runs inside the background task
+    /// spawned by [`NostrNodeRelay::spawn_publish`], never on a caller's task.
+    async fn publish_with_retry(&self, event: Event) -> Result<(), NodeError> {
         loop {
             let mut guard = self.conn.lock().await;
             self.ensure_connected(&mut guard).await;
@@ -186,12 +182,72 @@ impl NostrNodeRelay {
     }
 }
 
+/// Real [`NodeRelay`]: dials `relay_url`, NIP-42 authenticates as the node,
+/// subscribes to the owner's `AGENT_ASSIGNMENT` stream, and publishes
+/// status/announce/presence — all over one lazily-established, reconnecting
+/// connection. `buzz-ws-client` itself has no reconnect logic; this type
+/// owns that (mirrors `crates/buzz-acp/src/relay.rs`'s dial-out pattern).
+pub struct NostrNodeRelay {
+    inner: Arc<Inner>,
+    /// Latest known desired-state per agent (last-writer-wins by the
+    /// underlying addressable event's `created_at`, enforced relay-side by
+    /// NIP-33). Mutated only from `next_desired`, which holds `&mut self`.
+    desired: BTreeMap<PublicKey, DesiredAgent>,
+}
+
+impl NostrNodeRelay {
+    /// Build a relay client for `node_keys`, scoped to `owner_pubkey`'s
+    /// assignments. Dialing happens lazily on first use (`next_desired` or
+    /// any `publish_*` call), not in this constructor.
+    pub fn new(relay_url: String, node_keys: Keys, owner_pubkey: PublicKey) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                node_keys,
+                owner_pubkey,
+                relay_url,
+                conn: Mutex::new(None),
+            }),
+            desired: BTreeMap::new(),
+        }
+    }
+
+    /// Publish a pre-built, signed event on a background task, returning as
+    /// soon as the task is enqueued — NOT once the event is actually
+    /// delivered.
+    ///
+    /// This deliberately does not block the caller on relay reachability.
+    /// `engine::run` calls `publish_status` once per agent, sequentially,
+    /// inside its main reconcile loop
+    /// (`relay.publish_status(&status).await?`); if that awaited delivery
+    /// directly, a down relay would stall the loop before it ever reached
+    /// its next `substrate.observe()`, so an agent that crashes mid-outage
+    /// would go undetected and un-restarted until the relay reconnected —
+    /// breaking the node's otherwise relay-independent local crash recovery.
+    ///
+    /// This is safe because every event `publish_*` builds is NIP-33
+    /// addressable (last-writer-wins by `created_at`, which is captured
+    /// synchronously *before* this task is spawned, so logical ordering is
+    /// preserved even if delivery is delayed or arrives out of order): a
+    /// late or retried background publish can only ever be superseded by a
+    /// newer one, never corrupt relay state. A background failure (e.g. an
+    /// explicit relay rejection) is only logged — there is no caller left
+    /// awaiting this task's result to propagate it to.
+    fn spawn_publish(&self, event: Event) {
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            if let Err(e) = inner.publish_with_retry(event).await {
+                tracing::warn!(error = %e, "background publish failed");
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl NodeRelay for NostrNodeRelay {
     async fn next_desired(&mut self) -> Option<Vec<DesiredAgent>> {
         loop {
-            let mut guard = self.conn.lock().await;
-            self.ensure_connected(&mut guard).await;
+            let mut guard = self.inner.conn.lock().await;
+            self.inner.ensure_connected(&mut guard).await;
             let Some(conn) = guard.as_mut() else {
                 continue;
             };
@@ -200,7 +256,8 @@ impl NodeRelay for NostrNodeRelay {
                     subscription_id,
                     event,
                 }) if subscription_id == ASSIGNMENT_SUB_ID => {
-                    let update = desired_from_event(&event, &self.node_keys, &self.owner_pubkey);
+                    let update =
+                        desired_from_event(&event, &self.inner.node_keys, &self.inner.owner_pubkey);
                     // Drop the connection lock before touching `self.desired`
                     // — this iteration no longer needs the connection, and
                     // dropping explicitly sidesteps any doubt about whether
@@ -231,15 +288,17 @@ impl NodeRelay for NostrNodeRelay {
     }
 
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError> {
-        let event = buzz_core::node_status::build_status(&self.node_keys, status, now_unix())
+        let event = buzz_core::node_status::build_status(&self.inner.node_keys, status, now_unix())
             .map_err(|e| NodeError::Relay(format!("build status event: {e}")))?;
-        self.publish(event).await
+        self.spawn_publish(event);
+        Ok(())
     }
 
     async fn publish_announce(&self, caps: &NodeCapabilities) -> Result<(), NodeError> {
-        let event = buzz_core::node::build_announce(&self.node_keys, caps, now_unix())
+        let event = buzz_core::node::build_announce(&self.inner.node_keys, caps, now_unix())
             .map_err(|e| NodeError::Relay(format!("build announce event: {e}")))?;
-        self.publish(event).await
+        self.spawn_publish(event);
+        Ok(())
     }
 
     async fn publish_presence(&self, online: bool) -> Result<(), NodeError> {
@@ -248,9 +307,10 @@ impl NodeRelay for NostrNodeRelay {
         // status string, no tags — matching the desktop client's format.
         let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), content)
             .tags([])
-            .sign_with_keys(&self.node_keys)
+            .sign_with_keys(&self.inner.node_keys)
             .map_err(|e| NodeError::Relay(format!("build presence event: {e}")))?;
-        self.publish(event).await
+        self.spawn_publish(event);
+        Ok(())
     }
 }
 
@@ -372,6 +432,60 @@ mod tests {
     use super::NostrNodeRelay;
     use crate::relay::NodeRelay;
 
+    fn sample_status(node: &Keys) -> buzz_core::AgentNodeStatus {
+        buzz_core::AgentNodeStatus {
+            format: buzz_core::node_status::FORMAT.into(),
+            version: buzz_core::node_status::VERSION,
+            agent_pubkey: Keys::generate().public_key().to_hex(),
+            node_pubkey: node.public_key().to_hex(),
+            health: buzz_core::AgentHealth::Running,
+            reason: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Port 1 on loopback: nothing listens there and nothing (short of
+    /// root) ever will, so the TCP connect fails near-instantly
+    /// (connection refused) instead of timing out — this proves the
+    /// "returns promptly" property below without depending on slow or
+    /// sandboxed outbound network access.
+    const UNREACHABLE_RELAY_URL: &str = "ws://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn publish_status_returns_promptly_when_relay_is_unreachable() {
+        let node = Keys::generate();
+        let owner = Keys::generate();
+        let relay = NostrNodeRelay::new(
+            UNREACHABLE_RELAY_URL.into(),
+            node.clone(),
+            owner.public_key(),
+        );
+        let status = sample_status(&node);
+
+        // The old (pre-fix) behavior awaited delivery directly, which meant
+        // this call would block for as long as the relay stayed
+        // unreachable — effectively forever, since `ensure_connected`
+        // retries without giving up. A bounded timeout here is a direct
+        // regression test for that: it must resolve well within the first
+        // couple of backoff rungs, not hang until (or past) them.
+        let result = tokio::time::timeout(Duration::from_secs(2), relay.publish_status(&status))
+            .await
+            .expect("publish_status must return promptly (enqueue-and-return), not block on the relay being unreachable");
+        result.expect("building/enqueueing the status event must still succeed synchronously");
+    }
+
+    #[tokio::test]
+    async fn publish_presence_returns_promptly_when_relay_is_unreachable() {
+        let node = Keys::generate();
+        let owner = Keys::generate();
+        let relay = NostrNodeRelay::new(UNREACHABLE_RELAY_URL.into(), node, owner.public_key());
+
+        let result = tokio::time::timeout(Duration::from_secs(2), relay.publish_presence(true))
+            .await
+            .expect("publish_presence must return promptly (enqueue-and-return), not block on the relay being unreachable");
+        result.expect("building/enqueueing the presence event must still succeed synchronously");
+    }
+
     /// Requires a running relay. Run with:
     ///   `BUZZ_TEST_RELAY_URL=ws://localhost:3000 cargo test -p buzz-node --lib -- --ignored nostr_relay::tests::live_`
     #[tokio::test]
@@ -392,21 +506,17 @@ mod tests {
             max_agents: None,
         };
         relay.publish_announce(&caps).await.expect("announce");
-
-        let status = buzz_core::AgentNodeStatus {
-            format: buzz_core::node_status::FORMAT.into(),
-            version: buzz_core::node_status::VERSION,
-            agent_pubkey: Keys::generate().public_key().to_hex(),
-            node_pubkey: node.public_key().to_hex(),
-            health: buzz_core::AgentHealth::Running,
-            reason: None,
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        };
-        relay.publish_status(&status).await.expect("status");
+        relay
+            .publish_status(&sample_status(&node))
+            .await
+            .expect("status");
         relay.publish_presence(true).await.expect("presence");
 
         // No assignments published in this smoke test; just prove the
-        // subscribe path connects and the read loop is pollable.
+        // subscribe path connects and the read loop is pollable. Publishes
+        // above are now fire-and-forget (see `spawn_publish`), so this also
+        // gives the background tasks a moment to actually run against the
+        // real relay before the test process exits.
         let _ = tokio::time::timeout(Duration::from_secs(2), relay.next_desired()).await;
     }
 }

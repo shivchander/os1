@@ -45,9 +45,14 @@ const PAIRING_CODE_LEN: usize = 8;
 
 /// Generate a human-typeable pairing code for the human to visually confirm
 /// between this node's terminal output and the app's enrollment prompt.
-/// Not a cryptographic secret — the load-bearing trust check is
-/// [`accept_enrollment`]'s signature verification; this is a UX guard
-/// against approving the wrong physical machine.
+///
+/// This is a UX guard against approving the wrong physical machine, NOT the
+/// cryptographic root of trust — see [`accept_enrollment`] for what actually
+/// establishes trust. The code itself is never transmitted to, or checked
+/// by, the relay/app/protocol; it exists purely for a human to eyeball on
+/// both ends, so it cannot by itself prevent a third party from racing the
+/// real owner's approval (see the HARDENING FOLLOW-UP on
+/// [`accept_enrollment`]).
 pub fn pairing_code() -> String {
     let mut rng = rand::rng();
     (0..PAIRING_CODE_LEN)
@@ -204,9 +209,28 @@ pub fn load_node_config() -> Result<Option<NodeConfig>, NodeError> {
 /// rather than an externally-known owner — [`validate_enrollment`] still
 /// proves the signature is valid and self-consistent (its `owner_pubkey`
 /// field matches the signer), and this additionally checks the `d` tag
-/// names this exact node. Combined with the human confirming the printed
-/// [`pairing_code`] out-of-band, that is enough to bootstrap trust on first
-/// use; thereafter the node only acts on commands from the pinned owner.
+/// names this exact node.
+///
+/// **This is trust-on-first-use (TOFU):** the *first* well-formed,
+/// correctly-targeted `NODE_ENROLLMENT` this function accepts wins and pins
+/// the owner for good; thereafter the node only acts on commands from that
+/// pinned owner. The human confirming the printed [`pairing_code`]
+/// out-of-band is a UX guard against approving the wrong physical machine —
+/// it is NOT part of this function's trust decision, and the code is never
+/// transmitted to or checked here. Concretely, that means any authenticated
+/// community member could race a self-signed `NODE_ENROLLMENT` for this
+/// node's pubkey before the intended owner approves, and whichever one
+/// reaches this function first wins ("first-consistent-event-wins" TOFU).
+///
+/// **Accepted as a documented v1 risk**, not an oversight: the owner
+/// controls community membership, and this matches the design's
+/// TOFU/sovereignty stance
+/// (`docs/superpowers/specs/2026-08-29-execution-nodes-design.md` §9/§12).
+///
+/// HARDENING FOLLOW-UP: make the pairing code load-bearing instead of
+/// cosmetic — add a code/HMAC field to `NODE_ENROLLMENT`, emitted by the
+/// desktop app once the human confirms the code, and have this function
+/// reject an otherwise-valid enrollment whose code doesn't match.
 ///
 /// Pure and I/O-free: safe to unit test with events built by
 /// [`buzz_core::node::build_enrollment`].
@@ -233,6 +257,12 @@ const ENROLLMENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// code for the human to confirm in the app, wait (up to
 /// [`ENROLLMENT_TIMEOUT`]) for the owner's `NODE_ENROLLMENT`, validate it,
 /// and persist the resulting [`NodeConfig`] (via [`save_node_config`]).
+///
+/// Trust-on-first-use: the first `NODE_ENROLLMENT` [`accept_enrollment`]
+/// accepts wins and pins the owner. See that function's doc comment for why
+/// this (and the printed pairing code's purely cosmetic role in it) is a
+/// deliberate, documented v1 tradeoff rather than an oversight, and for the
+/// hardening follow-up that would make the code load-bearing.
 ///
 /// Requires a live relay — this whole function is I/O and is not unit
 /// tested; see the `#[ignore]`d `live_enroll_round_trip` test, which drives
@@ -277,6 +307,11 @@ pub async fn enroll(
         .await
         .map_err(|e| NodeError::Relay(format!("subscribe for enrollment: {e}")))?;
 
+    // First well-formed, correctly-targeted NODE_ENROLLMENT wins here
+    // (trust-on-first-use) — the pairing code printed above is a human UX
+    // guard only and is not checked in this loop. See `accept_enrollment`'s
+    // doc comment for why that's an accepted v1 risk and the hardening
+    // follow-up that would make the code load-bearing instead.
     let wait_for_enrollment = async {
         loop {
             match conn.next_event(ENROLL_READ_POLL_TIMEOUT).await {

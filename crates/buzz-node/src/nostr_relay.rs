@@ -48,6 +48,18 @@ pub fn desired_from_event(
 /// process-local: this type holds exactly one such subscription at a time.
 const ASSIGNMENT_SUB_ID: &str = "buzz-node-assignments";
 
+/// Subscription id for a one-shot resync query (see
+/// [`NostrNodeRelay::fetch_assignment_backlog`]) — distinct from
+/// [`ASSIGNMENT_SUB_ID`]'s long-lived live tail so the two can never be
+/// confused, though `engine::run` only ever calls `query_desired` between
+/// `select!` iterations, never concurrently with `next_desired`.
+const RESYNC_SUB_ID: &str = "buzz-node-resync";
+
+/// Upper bound on how long a one-shot resync query waits for EOSE, so a
+/// relay that never closes the subscription can't hang startup or a
+/// post-reconnect resync forever.
+const RESYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long a single read waits for the next relay message before looping
 /// back to poll again. Bounded (rather than unbounded/`Duration::MAX`) so
 /// the per-read `tokio::time::timeout` deadline computation can never
@@ -88,6 +100,11 @@ struct Inner {
     owner_pubkey: PublicKey,
     relay_url: String,
     conn: Mutex<Option<Conn>>,
+    /// Backing flag for [`NostrNodeRelay::take_reconnected`]: set whenever
+    /// [`Inner::ensure_connected`] (re)establishes the connection, including
+    /// the very first connect — so the engine's first check also drives its
+    /// startup resync.
+    reconnected: std::sync::atomic::AtomicBool,
 }
 
 impl Inner {
@@ -129,6 +146,8 @@ impl Inner {
                     {
                         Ok(()) => {
                             *guard = Some(Conn { ws });
+                            self.reconnected
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
                             return;
                         }
                         Err(e) => tracing::warn!(
@@ -209,6 +228,7 @@ impl NostrNodeRelay {
                 owner_pubkey,
                 relay_url,
                 conn: Mutex::new(None),
+                reconnected: std::sync::atomic::AtomicBool::new(true),
             }),
             desired: std::sync::Mutex::new(BTreeMap::new()),
         }
@@ -276,6 +296,64 @@ impl NostrNodeRelay {
             }
         });
     }
+
+    /// One-shot query: (re)connect if needed, subscribe under
+    /// [`RESYNC_SUB_ID`] to the same owner-scoped `AGENT_ASSIGNMENT` filter
+    /// [`Inner::ensure_connected`] uses for the live tail, collect every
+    /// backlog event up to EOSE (or [`RESYNC_TIMEOUT`], whichever comes
+    /// first), then close the subscription. Used by
+    /// [`NodeRelay::query_desired`] to rebuild desired-state from scratch on
+    /// startup and after a reconnect.
+    async fn fetch_assignment_backlog(&self) -> Result<Vec<Event>, NodeError> {
+        let deadline = std::time::Instant::now() + RESYNC_TIMEOUT;
+        let mut guard = self.inner.conn.lock().await;
+        self.inner.ensure_connected(&mut guard).await;
+        let Some(conn) = guard.as_mut() else {
+            return Err(NodeError::Relay(
+                "connection unexpectedly absent after connect".into(),
+            ));
+        };
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_AGENT_ASSIGNMENT as u16))
+            .author(self.inner.owner_pubkey);
+        conn.ws
+            .send_raw(&json!(["REQ", RESYNC_SUB_ID, filter]))
+            .await
+            .map_err(|e| NodeError::Relay(format!("resync subscribe: {e}")))?;
+
+        let mut events = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("resync query timed out waiting for EOSE; using partial results");
+                break;
+            }
+            match conn.ws.next_event(remaining).await {
+                Ok(RelayMessage::Event {
+                    subscription_id,
+                    event,
+                }) if subscription_id == RESYNC_SUB_ID => events.push(*event),
+                Ok(RelayMessage::Eose { subscription_id }) if subscription_id == RESYNC_SUB_ID => {
+                    break
+                }
+                Ok(_other) => {
+                    // A live-tail event, OK/NOTICE/AUTH, or another
+                    // subscription's message — not this query's concern.
+                }
+                Err(WsClientError::Timeout) => {
+                    // Loop; the outer `deadline` (not this per-read timeout)
+                    // governs how long the whole query may run.
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "resync query read failed");
+                    *guard = None;
+                    return Err(NodeError::Relay(format!("resync query: {e}")));
+                }
+            }
+        }
+        let _ = conn.ws.send_raw(&json!(["CLOSE", RESYNC_SUB_ID])).await;
+        Ok(events)
+    }
 }
 
 #[async_trait]
@@ -325,6 +403,30 @@ impl NodeRelay for NostrNodeRelay {
                 }
             }
         }
+    }
+
+    async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError> {
+        let events = self.fetch_assignment_backlog().await?;
+        let mut fresh: BTreeMap<PublicKey, DesiredAgent> = BTreeMap::new();
+        for event in &events {
+            if let Some(d) =
+                desired_from_event(event, &self.inner.node_keys, &self.inner.owner_pubkey)
+            {
+                fresh.insert(d.agent_pubkey, d);
+            }
+        }
+        let out: Vec<DesiredAgent> = fresh.values().cloned().collect();
+        *self
+            .desired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+        Ok(out)
+    }
+
+    fn take_reconnected(&self) -> bool {
+        self.inner
+            .reconnected
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn next_status(&self) -> Option<AgentNodeStatus> {

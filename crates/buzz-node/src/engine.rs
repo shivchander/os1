@@ -68,6 +68,21 @@ pub async fn run(
     let mut presence_ticker = tokio::time::interval_at(presence_start, cfg.presence_interval);
 
     loop {
+        // `take_reconnected` is always true before its first call, so this
+        // also performs the startup resync (spec §13 offline catch-up); it
+        // fires again after every later reconnect the relay reports.
+        if relay.take_reconnected() {
+            full_resync(
+                relay.as_ref(),
+                &substrate,
+                &mut current,
+                &status_view,
+                &mut pending_spawns,
+                me,
+            )
+            .await?;
+        }
+
         tokio::select! {
             maybe = relay.next_desired() => match maybe {
                 Some(desired) => current = desired,
@@ -109,9 +124,46 @@ pub async fn run(
     Ok(())
 }
 
+/// Rebuild `current` from a fresh relay snapshot and immediately reconcile
+/// against observed state. Called at the top of every loop iteration where
+/// [`NodeRelay::take_reconnected`] reports a (re)connect since the last
+/// check — always true on the very first iteration — so a rebooted or
+/// reconnected node restores its assigned agents from the relay instead of
+/// waiting on further live updates (spec §13 offline catch-up).
+///
+/// KNOWN LIMITATION (tracked as a Phase 5 follow-up): this reconciles
+/// `current` against [`Substrate::observe`], which for the real
+/// `LocalProcessSubstrate` only knows about processes *this OS process*
+/// spawned — a fresh `LocalProcessSubstrate` (as constructed after a node
+/// restart) starts with an empty process table and does not discover
+/// pre-existing agent processes left running by a prior node process (node
+/// shutdown deliberately leaves agents running so they survive a node
+/// restart; see `crates/buzz-node/src/daemon.rs`). So on a real reboot where
+/// the previous agent process is still alive, this resync's `reconcile`
+/// sees that agent as `Absent` and emits a second `Start`, spawning a
+/// duplicate live instance until the orphaned original is separately
+/// reaped — a real dup-spawn hazard against invariant I4. Closing it needs
+/// `LocalProcessSubstrate` to discover pre-existing processes on startup
+/// (e.g. a per-agent PID file under its workspace dir, checked for liveness
+/// the way `crate::daemon::singleton::live_daemon_pid` already does for the
+/// node's own PID) — a substantive `Substrate`-level change, intentionally
+/// out of scope for this batch; see the Phase 5 batch A report.
+async fn full_resync(
+    relay: &dyn NodeRelay,
+    substrate: &Arc<dyn Substrate>,
+    current: &mut Vec<DesiredAgent>,
+    status_view: &PeerStatusView,
+    pending_spawns: &mut HashMap<PublicKey, Instant>,
+    me: PublicKey,
+) -> Result<(), NodeError> {
+    *current = relay.query_desired().await?;
+    reconcile_and_apply(relay, substrate, status_view, pending_spawns, me, current).await
+}
+
 /// Observe the substrate, reconcile against `current`, apply the resulting
 /// actions — spawns gated through [`start_gated`] — and publish the
-/// resulting per-agent status.
+/// resulting per-agent status. Shared by the main loop body and
+/// [`full_resync`] so both go through the exact same gating/reporting path.
 async fn reconcile_and_apply(
     relay: &dyn NodeRelay,
     substrate: &Arc<dyn Substrate>,
@@ -515,6 +567,73 @@ mod tests {
             vec![agent.public_key()],
             "spawns anyway once the bounded handoff window elapses"
         );
+
+        task.abort();
+    }
+
+    // --- Task 2: full resync on startup + reconnect (offline catch-up) ---
+
+    #[tokio::test]
+    async fn full_resync_spawns_assigned_agents_from_a_fresh_snapshot() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        // Observes nothing — as a freshly rebooted substrate would.
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new(vec![]);
+        handle.set_snapshot(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+
+        let substrate_dyn: Arc<dyn Substrate> = substrate.clone();
+        let mut current = Vec::new();
+        let status_view = PeerStatusView::default();
+        let mut pending = HashMap::new();
+        full_resync(
+            &relay,
+            &substrate_dyn,
+            &mut current,
+            &status_view,
+            &mut pending,
+            node_m.public_key(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *substrate.starts.lock().unwrap(),
+            vec![agent.public_key()],
+            "reboot restarts assigned agents from the relay's desired state"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_triggers_full_resync() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, handle) = FakeRelay::new_hanging(vec![]);
+        let engine_cfg = EngineConfig {
+            reconcile_tick: Duration::from_millis(50),
+            presence_interval: Duration::from_secs(3600),
+            node_pubkey: node_m.public_key(),
+        };
+        let task = tokio::spawn(run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            engine_cfg,
+        ));
+        tokio::task::yield_now().await; // startup resync against an empty snapshot
+        assert!(substrate.starts.lock().unwrap().is_empty());
+
+        // The assignment now exists at the relay, as if published while
+        // this node was disconnected; only a reconnect (not the live tail)
+        // will pick it up here.
+        handle.set_snapshot(vec![fake_desired(&agent, &node_m, &owner, Assigned)]);
+        handle.simulate_reconnect();
+
+        // The next reconcile tick notices the reconnect flag and resyncs.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(*substrate.starts.lock().unwrap(), vec![agent.public_key()]);
 
         task.abort();
     }

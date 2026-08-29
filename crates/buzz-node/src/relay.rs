@@ -20,11 +20,22 @@ use crate::model::{DesiredAgent, NodeError};
 pub trait NodeRelay: Send + Sync {
     /// Await the next desired-state snapshot for this node. `None` = shut down.
     async fn next_desired(&self) -> Option<Vec<DesiredAgent>>;
+    /// Fetch a fresh snapshot of this node's desired agents directly from
+    /// the relay, bypassing the live tail. Used by
+    /// [`crate::engine::run`]'s full resync on startup and after every
+    /// reconnect (spec §13 offline catch-up), so a rebooted or reconnected
+    /// node restores state from the relay instead of waiting on further
+    /// live updates.
+    async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError>;
     /// Await the next observed `AGENT_NODE_STATUS`, from any node
     /// (including this one). Feeds
     /// [`crate::move_gate::PeerStatusView`] so a spawn can defer while a
     /// different node still reports the same agent alive (spec I4).
     async fn next_status(&self) -> Option<AgentNodeStatus>;
+    /// Test-and-clear: true at most once per underlying (re)connect. Always
+    /// true before the first call, so the engine's first check also drives
+    /// the startup resync (see [`crate::engine::run`]).
+    fn take_reconnected(&self) -> bool;
     /// Publish an observed per-agent status.
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError>;
     /// Publish this node's capabilities.
@@ -60,6 +71,10 @@ pub struct FakeRelayHandle {
     /// the pending future never re-checks would go unnoticed until some
     /// *other* `select!` branch happened to cycle the loop.
     desired_tx: tokio::sync::mpsc::UnboundedSender<Vec<DesiredAgent>>,
+    /// What the next `query_desired` call returns.
+    snapshot: Shared<Vec<DesiredAgent>>,
+    /// Backing flag for `take_reconnected`.
+    reconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -81,12 +96,24 @@ impl FakeRelayHandle {
     pub fn push_desired(&self, desired: Vec<DesiredAgent>) {
         let _ = self.desired_tx.send(desired);
     }
+    /// Set what a subsequent `query_desired` call returns, as if the relay
+    /// now holds this desired state (e.g. published while this node was
+    /// offline).
+    pub fn set_snapshot(&self, desired: Vec<DesiredAgent>) {
+        *self.snapshot.lock().expect("lock") = desired;
+    }
+    /// Simulate a reconnect: the next `take_reconnected` check returns
+    /// `true`, driving a full resync.
+    pub fn simulate_reconnect(&self) {
+        self.reconnected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// In-memory [`NodeRelay`]: yields a scripted sequence of desired-sets, then
 /// `None` (or, if built via [`FakeRelay::new_hanging`], pends forever
 /// instead); records everything published; accepts injected peer statuses
-/// via its paired [`FakeRelayHandle`].
+/// and resync snapshots via its paired [`FakeRelayHandle`].
 #[cfg(any(test, feature = "test-utils"))]
 pub struct FakeRelay {
     script: Shared<std::collections::VecDeque<Vec<DesiredAgent>>>,
@@ -101,6 +128,8 @@ pub struct FakeRelay {
     desired_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<DesiredAgent>>>,
     /// Kept alive for the same reason as `_status_tx_keepalive`.
     _desired_tx_keepalive: tokio::sync::mpsc::UnboundedSender<Vec<DesiredAgent>>,
+    snapshot: Shared<Vec<DesiredAgent>>,
+    reconnected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: FakeRelayHandle,
     /// When `true`, `next_desired` pends forever once `script` is exhausted
     /// instead of returning `None`. Set via [`FakeRelay::new_hanging`] for
@@ -123,8 +152,9 @@ impl FakeRelay {
     /// exhausted instead of returning `None`. For tests that need
     /// `engine::run` to stay alive indefinitely (e.g. to observe periodic
     /// ticker behavior over `tokio::time::advance`d virtual time, or to
-    /// inject peer statuses after startup); such tests must end the engine
-    /// by aborting its task rather than awaiting `run`'s return.
+    /// inject peer statuses / a reconnect after startup); such tests must
+    /// end the engine by aborting its task rather than awaiting `run`'s
+    /// return.
     pub fn new_hanging(script: Vec<Vec<DesiredAgent>>) -> (Self, FakeRelayHandle) {
         Self::build(script, true)
     }
@@ -132,12 +162,16 @@ impl FakeRelay {
     fn build(script: Vec<Vec<DesiredAgent>>, hang_when_exhausted: bool) -> (Self, FakeRelayHandle) {
         let (status_tx, status_rx) = tokio::sync::mpsc::unbounded_channel();
         let (desired_tx, desired_rx) = tokio::sync::mpsc::unbounded_channel();
+        let snapshot = Shared::default();
+        let reconnected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handle = FakeRelayHandle {
             statuses: Log::default(),
             announces: Log::default(),
             presence: Log::default(),
             status_tx: status_tx.clone(),
             desired_tx: desired_tx.clone(),
+            snapshot: snapshot.clone(),
+            reconnected: reconnected.clone(),
         };
         (
             Self {
@@ -146,6 +180,8 @@ impl FakeRelay {
                 _status_tx_keepalive: status_tx,
                 desired_rx: tokio::sync::Mutex::new(desired_rx),
                 _desired_tx_keepalive: desired_tx,
+                snapshot,
+                reconnected,
                 handle: handle.clone(),
                 hang_when_exhausted,
             },
@@ -169,8 +205,15 @@ impl NodeRelay for FakeRelay {
             None => None,
         }
     }
+    async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError> {
+        Ok(self.snapshot.lock().expect("lock").clone())
+    }
     async fn next_status(&self) -> Option<AgentNodeStatus> {
         self.status_rx.lock().await.recv().await
+    }
+    fn take_reconnected(&self) -> bool {
+        self.reconnected
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError> {
         self.handle
@@ -209,6 +252,29 @@ mod tests {
         assert_eq!(relay.next_desired().await, None);
         relay.publish_presence(true).await.unwrap();
         assert_eq!(*handle.presence.lock().unwrap(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn take_reconnected_is_true_once_then_false_until_simulated_again() {
+        let (relay, handle) = FakeRelay::new(vec![]);
+        assert!(
+            relay.take_reconnected(),
+            "must be true before the first check (drives startup resync)"
+        );
+        assert!(!relay.take_reconnected(), "consumed by the first check");
+        handle.simulate_reconnect();
+        assert!(relay.take_reconnected());
+        assert!(!relay.take_reconnected());
+    }
+
+    #[tokio::test]
+    async fn query_desired_reflects_the_latest_set_snapshot() {
+        let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (relay, handle) = FakeRelay::new(vec![]);
+        assert_eq!(relay.query_desired().await.unwrap(), vec![]);
+        let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
+        handle.set_snapshot(vec![d.clone()]);
+        assert_eq!(relay.query_desired().await.unwrap(), vec![d]);
     }
 
     #[tokio::test]

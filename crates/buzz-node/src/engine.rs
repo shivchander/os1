@@ -637,4 +637,69 @@ mod tests {
 
         task.abort();
     }
+
+    // --- Task 3: LWW + retarget-stop (one-live-instance, I4) ---
+    //
+    // The actual defect here was in `NostrNodeRelay::next_desired` (see
+    // `nostr_relay::apply_assignment_event` and its tests): it silently kept
+    // a stale desired-entry for an agent reassigned away from this node,
+    // because decryption fails (by design) once the envelope targets a
+    // different node, and the old code only ever acted on decrypt success.
+    // The engine loop's own snapshot-replace semantics (`current = desired`
+    // on every `next_desired` yield) were already correct — these tests
+    // characterize/lock in that engine-level contract against `FakeRelay`.
+
+    #[tokio::test]
+    async fn repeated_assignment_for_an_already_running_agent_spawns_once() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, _handle) = FakeRelay::new(vec![
+            vec![fake_desired(&agent, &node_m, &owner, Assigned)],
+            vec![fake_desired(&agent, &node_m, &owner, Assigned)],
+        ]);
+        run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            cfg(&node_m),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            substrate
+                .starts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| **a == agent.public_key())
+                .count(),
+            1,
+            "exactly one spawn for the agent — never two"
+        );
+    }
+
+    #[tokio::test]
+    async fn reassigned_away_stops_here() {
+        let (owner, node_m, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let substrate = Arc::new(FakeSubstrate::new());
+        // Second snapshot omits the agent entirely — exactly what a
+        // corrected `NostrNodeRelay::next_desired` now yields once the
+        // agent's envelope targets a different node (see
+        // `nostr_relay::apply_assignment_event`).
+        let (relay, _handle) = FakeRelay::new(vec![
+            vec![fake_desired(&agent, &node_m, &owner, Assigned)],
+            vec![],
+        ]);
+        run(
+            substrate.clone(),
+            Box::new(relay),
+            node_m.clone(),
+            cfg(&node_m),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*substrate.stops.lock().unwrap(), vec![agent.public_key()]);
+    }
 }

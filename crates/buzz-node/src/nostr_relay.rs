@@ -208,13 +208,70 @@ impl Inner {
 /// owns that (mirrors `crates/buzz-acp/src/relay.rs`'s dial-out pattern).
 pub struct NostrNodeRelay {
     inner: Arc<Inner>,
-    /// Latest known desired-state per agent (last-writer-wins by the
-    /// underlying addressable event's `created_at`, enforced relay-side by
-    /// NIP-33). `&self` interior mutability (a plain `std::sync::Mutex`,
-    /// never held across an `.await`): [`NodeRelay::next_desired`] must stay
-    /// concurrently pollable with [`NodeRelay::next_status`] in
-    /// `engine::run`'s `select!`.
-    desired: std::sync::Mutex<BTreeMap<PublicKey, DesiredAgent>>,
+    /// Latest known desired-state per agent plus LWW watermarks. `&self`
+    /// interior mutability (a plain `std::sync::Mutex`, never held across an
+    /// `.await`): [`NodeRelay::next_desired`] must stay concurrently
+    /// pollable with [`NodeRelay::next_status`] in `engine::run`'s
+    /// `select!`.
+    desired: std::sync::Mutex<DesiredState>,
+}
+
+/// Accumulated live desired-state plus last-seen `created_at` per agent.
+/// The relay's own NIP-33 replaceable-event semantics already keep only the
+/// latest stored copy, but `seen_created_at` defends this client-side
+/// accumulation against an older event reaching us after a newer one — e.g.
+/// a live-tail event racing a concurrent [`NostrNodeRelay::query_desired`]
+/// resync — from clobbering already-applied newer state.
+#[derive(Default)]
+struct DesiredState {
+    desired: BTreeMap<PublicKey, DesiredAgent>,
+    seen_created_at: BTreeMap<PublicKey, u64>,
+}
+
+/// Apply one `AGENT_ASSIGNMENT` event to `state`, returning `true` iff it
+/// changed `state.desired` (the caller uses this to decide whether the
+/// change is worth surfacing to the engine). Order of checks:
+///
+/// 1. Envelope invalid (bad signature, wrong owner, malformed tags) → ignore.
+/// 2. Older than the last-seen `created_at` for this agent → ignore (LWW).
+/// 3. Envelope targets a different node (including "moved away from us") →
+///    remove any existing entry for this agent; changed iff one existed.
+/// 4. Envelope targets us → decrypt and upsert (covers both `Assigned` and
+///    `Unassigned` — the desired-state's own `state` field carries that
+///    through to [`crate::reconcile::reconcile`]).
+///
+/// Pure and I/O-free (mirrors [`desired_from_event`]): unit-testable with
+/// events built by [`buzz_core::assignment::build_assignment`], no relay
+/// required.
+fn apply_assignment_event(
+    state: &mut DesiredState,
+    event: &Event,
+    node_keys: &Keys,
+    owner: &PublicKey,
+) -> bool {
+    let Ok(envelope) = buzz_core::assignment::validate_envelope(event, owner) else {
+        return false;
+    };
+    let created = event.created_at.as_secs();
+    if state
+        .seen_created_at
+        .get(&envelope.agent_pubkey)
+        .is_some_and(|&prev| created < prev)
+    {
+        return false;
+    }
+    state.seen_created_at.insert(envelope.agent_pubkey, created);
+
+    if envelope.node_pubkey != node_keys.public_key() {
+        return state.desired.remove(&envelope.agent_pubkey).is_some();
+    }
+    match desired_from_event(event, node_keys, owner) {
+        Some(d) => {
+            state.desired.insert(d.agent_pubkey, d);
+            true
+        }
+        None => false,
+    }
 }
 
 impl NostrNodeRelay {
@@ -230,7 +287,7 @@ impl NostrNodeRelay {
                 conn: Mutex::new(None),
                 reconnected: std::sync::atomic::AtomicBool::new(true),
             }),
-            desired: std::sync::Mutex::new(BTreeMap::new()),
+            desired: std::sync::Mutex::new(DesiredState::default()),
         }
     }
 
@@ -295,6 +352,18 @@ impl NostrNodeRelay {
                 tracing::warn!(error = %e, "background publish failed");
             }
         });
+    }
+
+    /// Lock `self.desired`, recovering from a poisoned mutex rather than
+    /// panicking (mirrors `LocalProcessSubstrate`'s `lock_table`/observe`
+    /// precedent): another call already panicked while holding it, which
+    /// must not additionally crash *this* caller — the desired-state map is
+    /// read on `engine::run`'s hot path via `next_desired`, a method with
+    /// no `Result` to propagate a poisoning error through anyway.
+    fn lock_desired(&self) -> std::sync::MutexGuard<'_, DesiredState> {
+        self.desired
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// One-shot query: (re)connect if needed, subscribe under
@@ -370,23 +439,25 @@ impl NodeRelay for NostrNodeRelay {
                     subscription_id,
                     event,
                 }) if subscription_id == ASSIGNMENT_SUB_ID => {
-                    let update =
-                        desired_from_event(&event, &self.inner.node_keys, &self.inner.owner_pubkey);
                     // Drop the connection lock before touching `self.desired`
                     // — this iteration no longer needs the connection, and
                     // dropping explicitly sidesteps any doubt about whether
                     // the borrow checker would see `conn`/`desired` as
                     // disjoint fields through the `guard` indirection.
                     drop(guard);
-                    if let Some(d) = update {
-                        let mut desired = self
-                            .desired
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        desired.insert(d.agent_pubkey, d);
-                        return Some(desired.values().cloned().collect());
+                    let mut state = self.lock_desired();
+                    let changed = apply_assignment_event(
+                        &mut state,
+                        &event,
+                        &self.inner.node_keys,
+                        &self.inner.owner_pubkey,
+                    );
+                    if changed {
+                        return Some(state.desired.values().cloned().collect());
                     }
-                    // Not decryptable / not ours — keep waiting.
+                    // Stale, malformed, or targets neither us nor an agent
+                    // we previously held — no desired-state change to
+                    // surface; keep waiting.
                 }
                 Ok(_other) => {
                     // EOSE / OK / NOTICE / AUTH / CLOSED / unrelated EVENT —
@@ -407,26 +478,18 @@ impl NodeRelay for NostrNodeRelay {
 
     async fn query_desired(&self) -> Result<Vec<DesiredAgent>, NodeError> {
         let events = self.fetch_assignment_backlog().await?;
-        let mut fresh: BTreeMap<PublicKey, DesiredAgent> = BTreeMap::new();
+        let mut fresh = DesiredState::default();
         for event in &events {
-            if let Some(d) =
-                desired_from_event(event, &self.inner.node_keys, &self.inner.owner_pubkey)
-            {
-                fresh.insert(d.agent_pubkey, d);
-            }
+            apply_assignment_event(
+                &mut fresh,
+                event,
+                &self.inner.node_keys,
+                &self.inner.owner_pubkey,
+            );
         }
-        let out: Vec<DesiredAgent> = fresh.values().cloned().collect();
-        *self
-            .desired
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+        let out: Vec<DesiredAgent> = fresh.desired.values().cloned().collect();
+        *self.lock_desired() = fresh;
         Ok(out)
-    }
-
-    fn take_reconnected(&self) -> bool {
-        self.inner
-            .reconnected
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn next_status(&self) -> Option<AgentNodeStatus> {
@@ -444,6 +507,12 @@ impl NodeRelay for NostrNodeRelay {
         // move's overlap but not as tightly as intended. Tracked as a
         // follow-up — see the Phase 5 batch A report.
         std::future::pending().await
+    }
+
+    fn take_reconnected(&self) -> bool {
+        self.inner
+            .reconnected
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn publish_status(&self, status: &AgentNodeStatus) -> Result<(), NodeError> {
@@ -504,12 +573,22 @@ mod tests {
         node: &Keys,
         state: AssignState,
     ) -> nostr::Event {
+        make_assignment_at(owner, agent, node, state, 1_785_780_000)
+    }
+
+    fn make_assignment_at(
+        owner: &Keys,
+        agent: &Keys,
+        node: &Keys,
+        state: AssignState,
+        created_at: u64,
+    ) -> nostr::Event {
         build_assignment(
             owner,
             &node.public_key(),
             &secret_for(owner, agent, node),
             state,
-            1_785_780_000,
+            created_at,
         )
         .unwrap()
     }
@@ -558,6 +637,136 @@ mod tests {
         let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
         let ev = make_assignment(&owner, &agent, &node, AssignState::Assigned);
         assert!(desired_from_event(&ev, &node, &Keys::generate().public_key()).is_none());
+    }
+
+    // --- apply_assignment_event: LWW + retarget-removal (Task 3, I4) ---
+
+    use super::{apply_assignment_event, DesiredState};
+
+    #[test]
+    fn first_assignment_to_us_is_applied() {
+        let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut state = DesiredState::default();
+        let ev = make_assignment_at(&owner, &agent, &node, AssignState::Assigned, 1_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &ev,
+            &node,
+            &owner.public_key()
+        ));
+        assert_eq!(state.desired.len(), 1);
+        assert!(state.desired.contains_key(&agent.public_key()));
+    }
+
+    #[test]
+    fn later_assignment_wins_regardless_of_arrival_order() {
+        let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let mut state = DesiredState::default();
+        // Apply the NEWER event first, then an OLDER one for the same agent
+        // (out-of-order live delivery) — the older one must be ignored.
+        let newer = make_assignment_at(&owner, &agent, &node, AssignState::Assigned, 2_000);
+        let older = make_assignment_at(&owner, &agent, &node, AssignState::Unassigned, 1_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &newer,
+            &node,
+            &owner.public_key()
+        ));
+        assert!(
+            !apply_assignment_event(&mut state, &older, &node, &owner.public_key()),
+            "a stale (older) event must not be applied"
+        );
+        // The newer `Assigned` state must still be in effect.
+        assert_eq!(
+            state.desired.get(&agent.public_key()).map(|d| d.state),
+            Some(AssignState::Assigned)
+        );
+    }
+
+    #[test]
+    fn reassignment_to_another_node_removes_from_desired() {
+        let (owner, agent, node_m, node_n) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let mut state = DesiredState::default();
+        let to_m = make_assignment_at(&owner, &agent, &node_m, AssignState::Assigned, 1_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &to_m,
+            &node_m,
+            &owner.public_key()
+        ));
+        assert!(state.desired.contains_key(&agent.public_key()));
+
+        // Reassigned to N: from M's point of view the envelope now targets
+        // someone else, and M can tell this from the PUBLIC envelope alone
+        // (no decryption needed/possible — the ciphertext is encrypted to N).
+        let to_n = make_assignment_at(&owner, &agent, &node_n, AssignState::Assigned, 2_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &to_n,
+            &node_m,
+            &owner.public_key()
+        ));
+        assert!(
+            !state.desired.contains_key(&agent.public_key()),
+            "M must drop an agent reassigned away from it"
+        );
+    }
+
+    #[test]
+    fn stale_reassignment_away_does_not_undo_a_newer_assignment_to_us() {
+        let (owner, agent, node_m, node_n) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let mut state = DesiredState::default();
+        // A newer assignment to us lands first...
+        let to_m = make_assignment_at(&owner, &agent, &node_m, AssignState::Assigned, 2_000);
+        assert!(apply_assignment_event(
+            &mut state,
+            &to_m,
+            &node_m,
+            &owner.public_key()
+        ));
+        // ...then a STALE, older "assigned elsewhere" event arrives late.
+        let stale_to_n = make_assignment_at(&owner, &agent, &node_n, AssignState::Assigned, 1_000);
+        assert!(
+            !apply_assignment_event(&mut state, &stale_to_n, &node_m, &owner.public_key()),
+            "an out-of-order stale reassignment must not be applied"
+        );
+        assert!(
+            state.desired.contains_key(&agent.public_key()),
+            "the newer assignment to us must survive a stale, older, contradicting event"
+        );
+    }
+
+    #[test]
+    fn unrelated_node_assignment_is_a_no_op_not_a_change() {
+        // A's assignment was never ours in the first place (e.g. another
+        // node's agent on a shared owner-scoped subscription) — must not be
+        // reported as a change.
+        let (owner, agent, node_m, node_other) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let mut state = DesiredState::default();
+        let to_other =
+            make_assignment_at(&owner, &agent, &node_other, AssignState::Assigned, 1_000);
+        assert!(!apply_assignment_event(
+            &mut state,
+            &to_other,
+            &node_m,
+            &owner.public_key()
+        ));
+        assert!(state.desired.is_empty());
     }
 
     // --- backoff_delay (pure) ---

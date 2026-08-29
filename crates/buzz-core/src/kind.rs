@@ -438,6 +438,21 @@ pub const KIND_THREAD_SUMMARY: u32 = 39005;
 /// clients must not infer `has_more` from row counts.
 pub const KIND_WINDOW_BOUNDS: u32 = 39006;
 
+// Execution nodes (39500–39503)
+/// Execution node self-announcement (parameterized replaceable, d = node pubkey).
+/// Node-authored capabilities + workspace root. Liveness is separate (kind:20001).
+pub const KIND_NODE_ANNOUNCE: u32 = 39500;
+/// Owner authorization of an execution node (parameterized replaceable, d = node pubkey).
+/// Owner-signed trust link; a node acts only on commands from an enrolling owner.
+pub const KIND_NODE_ENROLLMENT: u32 = 39501;
+/// Agent→node desired-state assignment (parameterized replaceable, d = agent pubkey).
+/// Owner-signed; target node in a public `node` tag; the agent nsec + launch env
+/// travel NIP-44-encrypted to the target node in `content`.
+pub const KIND_AGENT_ASSIGNMENT: u32 = 39502;
+/// Observed per-agent status reported by the node running it (parameterized
+/// replaceable, d = agent pubkey). Node-authored health + reason code.
+pub const KIND_AGENT_NODE_STATUS: u32 = 39503;
+
 /// Workflow definition (parameterized replaceable, d=workflow_uuid).
 pub const KIND_WORKFLOW_DEF: u32 = 30620;
 
@@ -1081,5 +1096,29 @@ mod tests {
         // from its own delegated readers.
         assert!(!is_shared_gated_kind(KIND_TEAM));
         assert!(!is_shared_gated_kind(KIND_MANAGED_AGENT));
+    }
+}
+
+#[cfg(test)]
+mod node_kind_tests {
+    use super::*;
+    #[test]
+    fn node_kinds_are_distinct_param_replaceable() {
+        let kinds = [
+            KIND_NODE_ANNOUNCE,
+            KIND_NODE_ENROLLMENT,
+            KIND_AGENT_ASSIGNMENT,
+            KIND_AGENT_NODE_STATUS,
+        ];
+        for k in kinds {
+            assert!(
+                (30000..40000).contains(&k),
+                "{k} must be parameterized-replaceable"
+            );
+        }
+        let mut sorted = kinds.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4, "node kinds must be distinct");
     }
 }

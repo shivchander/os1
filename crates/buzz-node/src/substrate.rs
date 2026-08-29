@@ -422,7 +422,13 @@ mod tests {
         assert_eq!(sub.observe().await.get(&agent), Some(&Observed::Stopped));
     }
 
-    struct DieRuntime;
+    #[derive(Default)]
+    struct DieRuntime {
+        /// Counts actual spawn attempts, so the breaker test can prove a
+        /// skipped `start()` really didn't spawn — not just that
+        /// `breaker_open()` reports true.
+        spawns: std::sync::atomic::AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl crate::runtime::AgentRuntime for DieRuntime {
         async fn spawn(
@@ -431,6 +437,8 @@ mod tests {
             workspace: &std::path::Path,
             _relay_url: &str,
         ) -> Result<tokio::process::Child, NodeError> {
+            self.spawns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut cmd = tokio::process::Command::new("/bin/sh");
             cmd.args(["-c", "exit 1"])
                 .current_dir(workspace)
@@ -445,11 +453,8 @@ mod tests {
     #[tokio::test]
     async fn crash_loop_opens_breaker() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let sub = LocalProcessSubstrate::new(
-            std::sync::Arc::new(DieRuntime),
-            "wss://r".into(),
-            dir.path().into(),
-        );
+        let runtime = std::sync::Arc::new(DieRuntime::default());
+        let sub = LocalProcessSubstrate::new(runtime.clone(), "wss://r".into(), dir.path().into());
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let d = fake_desired(&a, &n, &o, buzz_core::AssignState::Assigned);
 
@@ -459,5 +464,12 @@ mod tests {
             let _ = sub.observe().await;
         }
         assert!(sub.breaker_open(&d.agent_pubkey));
+        // 3 crashes trip the breaker (BREAKER_THRESHOLD); the 4th start()
+        // must have been refused rather than spawning a 4th process.
+        assert_eq!(
+            runtime.spawns.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "start() must not spawn while the breaker is open"
+        );
     }
 }

@@ -51,8 +51,12 @@ pub mod tenant;
 /// Schnorr signature and event ID verification.
 pub mod verification;
 
+pub use assignment::{AssignState, AssignmentEnvelope, AssignmentSecret, LaunchBlock};
 pub use error::VerificationError;
 pub use event::StoredEvent;
+pub use node::{Enrollment, NodeCapabilities};
+pub use node_codec::CodecError;
+pub use node_status::{AgentHealth, AgentNodeStatus};
 pub use nostr::{Event, EventId, Filter, Keys, Kind, PublicKey};
 pub use presence::PresenceStatus;
 pub use tenant::{normalize_host, CommunityId, TenantContext};
@@ -85,5 +89,14 @@ pub mod test_helpers {
     /// Create a [`StoredEvent`] wrapper around a test event.
     pub fn make_stored_event(kind: Kind, channel_id: Option<uuid::Uuid>) -> StoredEvent {
         StoredEvent::with_received_at(make_event(kind), Utc::now(), channel_id, true)
+    }
+}
+
+#[cfg(test)]
+mod reexport_tests {
+    #[test]
+    fn types_are_reachable_from_crate_root() {
+        let _ = crate::AgentHealth::Running;
+        assert_eq!(crate::node::VERSION, 1);
     }
 }

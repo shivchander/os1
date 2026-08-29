@@ -220,7 +220,11 @@ pub fn validate_envelope(
             "d" => &mut d,
             "node" => &mut node,
             "state" => &mut state,
-            name => return Err(CodecError::InvalidEnvelope(format!("unexpected tag: {name}"))),
+            name => {
+                return Err(CodecError::InvalidEnvelope(format!(
+                    "unexpected tag: {name}"
+                )))
+            }
         };
         if slot.replace(parts[1].clone()).is_some() {
             return Err(CodecError::InvalidEnvelope(format!(
@@ -269,8 +273,8 @@ pub fn decrypt_for_node(
     let plaintext = nip44::decrypt(node_keys.secret_key(), expected_owner, &event.content)
         .map_err(|_| CodecError::Decrypt)?;
     let value = parse_strict_json(plaintext.as_bytes())?;
-    let secret: AssignmentSecret =
-        serde_json::from_value(value).map_err(|e| CodecError::InvalidPayload(format!("schema: {e}")))?;
+    let secret: AssignmentSecret = serde_json::from_value(value)
+        .map_err(|e| CodecError::InvalidPayload(format!("schema: {e}")))?;
     validate_secret(&secret)?;
     if secret.agent_pubkey != envelope.agent_pubkey.to_hex()
         || secret.owner_pubkey != envelope.owner_pubkey.to_hex()
@@ -291,15 +295,18 @@ mod tests {
 
     fn secret(owner: &Keys, agent: &Keys, node: &Keys) -> AssignmentSecret {
         AssignmentSecret {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             agent_pubkey: agent.public_key().to_hex(),
             owner_pubkey: owner.public_key().to_hex(),
             node_pubkey: node.public_key().to_hex(),
             private_key_nsec: agent.secret_key().to_bech32().unwrap(),
             auth_tag: None,
             launch: LaunchBlock {
-                command: "claude".into(), args: vec![],
-                env: BTreeMap::new(), policy_env: BTreeMap::new(),
+                command: "claude".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+                policy_env: BTreeMap::new(),
                 owner_pubkey: Some(owner.public_key().to_hex()),
             },
             env_vars: BTreeMap::from([("FOO".into(), "bar".into())]),
@@ -311,7 +318,14 @@ mod tests {
     fn assignment_round_trips_on_target_node() {
         let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
         let s = secret(&owner, &agent, &node);
-        let ev = build_assignment(&owner, &node.public_key(), &s, AssignState::Assigned, 1_785_780_000).unwrap();
+        let ev = build_assignment(
+            &owner,
+            &node.public_key(),
+            &s,
+            AssignState::Assigned,
+            1_785_780_000,
+        )
+        .unwrap();
         // Any node can read the public envelope:
         let env = validate_envelope(&ev, &owner.public_key()).unwrap();
         assert_eq!(env.node_pubkey, node.public_key());
@@ -324,15 +338,32 @@ mod tests {
     #[test]
     fn non_target_node_cannot_decrypt() {
         let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let ev = build_assignment(&owner, &node.public_key(), &secret(&owner, &agent, &node), AssignState::Assigned, 1_785_780_000).unwrap();
+        let ev = build_assignment(
+            &owner,
+            &node.public_key(),
+            &secret(&owner, &agent, &node),
+            AssignState::Assigned,
+            1_785_780_000,
+        )
+        .unwrap();
         let stranger = Keys::generate();
-        assert!(matches!(decrypt_for_node(&ev, &stranger, &owner.public_key()), Err(CodecError::InvalidEnvelope(_)) | Err(CodecError::Decrypt)));
+        assert!(matches!(
+            decrypt_for_node(&ev, &stranger, &owner.public_key()),
+            Err(CodecError::InvalidEnvelope(_)) | Err(CodecError::Decrypt)
+        ));
     }
 
     #[test]
     fn wrong_owner_rejected() {
         let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
-        let ev = build_assignment(&owner, &node.public_key(), &secret(&owner, &agent, &node), AssignState::Assigned, 1_785_780_000).unwrap();
+        let ev = build_assignment(
+            &owner,
+            &node.public_key(),
+            &secret(&owner, &agent, &node),
+            AssignState::Assigned,
+            1_785_780_000,
+        )
+        .unwrap();
         assert!(validate_envelope(&ev, &Keys::generate().public_key()).is_err());
     }
 
@@ -352,7 +383,13 @@ mod tests {
         let (owner, agent, node) = (Keys::generate(), Keys::generate(), Keys::generate());
         let mut s = secret(&owner, &agent, &node);
         s.private_key_nsec = Keys::generate().secret_key().to_bech32().unwrap();
-        let ev = build_assignment(&owner, &node.public_key(), &s, AssignState::Assigned, 1_785_780_000);
+        let ev = build_assignment(
+            &owner,
+            &node.public_key(),
+            &s,
+            AssignState::Assigned,
+            1_785_780_000,
+        );
         assert!(matches!(ev, Err(CodecError::InvalidPayload(_))));
     }
 }

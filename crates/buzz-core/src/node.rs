@@ -52,10 +52,14 @@ pub fn build_announce(
     created_at: u64,
 ) -> Result<Event, CodecError> {
     if caps.format != FORMAT || caps.version != VERSION {
-        return Err(CodecError::InvalidPayload("unsupported format/version".into()));
+        return Err(CodecError::InvalidPayload(
+            "unsupported format/version".into(),
+        ));
     }
     if caps.node_pubkey != node_keys.public_key().to_hex() {
-        return Err(CodecError::InvalidPayload("node_pubkey != signing key".into()));
+        return Err(CodecError::InvalidPayload(
+            "node_pubkey != signing key".into(),
+        ));
     }
     let content = serde_json::to_string(caps).map_err(|_| CodecError::Encrypt)?;
     EventBuilder::new(Kind::Custom(KIND_NODE_ANNOUNCE as u16), content)
@@ -73,14 +77,19 @@ pub fn validate_announce(event: &Event) -> Result<NodeCapabilities, CodecError> 
     if !event.verify_id() || !event.verify_signature() {
         return Err(CodecError::InvalidEnvelope("invalid id/signature".into()));
     }
-    let caps: NodeCapabilities = serde_json::from_value(parse_strict_json(event.content.as_bytes())?)
-        .map_err(|e| CodecError::InvalidPayload(format!("schema: {e}")))?;
+    let caps: NodeCapabilities =
+        serde_json::from_value(parse_strict_json(event.content.as_bytes())?)
+            .map_err(|e| CodecError::InvalidPayload(format!("schema: {e}")))?;
     if caps.format != FORMAT || caps.version != VERSION {
-        return Err(CodecError::InvalidPayload("unsupported format/version".into()));
+        return Err(CodecError::InvalidPayload(
+            "unsupported format/version".into(),
+        ));
     }
     parse_canonical_pubkey("node_pubkey", &caps.node_pubkey)?;
     if caps.node_pubkey != event.pubkey.to_hex() {
-        return Err(CodecError::InvalidEnvelope("node did not sign its own announce".into()));
+        return Err(CodecError::InvalidEnvelope(
+            "node did not sign its own announce".into(),
+        ));
     }
     Ok(caps)
 }
@@ -114,7 +123,9 @@ pub fn validate_enrollment(
         return Err(CodecError::InvalidEnvelope("wrong kind".into()));
     }
     if &event.pubkey != expected_owner {
-        return Err(CodecError::InvalidEnvelope("author is not expected owner".into()));
+        return Err(CodecError::InvalidEnvelope(
+            "author is not expected owner".into(),
+        ));
     }
     if !event.verify_id() || !event.verify_signature() {
         return Err(CodecError::InvalidEnvelope("invalid id/signature".into()));
@@ -122,7 +133,9 @@ pub fn validate_enrollment(
     let e: Enrollment = serde_json::from_value(parse_strict_json(event.content.as_bytes())?)
         .map_err(|err| CodecError::InvalidPayload(format!("schema: {err}")))?;
     if e.format != FORMAT || e.version != VERSION {
-        return Err(CodecError::InvalidPayload("unsupported format/version".into()));
+        return Err(CodecError::InvalidPayload(
+            "unsupported format/version".into(),
+        ));
     }
     parse_canonical_pubkey("node_pubkey", &e.node_pubkey)?;
     if e.owner_pubkey != expected_owner.to_hex() {
@@ -140,7 +153,8 @@ mod tests {
     fn announce_round_trips_and_binds_author() {
         let node = Keys::generate();
         let caps = NodeCapabilities {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             node_pubkey: node.public_key().to_hex(),
             os: "macos".into(),
             runtimes: vec!["claude".into(), "goose".into()],
@@ -155,9 +169,13 @@ mod tests {
     fn announce_rejects_author_mismatch() {
         let node = Keys::generate();
         let caps = NodeCapabilities {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             node_pubkey: Keys::generate().public_key().to_hex(), // not the signer
-            os: "linux".into(), runtimes: vec![], workspace_root: "/x".into(), max_agents: None,
+            os: "linux".into(),
+            runtimes: vec![],
+            workspace_root: "/x".into(),
+            max_agents: None,
         };
         // `build_announce` itself refuses to sign a self-mismatched announce, so
         // construct the malformed event directly to exercise `validate_announce`'s
@@ -169,7 +187,10 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(1_785_780_000))
             .sign_with_keys(&node)
             .unwrap();
-        assert!(matches!(validate_announce(&ev), Err(CodecError::InvalidEnvelope(_))));
+        assert!(matches!(
+            validate_announce(&ev),
+            Err(CodecError::InvalidEnvelope(_))
+        ));
     }
 
     #[test]

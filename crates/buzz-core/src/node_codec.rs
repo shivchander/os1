@@ -2,10 +2,9 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use nostr::{EventId, PublicKey};
+use nostr::PublicKey;
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Errors returned by the execution-node event codecs.
@@ -28,11 +27,6 @@ pub enum CodecError {
     Sign,
 }
 
-/// Compute the lowercase SHA-256 binding for exact content bytes.
-pub(crate) fn content_sha256(content: &[u8]) -> String {
-    hex::encode(Sha256::digest(content))
-}
-
 /// Parse an RFC3339 timestamp string, returning an error labeled with `label`.
 pub(crate) fn parse_rfc3339(label: &str, value: &str) -> Result<(), CodecError> {
     chrono::DateTime::parse_from_rfc3339(value)
@@ -48,12 +42,6 @@ pub(crate) fn parse_canonical_pubkey(label: &str, value: &str) -> Result<PublicK
     key.xonly()
         .map_err(|_| CodecError::InvalidEnvelope(format!("invalid {label} curve point")))?;
     Ok(key)
-}
-
-/// Parse and validate a canonical (lowercase hex) event id.
-pub(crate) fn parse_event_id(label: &str, value: &str) -> Result<EventId, CodecError> {
-    parse_lower_hex_32(label, value)?;
-    EventId::from_hex(value).map_err(|_| CodecError::InvalidEnvelope(format!("invalid {label}")))
 }
 
 /// Validate that `value` is exactly 64 lowercase hex characters.

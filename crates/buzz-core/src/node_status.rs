@@ -109,10 +109,12 @@ mod tests {
     fn status_round_trips_and_binds_node_author() {
         let (node, agent) = (Keys::generate(), Keys::generate());
         let s = AgentNodeStatus {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             agent_pubkey: agent.public_key().to_hex(),
             node_pubkey: node.public_key().to_hex(),
-            health: AgentHealth::Running, reason: None,
+            health: AgentHealth::Running,
+            reason: None,
             updated_at: "2026-08-29T00:00:00Z".into(),
         };
         let ev = build_status(&node, &s, 1_785_780_000).unwrap();
@@ -122,10 +124,12 @@ mod tests {
     fn status_rejects_non_author_node() {
         let (node, agent) = (Keys::generate(), Keys::generate());
         let s = AgentNodeStatus {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             agent_pubkey: agent.public_key().to_hex(),
             node_pubkey: Keys::generate().public_key().to_hex(), // not signer
-            health: AgentHealth::Crashed, reason: Some("exit 1".into()),
+            health: AgentHealth::Crashed,
+            reason: Some("exit 1".into()),
             updated_at: "2026-08-29T00:00:00Z".into(),
         };
         // `build_status` itself refuses to sign a self-mismatched status, so
@@ -138,18 +142,26 @@ mod tests {
             .custom_created_at(nostr::Timestamp::from(1_785_780_000))
             .sign_with_keys(&node)
             .unwrap();
-        assert!(matches!(validate_status(&ev), Err(CodecError::InvalidEnvelope(_))));
+        assert!(matches!(
+            validate_status(&ev),
+            Err(CodecError::InvalidEnvelope(_))
+        ));
     }
     #[test]
     fn status_rejects_bad_timestamp() {
         let (node, agent) = (Keys::generate(), Keys::generate());
         let s = AgentNodeStatus {
-            format: FORMAT.into(), version: VERSION,
+            format: FORMAT.into(),
+            version: VERSION,
             agent_pubkey: agent.public_key().to_hex(),
             node_pubkey: node.public_key().to_hex(),
-            health: AgentHealth::Stopped, reason: None,
+            health: AgentHealth::Stopped,
+            reason: None,
             updated_at: "not-a-date".into(),
         };
-        assert!(matches!(build_status(&node, &s, 1_785_780_000), Err(CodecError::InvalidPayload(_))));
+        assert!(matches!(
+            build_status(&node, &s, 1_785_780_000),
+            Err(CodecError::InvalidPayload(_))
+        ));
     }
 }

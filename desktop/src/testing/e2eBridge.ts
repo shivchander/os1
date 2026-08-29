@@ -31,16 +31,19 @@ import {
   injectObserverEventsForE2E,
   syncAgentObserverEvents,
 } from "@/features/agents/observerRelayStore";
+import { ingestNodeEvent } from "@/features/nodes/lib/nodesStore";
 import {
   CUSTOM_EMOJI_SET_D_TAG,
   KIND_EMOJI_SET,
 } from "@/shared/api/customEmoji";
 import {
+  KIND_AGENT_ASSIGNMENT,
   KIND_AGENT_OBSERVER_FRAME,
   KIND_CHANNEL_THREAD_SUMMARY,
   KIND_CHANNEL_WINDOW_BOUNDS,
   KIND_DM_VISIBILITY,
   KIND_EVENT_REMINDER,
+  KIND_NODE_ENROLLMENT,
   KIND_GIT_ISSUE,
   KIND_GIT_PATCH,
   KIND_GIT_PR_UPDATE,
@@ -1410,6 +1413,7 @@ declare global {
       slotId: string;
     }) => unknown;
     __BUZZ_E2E_SEED_MOCK_REMINDERS__?: (reminders: RelayEvent[]) => void;
+    __BUZZ_E2E_SEED_NODE_EVENTS__?: (events: RelayEvent[]) => void;
     __BUZZ_E2E_QUERY_CLIENT__?: {
       invalidateQueries: (filters: { queryKey: readonly unknown[] }) => unknown;
     };
@@ -11457,6 +11461,18 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_SEED_OBSERVER_EVENTS__ = ({ agentPubkey, events }) => {
     injectObserverEventsForE2E(agentPubkey, events);
   };
+  // Feeds raw NODE_ANNOUNCE / AGENT_NODE_STATUS / presence events straight
+  // into nodesStore's real reducer (bypassing the relay), the same way
+  // __BUZZ_E2E_SEED_OBSERVER_EVENTS__ exercises observerRelayStore's real
+  // ingestion path instead of stubbing the panel. The generic "live-"
+  // subscription branch in sendToMockSocket (below) never replays backfill
+  // for any kind, so this is the only way node/status/presence history
+  // reaches the store under the mock bridge.
+  window.__BUZZ_E2E_SEED_NODE_EVENTS__ = (events) => {
+    for (const event of events) {
+      ingestNodeEvent(event);
+    }
+  };
   const meshModelName = (modelId: string) => {
     const basename = modelId.split("/").at(-1) ?? modelId;
     return basename
@@ -14580,6 +14596,53 @@ export function maybeInstallE2eTauriMocks() {
           }
         }
         return null;
+      }
+      case "publish_node_enrollment": {
+        const { nodePubkey } = payload as { nodePubkey: string };
+        const ownerPubkey = normalizePubkey(
+          identity?.pubkey ?? MOCK_IDENTITY_PUBKEY,
+        );
+        const normalizedNode = normalizePubkey(nodePubkey);
+        const content = JSON.stringify({
+          format: "buzz-node-v1",
+          version: 1,
+          node_pubkey: normalizedNode,
+          owner_pubkey: ownerPubkey,
+        });
+        const event = createMockEvent(
+          KIND_NODE_ENROLLMENT,
+          content,
+          [["d", normalizedNode]],
+          ownerPubkey,
+        );
+        return event.id;
+      }
+      case "publish_agent_assignment": {
+        const { agentId, nodePubkey, launch, assigned } = payload as {
+          agentId: string;
+          nodePubkey: string;
+          launch: unknown;
+          assigned: boolean;
+        };
+        const ownerPubkey = normalizePubkey(
+          identity?.pubkey ?? MOCK_IDENTITY_PUBKEY,
+        );
+        const normalizedAgent = normalizePubkey(agentId);
+        const normalizedNode = normalizePubkey(nodePubkey);
+        // The real event NIP-44-encrypts { launch, private_key_nsec, ... } to
+        // the node; no spec decrypts this mock, so a plain JSON marker is
+        // enough to exercise the publish round-trip (id + public tags).
+        const content = JSON.stringify({ assigned, launch });
+        const event = createMockEvent(
+          KIND_AGENT_ASSIGNMENT,
+          content,
+          [
+            ["d", normalizedAgent],
+            ["node", normalizedNode],
+          ],
+          ownerPubkey,
+        );
+        return event.id;
       }
       default:
         throw new Error(`Unsupported mocked Tauri command: ${command}`);

@@ -29,6 +29,11 @@ pub struct NodeCapabilities {
     /// Optional soft cap on concurrently hosted agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agents: Option<u32>,
+    /// Human-friendly device name (e.g. hostname), shown in the desktop
+    /// "Run on node" picker in place of a truncated pubkey. `None` on nodes
+    /// that predate this field or couldn't resolve a hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Owner-signed authorization binding a node pubkey to an owner.
@@ -160,6 +165,7 @@ mod tests {
             runtimes: vec!["claude".into(), "goose".into()],
             workspace_root: "/Users/x/.buzz-node".into(),
             max_agents: Some(8),
+            name: Some("shiv-macbook".into()),
         };
         let ev = build_announce(&node, &caps, 1_785_780_000).unwrap();
         assert_eq!(validate_announce(&ev).unwrap(), caps);
@@ -176,6 +182,7 @@ mod tests {
             runtimes: vec![],
             workspace_root: "/x".into(),
             max_agents: None,
+            name: None,
         };
         // `build_announce` itself refuses to sign a self-mismatched announce, so
         // construct the malformed event directly to exercise `validate_announce`'s

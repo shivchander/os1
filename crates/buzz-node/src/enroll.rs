@@ -59,6 +59,12 @@ pub struct NodeConfig {
     /// a config persisted before this field existed still loads.
     #[serde(default)]
     pub agent_env: std::collections::BTreeMap<String, String>,
+    /// User- or host-supplied device name for this node, persisted across
+    /// restarts. `None` until a rename UI exists, in which case
+    /// `daemon::up_foreground` falls back to the live hostname. `#[serde(default)]`
+    /// so a config persisted before this field existed still loads.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[cfg(test)]
@@ -75,6 +81,7 @@ impl NodeConfig {
             workspace_root: "/tmp/x".into(),
             providers: vec![provider.to_string()],
             agent_env: Default::default(),
+            name: None,
         }
     }
 }
@@ -501,6 +508,7 @@ pub async fn enroll(
         workspace_root: PathBuf::from(&caps.workspace_root),
         providers: Vec::new(),
         agent_env: Default::default(),
+        name: None,
     };
     save_node_config(&cfg)?;
     Ok(cfg)
@@ -537,6 +545,7 @@ mod tests {
             workspace_root: "/tmp/x".into(),
             providers: Vec::new(),
             agent_env: Default::default(),
+            name: None,
         }
     }
 
@@ -674,6 +683,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             max_agents: None,
+            name: None,
         };
 
         let relay_url_for_task = relay_url.clone();

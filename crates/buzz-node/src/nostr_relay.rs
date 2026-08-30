@@ -1738,6 +1738,7 @@ mod tests {
             runtimes: vec![],
             workspace_root: "/tmp".into(),
             max_agents: None,
+            name: None,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(2), relay.publish_announce(&caps))
@@ -1789,6 +1790,7 @@ mod tests {
             runtimes: vec![],
             workspace_root: "/tmp".into(),
             max_agents: None,
+            name: None,
         };
         relay.publish_announce(&caps).await.expect("announce");
         relay

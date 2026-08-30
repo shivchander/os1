@@ -55,9 +55,10 @@ const NODES_LIVE_SUBSCRIPTION_LIMIT = 500;
 export type NodeView = {
   nodePubkey: string;
   /**
-   * Display label. `NodeCapabilities` (buzz-core) has no device-name field
-   * yet, so this is a truncated pubkey via the canonical `truncatePubkey`
-   * helper — never hand-rolled (see `scripts/check-pubkey-truncation.mjs`).
+   * Display label: the node's own announced `name` (`NodeCapabilities.name`,
+   * buzz-core — e.g. its hostname) when present, otherwise a truncated
+   * pubkey via the canonical `truncatePubkey` helper — never hand-rolled
+   * (see `scripts/check-pubkey-truncation.mjs`).
    */
   name: string;
   os: string;
@@ -98,6 +99,8 @@ type NodeAnnounceContent = {
   runtimes: string[];
   workspace_root: string;
   max_agents?: number;
+  /** Device name (e.g. hostname), when the node announced one. */
+  name?: string | null;
 };
 
 type PresenceContent = "online" | "away" | "offline";
@@ -209,6 +212,7 @@ function parseNodeAnnounce(content: string): NodeAnnounceContent | null {
     workspace_root: value.workspace_root,
     max_agents:
       typeof value.max_agents === "number" ? value.max_agents : undefined,
+    name: typeof value.name === "string" ? value.name : undefined,
   };
 }
 
@@ -399,7 +403,7 @@ function buildNodeView(caps: NodeAnnounceContent): NodeView {
   }
   return {
     nodePubkey: caps.node_pubkey,
-    name: truncatePubkey(caps.node_pubkey),
+    name: caps.name ?? truncatePubkey(caps.node_pubkey),
     os: caps.os,
     runtimes: caps.runtimes,
     online: presenceByPubkey.get(key) === "online",

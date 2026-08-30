@@ -141,6 +141,7 @@ async fn enroll_assign_running() {
             .to_string_lossy()
             .into_owned(),
         max_agents: None,
+        name: None,
     };
     let relay_url_for_enroll = relay_url.clone();
     let node_for_enroll = node.clone();

@@ -236,6 +236,25 @@ async fn run_until_shutdown(
     }
 }
 
+/// Best-effort local hostname, used as the default node display name
+/// ([`buzz_core::NodeCapabilities::name`]) when the persisted [`NodeConfig`]
+/// carries no explicit override. `None` on any failure (missing `hostname`
+/// binary, non-UTF8 or empty output) — a display name is cosmetic and must
+/// never block node startup.
+fn node_hostname() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 // ─── `up` ───────────────────────────────────────────────────────────────
 
 async fn cmd_up(foreground: bool) -> Result<(), NodeError> {
@@ -347,6 +366,7 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
         runtimes: vec!["acp".to_string()],
         workspace_root: cfg.workspace_root.to_string_lossy().into_owned(),
         max_agents: None,
+        name: cfg.name.clone().or_else(node_hostname),
     };
     relay_for_engine.publish_announce(&caps).await?;
     // A second, independent connection used only for the final, AWAITED
@@ -400,6 +420,7 @@ async fn cmd_enroll(relay_url_flag: Option<String>) -> Result<(), NodeError> {
         runtimes: vec!["acp".to_string()],
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         max_agents: None,
+        name: node_hostname(),
     };
     let cfg = enroll::enroll(&relay_url, &node_keys, &caps).await?;
     eprintln!(
@@ -494,6 +515,7 @@ mod tests {
             workspace_root: "/tmp/x".into(),
             providers: Vec::new(),
             agent_env: Default::default(),
+            name: None,
         }
     }
 

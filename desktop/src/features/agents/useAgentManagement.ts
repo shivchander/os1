@@ -25,6 +25,8 @@ import {
 import { publishNodeAssignmentForCreatedAgent } from "./lib/publishNodeAssignmentForCreatedAgent";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { isAgentNodeHosted, nodePubkeyForAgent } from "@/shared/api/nodesStore";
+import { listManagedAgents } from "@/shared/api/tauri";
 import { classifyAgentManagementOrigin } from "./agentManagementBuffer";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { resolveManagedAgentAvatarUrl } from "./ui/managedAgentAvatar";
@@ -284,6 +286,33 @@ export function useAgentManagement() {
         queryClient.invalidateQueries({ queryKey: personasQueryKey }),
         queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
       ]);
+      // A node-hosted agent's running process only picks up an edited system
+      // prompt/model once its AGENT_ASSIGNMENT is republished (the node
+      // restarts when its assignment's launch changes) — the persona update
+      // above only touches the local record. Fetch fresh so the republished
+      // launch reflects the edit just saved, not a stale cached snapshot.
+      // Soft-fail like submitCreate's own publishNodeAssignmentForCreatedAgent
+      // call: the persona edit already succeeded, so a failed republish must
+      // not roll it back, only surface a warning.
+      const updatedAgents = await listManagedAgents();
+      for (const updatedAgent of updatedAgents) {
+        if (updatedAgent.personaId !== input.id) continue;
+        const nodePubkey = nodePubkeyForAgent(updatedAgent.pubkey);
+        if (!isAgentNodeHosted(updatedAgent.pubkey) || !nodePubkey) continue;
+        try {
+          await publishNodeAssignmentForCreatedAgent(
+            { type: "node", nodePubkey },
+            updatedAgent,
+            identityQuery.data?.pubkey,
+          );
+        } catch (assignError) {
+          setError(
+            assignError instanceof Error
+              ? `${updatedAgent.name} was saved, but updating the node failed: ${assignError.message}`
+              : `${updatedAgent.name} was saved, but updating the node failed.`,
+          );
+        }
+      }
       dismiss();
       return true;
     } catch (cause) {

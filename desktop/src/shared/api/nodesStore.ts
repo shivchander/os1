@@ -454,6 +454,18 @@ export function isAgentNodeHosted(agentPubkey: string): boolean {
   return getAgentAssignment(agentPubkey)?.state === "assigned";
 }
 
+/**
+ * The node pubkey from this agent's own current assignment record, when one
+ * exists and is in the "assigned" state (i.e. exactly when
+ * `isAgentNodeHosted` is true for it) — `null` otherwise. Reuses
+ * `getAgentAssignment`'s own map rather than re-deriving assignment state, so
+ * this can never disagree with `isAgentNodeHosted` on the same agent.
+ */
+export function nodePubkeyForAgent(agentPubkey: string): string | null {
+  const assignment = getAgentAssignment(agentPubkey);
+  return assignment?.state === "assigned" ? assignment.nodePubkey : null;
+}
+
 export function subscribeNodes(listener: () => void): () => void {
   listeners.add(listener);
   return () => {

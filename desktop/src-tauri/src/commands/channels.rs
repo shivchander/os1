@@ -28,18 +28,9 @@ struct StarterChannelSpec {
     description: &'static str,
 }
 
-const STARTER_CHANNELS: &[StarterChannelSpec] = &[
-    StarterChannelSpec {
-        slug: "general",
-        name: "general",
-        description: "General conversation and community updates.",
-    },
-    StarterChannelSpec {
-        slug: "welcome-everyone",
-        name: "welcome-everyone",
-        description: "Say hi, ask a question, or share what brought you here.",
-    },
-];
+// os1: no auto-created starter channels. Users create their own channels.
+#[allow(dead_code)]
+const STARTER_CHANNELS: &[StarterChannelSpec] = &[];
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 

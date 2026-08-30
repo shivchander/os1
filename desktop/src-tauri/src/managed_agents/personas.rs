@@ -35,41 +35,12 @@ pub(crate) const POLLEN_LEGACY_SYSTEM_PROMPT: &str = "You are Bumble, a curious 
 // product name everywhere it is consumed.
 const POLLEN_AVATAR: &str = BUMBLE_AVATAR;
 
-const BUILT_IN_PERSONAS: &[BuiltInPersona] = &[
-    BuiltInPersona {
-        id: "builtin:fizz",
-        display_name: "Fizz",
-        avatar_url: Some(FIZZ_AVATAR),
-        system_prompt: FIZZ_SYSTEM_PROMPT,
-        name_pool: &[
-            "Nectar", "Comet", "Bramble", "Clover", "Amber", "Daisy", "Mason", "Thistle",
-            "Waxwing", "Hive", "Meadow", "Juniper", "Aster", "Sage", "Willow", "Orchard", "Buzz",
-        ],
-        model: None,
-        runtime: None,
-        default_active: true,
-    },
-    BuiltInPersona {
-        id: "builtin:honey",
-        display_name: "Honey",
-        avatar_url: Some(HONEY_AVATAR),
-        system_prompt: HONEY_SYSTEM_PROMPT,
-        name_pool: &["Honey"],
-        model: None,
-        runtime: None,
-        default_active: true,
-    },
-    BuiltInPersona {
-        id: POLLEN_PERSONA_ID,
-        display_name: POLLEN_DISPLAY_NAME,
-        avatar_url: Some(POLLEN_AVATAR),
-        system_prompt: POLLEN_SYSTEM_PROMPT,
-        name_pool: &[POLLEN_DISPLAY_NAME],
-        model: None,
-        runtime: None,
-        default_active: true,
-    },
-];
+// os1: no built-in persona templates. Users create their own personas/agents
+// from the panel (create_persona). Emptied (not deleted) so the surrounding
+// merge/avatar-lookup machinery and the embedded avatar/prompt consts —
+// referenced by migrations of any pre-existing built-in agents — stay intact.
+#[allow(dead_code)]
+const BUILT_IN_PERSONAS: &[BuiltInPersona] = &[];
 
 pub(crate) fn built_in_persona_avatar_url(id: &str) -> Option<&'static str> {
     BUILT_IN_PERSONAS

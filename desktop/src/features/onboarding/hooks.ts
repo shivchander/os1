@@ -83,6 +83,13 @@ export async function initializeStarterChannels(
     communityScope: string | null;
   },
 ): Promise<ChannelInitResult> {
+  // os1: open to an empty workspace — skip ALL auto-created starter/welcome
+  // content (public starter channels, the private Welcome channel, and the
+  // Welcome Team seeding). Pairs with the emptied STARTER_CHANNELS /
+  // BUILT_IN_PERSONAS / BUILT_IN_TEAMS consts on the Rust side. The original
+  // seeding is kept below (unreachable) for easy revert.
+  return { ok: true };
+  // biome-ignore lint/correctness/noUnreachable: os1 clean-slate guard above
   try {
     let starterChannels: Awaited<
       ReturnType<typeof ensureStarterChannels>

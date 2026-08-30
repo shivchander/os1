@@ -99,6 +99,18 @@ async fn main() {
             // strips the legacy "acp" default arg for codex-acp, so command alone suffices.
             env.insert("BUZZ_ACP_AGENT_COMMAND".to_string(), "codex-acp".to_string());
             env.insert("OPENAI_API_KEY".to_string(), openai);
+            // codex-acp only consumes OPENAI_API_KEY once the api-key auth
+            // method is selected, and buzz-acp never issues an ACP
+            // `authenticate` call. DEFAULT_AUTH_REQUEST makes codex-acp
+            // auto-select api-key when Codex requires auth (then it reads
+            // OPENAI_API_KEY from env); NO_BROWSER hides the ChatGPT method on
+            // this headless node. Without this, codex returns
+            // "Authentication required" (ACP error -32000) on the first prompt.
+            env.insert(
+                "DEFAULT_AUTH_REQUEST".to_string(),
+                r#"{"methodId":"api-key"}"#.to_string(),
+            );
+            env.insert("NO_BROWSER".to_string(), "1".to_string());
 
             let secret = AssignmentSecret {
                 format: buzz_core::assignment::FORMAT.into(),

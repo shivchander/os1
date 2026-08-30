@@ -177,11 +177,15 @@ pub async fn run(
 ///
 /// RESIDUAL, ACCEPTED LIMITATIONS (see `adopt_existing`'s own doc comment
 /// for more detail):
-/// - Pid reuse: adoption's only identity check is the bare pid (no
-///   corroborating start-time/command-line check), so an OS that recycles a
-///   pid during a long gap between an agent stopping and a much later
-///   restart could in principle be mis-adopted as an unrelated process.
-///   Accepted for v1 given this feature's target ("always-on boxes I own").
+/// - Pid reuse: adoption corroborates the recorded pid is its own
+///   process-group leader (`getpgid(pid) == pid`, every agent this
+///   substrate spawns satisfies this by construction) before adopting, and
+///   re-checks it again right before `killpg`-signaling a later stop — but
+///   this narrows, rather than fully closes, the hazard: an OS that recycles
+///   a pid during a long gap between an agent stopping and a much later
+///   restart could in principle reuse it for another process that also
+///   happens to be its own group leader. Accepted for v1 given this
+///   feature's target ("always-on boxes I own").
 /// - Windows liveness shells out to `tasklist` (no `unsafe` FFI allowed) and
 ///   has no automated test here, unlike the unix path.
 /// - Assumes a single daemon per workspace root, same as today — the

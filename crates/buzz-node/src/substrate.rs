@@ -224,11 +224,14 @@ impl LocalProcessSubstrate {
     /// than that baseline.
     ///
     /// SCOPE: liveness is checked via [`pid_is_alive`] (unix `kill(pid,
-    /// 0)`, with a Windows `tasklist` fallback) — no corroborating identity
-    /// check (e.g. process start time or command line) beyond the bare pid.
-    /// Accepted for v1 given this feature's target ("always-on boxes I
-    /// own", not short-lived/high-churn hosts where pid reuse between a
-    /// stop and a much-later restart is more likely); see
+    /// 0)`, with a Windows `tasklist` fallback), corroborated by
+    /// [`is_own_group_leader`] (every agent this substrate spawns is its
+    /// own process-group leader by construction) before adopting — this
+    /// narrows, but does not fully close, pid-reuse risk (a coincidental
+    /// impostor could also be a group leader; see `is_own_group_leader`'s
+    /// own doc comment). Accepted for v1 given this feature's target
+    /// ("always-on boxes I own", not short-lived/high-churn hosts where pid
+    /// reuse between a stop and a much-later restart is more likely); see
     /// `crate::engine::full_resync`'s doc comment for the full limitations
     /// list.
     fn adopt_existing(root: &Path) -> BTreeMap<PublicKey, AgentSlot> {
@@ -587,11 +590,23 @@ impl Substrate for LocalProcessSubstrate {
                     // poll (unlike `try_wait`) has no "already reaped"
                     // terminal state of its own to stop re-detecting the
                     // same death on every subsequent `observe()` call.
+                    //
+                    // Also re-corroborates `is_own_group_leader` on every
+                    // poll, not just at adopt time: an agent that crashes
+                    // while the daemon stays up never goes through `stop()`
+                    // (which would clear this slot), so a pid the OS later
+                    // recycles for an unrelated process-group leader would
+                    // otherwise latch `Running` on that impostor forever —
+                    // an even more likely trigger than the daemon-restart
+                    // window `adopt_existing`'s own check guards. A mismatch
+                    // here is treated exactly like the pid dying: reported
+                    // (once) as a crash so `reconcile` retries it, same as
+                    // any other `Adopted` slot whose process is gone.
                     AgentSlot::Adopted {
                         pid,
                         reported_crash,
                     } => {
-                        if pid_is_alive(*pid) {
+                        if pid_is_alive(*pid) && is_own_group_leader(*pid) {
                             Observed::Running
                         } else {
                             if !*reported_crash {
@@ -1219,6 +1234,55 @@ mod tests {
         assert!(
             !pid_path.exists(),
             "the rejected record must be cleaned up like a dead one"
+        );
+
+        impostor.start_kill().ok();
+        let _ = impostor.wait().await;
+    }
+
+    /// The THIRD `is_own_group_leader` call site (Phase 5 batch C2 fold-in),
+    /// proven in isolation like the other two: `observe()` must
+    /// re-corroborate group leadership on every poll of an `Adopted` slot,
+    /// not just once at `adopt_existing` time. Simulates the scenario that
+    /// makes this matter -- an agent crashing while the daemon stays up
+    /// (never going through `stop()`, so the slot is never cleared) and the
+    /// OS later reusing its pid for an unrelated, non-group-leader process
+    /// -- by seeding an `Adopted` slot directly rather than waiting on a
+    /// real pid-recycle race (not reproducible on demand).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observe_rejects_an_adopted_pid_reused_by_a_non_leader_impostor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Keys::generate().public_key();
+
+        let mut impostor = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn impostor");
+        let pid = impostor.id().expect("pid");
+
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+        // As if a previous `observe()` had legitimately adopted this pid
+        // (it was alive and its own group leader then) and the underlying
+        // process has since been replaced by the impostor above.
+        sub.table.lock().unwrap().insert(
+            agent,
+            AgentSlot::Adopted {
+                pid,
+                reported_crash: false,
+            },
+        );
+
+        assert_eq!(
+            sub.observe().await.get(&agent),
+            Some(&Observed::Crashed { code: None }),
+            "a pid reused by a non-group-leader impostor must be observed as crashed, \
+             never latched Running just because pid_is_alive alone still says yes"
         );
 
         impostor.start_kill().ok();

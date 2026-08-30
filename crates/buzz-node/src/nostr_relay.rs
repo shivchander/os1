@@ -1,22 +1,27 @@
 //! Real Nostr relay client for the node: dial-out + NIP-42 auth, owner-scoped
-//! `AGENT_ASSIGNMENT` intake (decrypt + target-node filter), and
-//! status/announce/presence publish. Mirrors the dial-out/NIP-42/reconnect
-//! pattern in `crates/buzz-acp/src/relay.rs`, built on `buzz-ws-client` (which
-//! has no reconnect of its own — this module owns that). Publishes run on a
-//! background task (see [`NostrNodeRelay::spawn_publish`]) so a down relay
-//! never blocks the node's local reconcile loop.
-use std::collections::{BTreeMap, HashMap};
+//! `AGENT_ASSIGNMENT` intake (decrypt + target-node filter), peer
+//! `AGENT_NODE_STATUS` intake (authenticate + `#d`-scoped to learned
+//! agents), and status/announce/presence publish. Mirrors the
+//! dial-out/NIP-42/reconnect pattern in `crates/buzz-acp/src/relay.rs`,
+//! built on `buzz-ws-client` (which has no reconnect of its own — this
+//! module owns that). A single background actor (see [`ActorState`],
+//! [`run_actor`]) owns the one connection and multiplexes both live
+//! subscriptions plus publishes and resync queries over it — see
+//! [`ActorState`]'s doc comment for why. Publishes run on their own
+//! `tokio::spawn`ed task per key (see [`NostrNodeRelay::spawn_publish`]) so
+//! a down relay never blocks the node's local reconcile loop.
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use buzz_core::assignment::decrypt_for_node;
-use buzz_core::kind::{KIND_AGENT_ASSIGNMENT, KIND_PRESENCE_UPDATE};
+use buzz_core::kind::{KIND_AGENT_ASSIGNMENT, KIND_AGENT_NODE_STATUS, KIND_PRESENCE_UPDATE};
 use buzz_core::{AgentNodeStatus, NodeCapabilities};
 use buzz_ws_client::{NostrWsConnection, RelayMessage, WsClientError};
-use nostr::{Event, EventBuilder, Filter, Keys, Kind, PublicKey};
+use nostr::{Alphabet, Event, EventBuilder, Filter, Keys, Kind, PublicKey, SingleLetterTag};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 
 use crate::model::{DesiredAgent, NodeError};
 use crate::relay::NodeRelay;
@@ -47,6 +52,15 @@ pub fn desired_from_event(
 /// Subscription id for this node's `AGENT_ASSIGNMENT` stream. Fixed and
 /// process-local: this type holds exactly one such subscription at a time.
 const ASSIGNMENT_SUB_ID: &str = "buzz-node-assignments";
+
+/// Subscription id for this node's `AGENT_NODE_STATUS` live tail (Phase 5
+/// batch C2). Scoped by `#d` to the agent pubkeys learned from the
+/// `AGENT_ASSIGNMENT` stream (see [`ActorState::track_agent`]) rather than
+/// left unscoped — `AGENT_NODE_STATUS` events are node-authored (not
+/// owner-authored), so there is no `author` filter that would bound this to
+/// "this owner's world" the way [`ASSIGNMENT_SUB_ID`]'s does; the `#d` scope
+/// is the substitute.
+const STATUS_SUB_ID: &str = "buzz-node-peer-status";
 
 /// Subscription id for a one-shot resync query (see
 /// [`NostrNodeRelay::fetch_assignment_backlog`]) — distinct from
@@ -120,9 +134,11 @@ impl PublishKey {
 /// agent's status on every reconcile tick (any `Observed` state but
 /// `Absent` is "worth reporting" — see `crate::health::classify`) would
 /// have [`NostrNodeRelay::spawn_publish`] `tokio::spawn` a brand new task
-/// on every tick, each independently retrying `Inner::ensure_connected`'s
-/// reconnect-forever loop — an unbounded number of parked tasks for the
-/// duration of the outage (Phase 3 residual). With this, a publish call
+/// on every tick, each sitting parked waiting on its own
+/// [`Inner::publish_with_retry`] call — the connection-owning actor
+/// (`ActorState::ensure_connected`) is retrying forever, so every one of
+/// these tasks queues up behind it — an unbounded number of parked tasks for
+/// the duration of the outage (Phase 3 residual). With this, a publish call
 /// that arrives while a task is already in flight for its key REPLACES the
 /// payload that task will send next, rather than spawning a second one:
 /// newest always wins, and any earlier not-yet-sent replacement is simply
@@ -175,16 +191,23 @@ impl PublishCoalescer {
 
 /// Shared connection state, wrapped in an `Arc` so the background publish
 /// task spawned by [`NostrNodeRelay::spawn_publish`] can outlive the
-/// `&self` call that spawned it.
+/// `&self` call that spawned it, and so the connection-owning actor task
+/// (see [`ActorState`]) can hold its own clone independent of `NostrNodeRelay`
+/// itself.
 struct Inner {
     node_keys: Keys,
     owner_pubkey: PublicKey,
     relay_url: String,
-    conn: Mutex<Option<Conn>>,
+    /// Lazily spawns [`run_actor`] on first use (mirrors this module's
+    /// existing "dialing happens lazily on first use" contract — see
+    /// [`NostrNodeRelay`]'s doc comment). Exactly one actor per `Inner`,
+    /// which is exactly one connection per `NostrNodeRelay`: every
+    /// trait-method call reaches the SAME actor through this cell.
+    actor: OnceCell<ActorHandle>,
     /// Backing flag for [`NostrNodeRelay::take_reconnected`]. Pre-seeded
     /// `true` at construction so the engine's very first check (before any
     /// connection exists) drives the startup resync;
-    /// [`Inner::ensure_connected`] re-arms it on every later reconnect —
+    /// [`ActorState::ensure_connected`] re-arms it on every later reconnect —
     /// but deliberately NOT on the very first successful connect (see
     /// `has_connected_once`), since that first connect happens *inside*
     /// the startup resync's own `query_desired` call: re-arming there too
@@ -211,44 +234,227 @@ impl Inner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Ensure `*guard` holds a live, authenticated, subscribed connection,
-    /// (re)connecting with the [`backoff_delay`] ladder until it succeeds.
-    /// Never gives up: a down relay is a condition this daemon must ride
-    /// out, not a fatal error — there is no shutdown signal wired through
-    /// the [`NodeRelay`] trait other than `next_desired` returning `None`,
-    /// which this type never does on its own.
+    /// Get (lazily spawning [`run_actor`] on the first call) the handle to
+    /// this relay's connection-owning background actor. Every later call —
+    /// from any of `next_desired`/`next_status`/`query_desired`/`publish_*`,
+    /// on any clone of this `Arc` — reaches the SAME actor and therefore the
+    /// SAME one underlying WebSocket connection (Phase 5 batch C2: the
+    /// `AGENT_ASSIGNMENT` and `AGENT_NODE_STATUS` live tails are multiplexed
+    /// over it, demuxed by [`ActorState::route_or_collect`]).
     ///
-    /// Called from two places with different blocking implications.
-    /// `next_desired` awaits this directly, which is safe because
-    /// `engine::run` races `next_desired` against its own reconcile ticker
-    /// via `select!` — a long reconnect wait there just means the ticker
-    /// branch wins that loop iteration instead of the assignment-read
-    /// branch. The publish path never awaits this on the caller's task at
-    /// all: [`NostrNodeRelay::spawn_publish`] runs it inside a
-    /// `tokio::spawn`ed background task precisely so a down relay can't
-    /// block `engine::run`'s per-agent `relay.publish_status(...).await?`
-    /// — which would otherwise stall the whole reconcile loop before it
-    /// ever reaches the next `substrate.observe()`, leaving a mid-outage
-    /// agent crash undetected and un-restarted until the relay reconnects.
-    async fn ensure_connected(&self, guard: &mut Option<Conn>) {
-        if guard.is_some() {
+    /// `self: &Arc<Self>` (mirrors `buzz_workflow`/`buzz_pubsub`'s precedent
+    /// for actor-owning types in this workspace) so the spawned task can
+    /// hold its own `Arc::clone` independent of whichever caller happened to
+    /// trigger the lazy spawn.
+    async fn actor_handle(self: &Arc<Self>) -> &ActorHandle {
+        self.actor
+            .get_or_init(|| async { ActorHandle::spawn(Arc::clone(self)) })
+            .await
+    }
+
+    /// Publish `event`, retrying transport failures forever (never gives up
+    /// — a down relay is a condition this daemon must ride out, not a fatal
+    /// error; see the actor's `ensure_connected` for the same policy applied
+    /// to connecting). An explicit relay rejection (`OK false`) is NOT
+    /// retried — that is a policy/validation outcome retrying can't fix.
+    ///
+    /// Talks to the connection-owning actor via [`ActorCommand::Publish`]
+    /// rather than touching any connection directly — `Inner` no longer
+    /// holds one. Always runs inside the background task spawned by
+    /// [`NostrNodeRelay::spawn_publish`], never on a caller's task (except
+    /// [`NostrNodeRelay::publish_presence_awaited`], which awaits it
+    /// directly by design).
+    async fn publish_with_retry(self: &Arc<Self>, event: Event) -> Result<(), NodeError> {
+        loop {
+            let handle = self.actor_handle().await;
+            let (respond_to, rx) = oneshot::channel();
+            if handle
+                .cmd_tx
+                .send(ActorCommand::Publish {
+                    event: Box::new(event.clone()),
+                    respond_to,
+                })
+                .is_err()
+            {
+                return Err(NodeError::Relay("relay actor task is gone".into()));
+            }
+            match rx.await {
+                Ok(PublishAttempt::Accepted) => return Ok(()),
+                Ok(PublishAttempt::Rejected(message)) => {
+                    return Err(NodeError::Relay(format!(
+                        "event rejected by relay: {message}"
+                    )))
+                }
+                // The actor already resets its connection on a transport
+                // failure and will reconnect on its next loop iteration
+                // (via `ensure_connected`) before picking up another
+                // command — resending here just queues behind that.
+                Ok(PublishAttempt::Transport) => continue,
+                Err(_) => {
+                    return Err(NodeError::Relay(
+                        "relay actor task dropped the publish response".into(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Commands the rest of [`NostrNodeRelay`] sends to the connection-owning
+/// actor (see [`run_actor`]) — everything that needs exclusive access to the
+/// single [`Conn`] goes through this channel instead of touching a
+/// connection directly.
+enum ActorCommand {
+    /// Publish one pre-built, signed event. `event` is boxed: `nostr::Event`
+    /// is large enough (id/pubkey/sig are all fixed-size hashes/keys/sigs)
+    /// that an unboxed copy would dominate this enum's size next to
+    /// `Resync`'s tiny payload — mirrors [`buzz_ws_client::RelayMessage`]'s
+    /// own boxing of `Event` for the same reason.
+    Publish {
+        /// The event to publish.
+        event: Box<Event>,
+        /// How the attempt went — see [`PublishAttempt`].
+        respond_to: oneshot::Sender<PublishAttempt>,
+    },
+    /// Fetch the full `AGENT_ASSIGNMENT` backlog for `query_desired`'s
+    /// startup/reconnect resync (spec §13 offline catch-up).
+    Resync {
+        /// The collected backlog, or the transport error that cut it short.
+        respond_to: oneshot::Sender<Result<Vec<Event>, NodeError>>,
+    },
+}
+
+/// Outcome of one publish attempt inside the actor (see
+/// [`ActorState::handle_publish`]), distinguishing a transport failure the
+/// caller should retry (mirrors `ensure_connected`'s "never gives up"
+/// policy) from a final, non-retryable answer.
+enum PublishAttempt {
+    /// The relay accepted the event.
+    Accepted,
+    /// The relay explicitly rejected the event (its `OK false` message).
+    Rejected(String),
+    /// Sending failed at the transport level; the actor has already reset
+    /// its connection so the next loop iteration reconnects.
+    Transport,
+}
+
+/// Where one incoming relay message went, decided by its subscription id
+/// (see [`ActorState::route_or_collect`]).
+enum RouteOutcome {
+    /// Forwarded to a live channel, or simply irrelevant (an EOSE/OK/NOTICE,
+    /// or an `EVENT` for a subscription this actor doesn't recognize) —
+    /// nothing further for the caller to do.
+    Other,
+    /// A [`RESYNC_SUB_ID`] event, for a caller running [`ActorState::run_resync`]
+    /// to collect. Never produced outside that call — the shared demux is
+    /// used by both, but only `run_resync` looks for this variant. Boxed for
+    /// the same reason as [`ActorCommand::Publish`]'s `event` field — `Event`
+    /// is large enough to otherwise dominate this enum's size next to
+    /// `Other`/`ResyncEose`'s zero-sized variants.
+    ResyncEvent(Box<Event>),
+    /// `RESYNC_SUB_ID` reached end-of-stored-events.
+    ResyncEose,
+}
+
+/// Cloneable/shareable handle to a running [`run_actor`] task: the command
+/// channel plus the two live-tail receivers `next_desired`/`next_status`
+/// drain. Never itself cloned today (owned once by `Inner::actor`), but see
+/// [`FakeRelayHandle`] for the shape this mirrors.
+struct ActorHandle {
+    cmd_tx: mpsc::UnboundedSender<ActorCommand>,
+    /// Raw (not yet [`apply_assignment_event`]-processed) `AGENT_ASSIGNMENT`
+    /// events, drained by [`NostrNodeRelay::next_desired`]. `Mutex`-wrapped
+    /// so `&self` methods on `NostrNodeRelay` can drain it (mirrors
+    /// `FakeRelay`'s `status_rx`/`desired_rx` precedent in `relay.rs`).
+    assignment_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+    /// Raw (not yet [`buzz_core::node_status::validate_status`]-checked)
+    /// `AGENT_NODE_STATUS` events, drained and authenticated by
+    /// [`NostrNodeRelay::next_status`].
+    status_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
+}
+
+impl ActorHandle {
+    /// Spawn [`run_actor`] and return a handle to it. Synchronous — the
+    /// spawn itself is instant; the actor's own first `ensure_connected`
+    /// runs on the new task, not this call, preserving this module's
+    /// "dialing happens lazily on first use, not before" contract even
+    /// though the actor task itself now exists eagerly once first touched.
+    fn spawn(inner: Arc<Inner>) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (assignment_tx, assignment_rx) = mpsc::unbounded_channel();
+        let (status_tx, status_rx) = mpsc::unbounded_channel();
+        let state = ActorState {
+            inner,
+            conn: None,
+            known_agents: BTreeSet::new(),
+            assignment_tx,
+            status_tx,
+        };
+        tokio::spawn(run_actor(state, cmd_rx));
+        Self {
+            cmd_tx,
+            assignment_rx: Mutex::new(assignment_rx),
+            status_rx: Mutex::new(status_rx),
+        }
+    }
+}
+
+/// The connection-owning actor's private, single-owner state — never shared
+/// or wrapped in a lock: [`run_actor`] is the only task that ever touches
+/// it, which is exactly what lets `next_desired` and `next_status` stay
+/// concurrently pollable (Phase 5 batch C2's crux) without either blocking
+/// the other or a publish on a shared connection mutex.
+struct ActorState {
+    inner: Arc<Inner>,
+    conn: Option<Conn>,
+    /// Agent pubkeys learned from the `AGENT_ASSIGNMENT` stream (any
+    /// envelope for this owner, regardless of which node it targets — see
+    /// [`Self::track_agent`]'s doc comment for why). Scopes
+    /// [`STATUS_SUB_ID`]'s `#d` filter and persists across reconnects
+    /// (only `conn` resets).
+    known_agents: BTreeSet<PublicKey>,
+    assignment_tx: mpsc::UnboundedSender<Event>,
+    status_tx: mpsc::UnboundedSender<Event>,
+}
+
+impl ActorState {
+    /// Ensure `self.conn` holds a live, authenticated connection with both
+    /// live subscriptions (re)established, (re)connecting with the
+    /// [`backoff_delay`] ladder until it succeeds. Never gives up: a down
+    /// relay is a condition this daemon must ride out, not a fatal error —
+    /// there is no shutdown signal wired through the [`NodeRelay`] trait.
+    /// Called at the top of every [`run_actor`] loop iteration; a no-op
+    /// once connected.
+    async fn ensure_connected(&mut self) {
+        if self.conn.is_some() {
             return;
         }
         let mut attempt = 0usize;
         loop {
-            match NostrWsConnection::connect_authenticated(&self.relay_url, &self.node_keys, None)
-                .await
+            match NostrWsConnection::connect_authenticated(
+                &self.inner.relay_url,
+                &self.inner.node_keys,
+                None,
+            )
+            .await
             {
                 Ok(mut ws) => {
                     let filter = Filter::new()
                         .kind(Kind::Custom(KIND_AGENT_ASSIGNMENT as u16))
-                        .author(self.owner_pubkey);
+                        .author(self.inner.owner_pubkey);
                     match ws
                         .send_raw(&json!(["REQ", ASSIGNMENT_SUB_ID, filter]))
                         .await
                     {
                         Ok(()) => {
-                            *guard = Some(Conn { ws });
+                            self.conn = Some(Conn { ws });
+                            // Re-establish the status tail too, scoped to
+                            // whatever agents were already known before this
+                            // (re)connect — a no-op while that set is still
+                            // empty. Together with the REQ above this
+                            // satisfies "reconnect re-establishes both
+                            // subscriptions" (Phase 5 batch C2).
+                            self.send_status_req().await;
                             // Only a genuine RECONNECT re-arms `reconnected`
                             // — the very first connect is already covered
                             // by its constructor pre-seed, and this first
@@ -256,17 +462,19 @@ impl Inner {
                             // query, so re-arming here too would trigger an
                             // immediate, redundant second resync.
                             if self
+                                .inner
                                 .has_connected_once
                                 .swap(true, std::sync::atomic::Ordering::SeqCst)
                             {
-                                self.reconnected
+                                self.inner
+                                    .reconnected
                                     .store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             return;
                         }
                         Err(e) => tracing::warn!(
                             error = %e,
-                            relay_url = %self.relay_url,
+                            relay_url = %self.inner.relay_url,
                             "failed to subscribe after connect; retrying"
                         ),
                     }
@@ -274,7 +482,7 @@ impl Inner {
                 Err(e) => tracing::warn!(
                     error = %e,
                     attempt,
-                    relay_url = %self.relay_url,
+                    relay_url = %self.inner.relay_url,
                     "node relay connect failed; retrying"
                 ),
             }
@@ -283,33 +491,265 @@ impl Inner {
         }
     }
 
-    /// The actual send-with-retry loop: (re)connects via
-    /// [`Self::ensure_connected`] and sends `event`, retrying transport
-    /// failures behind the same reconnect-forever policy. An explicit relay
-    /// rejection (`OK false`) is NOT retried — that is a policy/validation
-    /// outcome retrying can't fix. Always runs inside the background task
-    /// spawned by [`NostrNodeRelay::spawn_publish`], never on a caller's task.
-    async fn publish_with_retry(&self, event: Event) -> Result<(), NodeError> {
+    /// (Re)send the `AGENT_NODE_STATUS` REQ scoped by `#d` to
+    /// `self.known_agents`'s current set. A no-op while that set is empty —
+    /// an empty `#d` filter matches nothing (see
+    /// `buzz_core::filter::filter_match_one`), so subscribing before there
+    /// is anything to scope to would just be a wasted round trip, not an
+    /// over-subscription hazard either way.
+    async fn send_status_req(&mut self) {
+        if self.known_agents.is_empty() {
+            return;
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let values: Vec<String> = self.known_agents.iter().map(PublicKey::to_hex).collect();
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_AGENT_NODE_STATUS as u16))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::D), values);
+        if let Err(e) = conn
+            .ws
+            .send_raw(&json!(["REQ", STATUS_SUB_ID, filter]))
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                "failed to (re)subscribe AGENT_NODE_STATUS; reconnecting"
+            );
+            self.conn = None;
+        }
+    }
+
+    /// Learn `event`'s agent pubkey into `self.known_agents` when `event` is
+    /// a validly owner-signed `AGENT_ASSIGNMENT` envelope, re-issuing the
+    /// `AGENT_NODE_STATUS` subscription the first time a given agent is
+    /// seen. Ignores anything that fails [`buzz_core::assignment::validate_envelope`]
+    /// (forged, malformed, or wrong-kind) — growing the status scope from an
+    /// unauthenticated claim would let a malicious relay steer which `#d`
+    /// values this node asks about.
+    ///
+    /// Deliberately keyed on EVERY envelope for this owner, not just ones
+    /// that target this node: `next_desired`'s `ASSIGNMENT_SUB_ID` stream
+    /// already receives every one of the owner's assignment records
+    /// (`Self::ensure_connected`'s REQ has no target-node filter — see
+    /// `apply_assignment_event`'s doc comment), so an agent's *first*
+    /// assignment (to some other node) is what proactively grows this
+    /// node's status scope. That matters because a *later* move of that
+    /// same agent to this node needs its peer's prior status already on
+    /// hand at the moment the move's assignment arrives — `engine::run`
+    /// reconciles synchronously right after `next_desired` yields, with no
+    /// time left for a just-in-time subscription update to pay off. Scoping
+    /// only to agents already assigned to this node would miss exactly the
+    /// first-time-onto-this-node case this batch exists to make fast.
+    async fn track_agent(&mut self, event: &Event) {
+        if let Ok(envelope) =
+            buzz_core::assignment::validate_envelope(event, &self.inner.owner_pubkey)
+        {
+            if self.known_agents.insert(envelope.agent_pubkey) {
+                self.send_status_req().await;
+            }
+        }
+    }
+
+    /// Route one incoming relay message by subscription id — the demux at
+    /// the heart of multiplexing both live tails over the one connection.
+    /// Forwards `ASSIGNMENT_SUB_ID`/`STATUS_SUB_ID` events to their channel
+    /// (learning a new agent along the way for the former); a
+    /// `RESYNC_SUB_ID` event or its EOSE is returned to the caller instead
+    /// of being handled here, since it's only meaningful to an in-progress
+    /// [`Self::run_resync`] call — this same method is shared by the main
+    /// loop (which has no such call in flight and simply lets those
+    /// outcomes fall on the floor) and `run_resync` (which collects them),
+    /// so a live-tail event racing a resync is still delivered, never
+    /// dropped.
+    async fn route_or_collect(&mut self, msg: RelayMessage) -> RouteOutcome {
+        match msg {
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } if subscription_id == ASSIGNMENT_SUB_ID => {
+                self.track_agent(&event).await;
+                let _ = self.assignment_tx.send(*event);
+                RouteOutcome::Other
+            }
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } if subscription_id == STATUS_SUB_ID => {
+                let _ = self.status_tx.send(*event);
+                RouteOutcome::Other
+            }
+            RelayMessage::Event {
+                subscription_id,
+                event,
+            } if subscription_id == RESYNC_SUB_ID => RouteOutcome::ResyncEvent(event),
+            RelayMessage::Eose { subscription_id } if subscription_id == RESYNC_SUB_ID => {
+                RouteOutcome::ResyncEose
+            }
+            // EOSE/OK/NOTICE/AUTH/CLOSED, or an EVENT for a subscription
+            // this actor doesn't recognize — no destination.
+            _ => RouteOutcome::Other,
+        }
+    }
+
+    /// Handle one already-established connection's next relay message
+    /// (main-loop branch): route it, or reconnect on a transport error.
+    /// [`WsClientError::Timeout`] is not an error here — it just means no
+    /// news within [`READ_POLL_TIMEOUT`]; the next loop iteration reads
+    /// again (`ensure_connected` re-checks first, which is a no-op while
+    /// still connected).
+    async fn handle_incoming(&mut self, msg: Result<RelayMessage, WsClientError>) {
+        match msg {
+            Ok(relay_msg) => {
+                let _ = self.route_or_collect(relay_msg).await;
+            }
+            Err(WsClientError::Timeout) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "relay read failed; reconnecting");
+                self.conn = None;
+            }
+        }
+    }
+
+    /// Read the next relay message off `self.conn`, or pend forever if
+    /// somehow disconnected (defensive only: [`run_actor`] always calls
+    /// [`Self::ensure_connected`] immediately before this, so `self.conn`
+    /// is `Some` here in practice — pending rather than panicking keeps
+    /// this method infallible without a spurious busy-loop if that
+    /// invariant is ever violated).
+    async fn next_relay_message(&mut self) -> Result<RelayMessage, WsClientError> {
+        match self.conn.as_mut() {
+            Some(conn) => conn.ws.next_event(READ_POLL_TIMEOUT).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// Handle [`ActorCommand::Publish`]: one send attempt against the
+    /// current connection. A transport failure resets `self.conn` (so the
+    /// next loop iteration reconnects) and reports [`PublishAttempt::Transport`]
+    /// — [`Inner::publish_with_retry`] is what actually retries, by sending
+    /// a fresh command; this method never loops or sleeps itself, so it can
+    /// never starve the rest of [`run_actor`]'s select loop for longer than
+    /// one attempt.
+    async fn handle_publish(
+        &mut self,
+        event: Box<Event>,
+        respond_to: oneshot::Sender<PublishAttempt>,
+    ) {
+        let Some(conn) = self.conn.as_mut() else {
+            // `ensure_connected` just ran; this shouldn't happen. Treat it
+            // like a transport failure rather than panicking.
+            let _ = respond_to.send(PublishAttempt::Transport);
+            return;
+        };
+        let outcome = match conn.ws.send_event(*event).await {
+            Ok(ok) if ok.accepted => PublishAttempt::Accepted,
+            Ok(ok) => PublishAttempt::Rejected(ok.message),
+            Err(e) => {
+                tracing::warn!(error = %e, "publish failed; reconnecting");
+                self.conn = None;
+                PublishAttempt::Transport
+            }
+        };
+        let _ = respond_to.send(outcome);
+    }
+
+    /// Handle [`ActorCommand::Resync`]: fetch the full `AGENT_ASSIGNMENT`
+    /// backlog under [`RESYNC_SUB_ID`], bounded by [`RESYNC_TIMEOUT`].
+    /// Delegates to [`Self::run_resync`] and forwards its result — split out
+    /// so `?` can be used there instead of threading the response sender
+    /// through every early return.
+    async fn handle_resync(&mut self, respond_to: oneshot::Sender<Result<Vec<Event>, NodeError>>) {
+        let result = self.run_resync().await;
+        let _ = respond_to.send(result);
+    }
+
+    /// The actual one-shot backlog fetch: subscribe under [`RESYNC_SUB_ID`]
+    /// to the same owner-scoped `AGENT_ASSIGNMENT` filter the live tail
+    /// uses, collect every backlog event up to EOSE (or [`RESYNC_TIMEOUT`],
+    /// whichever comes first), then close the subscription. A live-tail
+    /// `ASSIGNMENT_SUB_ID`/`STATUS_SUB_ID` event that arrives while this
+    /// runs is still routed normally (via [`Self::route_or_collect`]), not
+    /// dropped, and does not count towards this call's own collection.
+    async fn run_resync(&mut self) -> Result<Vec<Event>, NodeError> {
+        let Some(conn) = self.conn.as_mut() else {
+            return Err(NodeError::Relay(
+                "connection unexpectedly absent after connect".into(),
+            ));
+        };
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_AGENT_ASSIGNMENT as u16))
+            .author(self.inner.owner_pubkey);
+        conn.ws
+            .send_raw(&json!(["REQ", RESYNC_SUB_ID, filter]))
+            .await
+            .map_err(|e| NodeError::Relay(format!("resync subscribe: {e}")))?;
+
+        let deadline = std::time::Instant::now() + RESYNC_TIMEOUT;
+        let mut events = Vec::new();
         loop {
-            let mut guard = self.conn.lock().await;
-            self.ensure_connected(&mut guard).await;
-            let Some(conn) = guard.as_mut() else {
-                return Err(NodeError::Relay(
-                    "connection unexpectedly absent after connect".into(),
-                ));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("resync query timed out waiting for EOSE; using partial results");
+                break;
+            }
+            let read_result = {
+                let Some(conn) = self.conn.as_mut() else {
+                    return Err(NodeError::Relay("connection lost during resync".into()));
+                };
+                conn.ws.next_event(remaining).await
             };
-            match conn.ws.send_event(event.clone()).await {
-                Ok(ok) if ok.accepted => return Ok(()),
-                Ok(ok) => {
-                    return Err(NodeError::Relay(format!(
-                        "event rejected by relay: {}",
-                        ok.message
-                    )))
+            match read_result {
+                Ok(msg) => match self.route_or_collect(msg).await {
+                    RouteOutcome::ResyncEvent(event) => events.push(*event),
+                    RouteOutcome::ResyncEose => break,
+                    RouteOutcome::Other => {}
+                },
+                Err(WsClientError::Timeout) => {
+                    // Loop; the outer `deadline` (not this per-read timeout)
+                    // governs how long the whole query may run.
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "publish failed; reconnecting");
-                    *guard = None;
+                    tracing::warn!(error = %e, "resync query read failed");
+                    self.conn = None;
+                    return Err(NodeError::Relay(format!("resync query: {e}")));
                 }
+            }
+        }
+        if let Some(conn) = self.conn.as_mut() {
+            let _ = conn.ws.send_raw(&json!(["CLOSE", RESYNC_SUB_ID])).await;
+        }
+        Ok(events)
+    }
+}
+
+/// The connection-owning actor's main loop: one task, spawned once per
+/// [`NostrNodeRelay`] (via [`ActorHandle::spawn`]), that holds the sole
+/// `NostrWsConnection` and multiplexes everything over it — the
+/// `AGENT_ASSIGNMENT` and `AGENT_NODE_STATUS` live tails (demuxed by
+/// [`ActorState::route_or_collect`] into `next_desired`/`next_status`'s
+/// channels), one-shot resync queries, and publishes — via `cmd_rx` and its
+/// own read loop. `ensure_connected` runs at the top of every iteration
+/// (a no-op once connected), so a command handler never needs its own
+/// nested reconnect loop: whatever it leaves in `state.conn` (including
+/// `None` after a transport failure) is reconciled before the next command
+/// or read is attempted.
+async fn run_actor(mut state: ActorState, mut cmd_rx: mpsc::UnboundedReceiver<ActorCommand>) {
+    loop {
+        state.ensure_connected().await;
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                None => return, // every `ActorHandle`/`Inner` clone dropped; nothing left to serve
+                Some(ActorCommand::Publish { event, respond_to }) => {
+                    state.handle_publish(event, respond_to).await;
+                }
+                Some(ActorCommand::Resync { respond_to }) => {
+                    state.handle_resync(respond_to).await;
+                }
+            },
+            msg = state.next_relay_message() => {
+                state.handle_incoming(msg).await;
             }
         }
     }
@@ -400,7 +840,7 @@ impl NostrNodeRelay {
                 node_keys,
                 owner_pubkey,
                 relay_url,
-                conn: Mutex::new(None),
+                actor: OnceCell::new(),
                 reconnected: std::sync::atomic::AtomicBool::new(true),
                 has_connected_once: std::sync::atomic::AtomicBool::new(false),
                 coalescer: std::sync::Mutex::new(PublishCoalescer::default()),
@@ -514,113 +954,73 @@ impl NostrNodeRelay {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// One-shot query: (re)connect if needed, subscribe under
-    /// [`RESYNC_SUB_ID`] to the same owner-scoped `AGENT_ASSIGNMENT` filter
-    /// [`Inner::ensure_connected`] uses for the live tail, collect every
-    /// backlog event up to EOSE (or [`RESYNC_TIMEOUT`], whichever comes
-    /// first), then close the subscription. Used by
-    /// [`NodeRelay::query_desired`] to rebuild desired-state from scratch on
-    /// startup and after a reconnect.
+    /// One-shot query: ask the connection-owning actor to fetch the full
+    /// owner-scoped `AGENT_ASSIGNMENT` backlog (see
+    /// [`ActorState::run_resync`] for the actual subscribe/collect/close
+    /// sequence). Used by [`NodeRelay::query_desired`] to rebuild
+    /// desired-state from scratch on startup and after a reconnect.
     async fn fetch_assignment_backlog(&self) -> Result<Vec<Event>, NodeError> {
-        let deadline = std::time::Instant::now() + RESYNC_TIMEOUT;
-        let mut guard = self.inner.conn.lock().await;
-        self.inner.ensure_connected(&mut guard).await;
-        let Some(conn) = guard.as_mut() else {
-            return Err(NodeError::Relay(
-                "connection unexpectedly absent after connect".into(),
-            ));
-        };
-        let filter = Filter::new()
-            .kind(Kind::Custom(KIND_AGENT_ASSIGNMENT as u16))
-            .author(self.inner.owner_pubkey);
-        conn.ws
-            .send_raw(&json!(["REQ", RESYNC_SUB_ID, filter]))
-            .await
-            .map_err(|e| NodeError::Relay(format!("resync subscribe: {e}")))?;
+        let handle = self.inner.actor_handle().await;
+        let (respond_to, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ActorCommand::Resync { respond_to })
+            .map_err(|_| NodeError::Relay("relay actor task is gone".into()))?;
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(NodeError::Relay(
+                "relay actor task dropped the resync response".into(),
+            )),
+        }
+    }
+}
 
-        let mut events = Vec::new();
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!("resync query timed out waiting for EOSE; using partial results");
-                break;
-            }
-            match conn.ws.next_event(remaining).await {
-                Ok(RelayMessage::Event {
-                    subscription_id,
-                    event,
-                }) if subscription_id == RESYNC_SUB_ID => events.push(*event),
-                Ok(RelayMessage::Eose { subscription_id }) if subscription_id == RESYNC_SUB_ID => {
-                    break
-                }
-                Ok(_other) => {
-                    // A live-tail event, OK/NOTICE/AUTH, or another
-                    // subscription's message — not this query's concern.
-                }
-                Err(WsClientError::Timeout) => {
-                    // Loop; the outer `deadline` (not this per-read timeout)
-                    // governs how long the whole query may run.
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "resync query read failed");
-                    *guard = None;
-                    return Err(NodeError::Relay(format!("resync query: {e}")));
-                }
+/// Drain `rx` until a validly-authenticated `AGENT_NODE_STATUS` event
+/// arrives, dropping (and logging) anything that fails
+/// [`buzz_core::node_status::validate_status`] along the way — wrong kind,
+/// bad signature, or a malformed payload. This is the authenticate-before-
+/// yield contract [`NodeRelay::next_status`]'s doc comment requires:
+/// [`crate::move_gate::PeerStatusView::record`] only hex-parses its already-
+/// `AgentNodeStatus` input, trusting the relay layer (this function) to have
+/// verified the event first.
+///
+/// A free function taking the receiver directly (rather than a method on
+/// `NostrNodeRelay`) so it's unit-testable against a hand-fed channel,
+/// without spinning up the real connection-owning actor.
+async fn next_valid_status(rx: &mut mpsc::UnboundedReceiver<Event>) -> Option<AgentNodeStatus> {
+    loop {
+        let event = rx.recv().await?;
+        match buzz_core::node_status::validate_status(&event) {
+            Ok(status) => return Some(status),
+            Err(e) => {
+                tracing::warn!(error = %e, "dropped an invalid AGENT_NODE_STATUS event");
             }
         }
-        let _ = conn.ws.send_raw(&json!(["CLOSE", RESYNC_SUB_ID])).await;
-        Ok(events)
     }
 }
 
 #[async_trait]
 impl NodeRelay for NostrNodeRelay {
     async fn next_desired(&self) -> Option<Vec<DesiredAgent>> {
+        let handle = self.inner.actor_handle().await;
         loop {
-            let mut guard = self.inner.conn.lock().await;
-            self.inner.ensure_connected(&mut guard).await;
-            let Some(conn) = guard.as_mut() else {
-                continue;
-            };
-            match conn.ws.next_event(READ_POLL_TIMEOUT).await {
-                Ok(RelayMessage::Event {
-                    subscription_id,
-                    event,
-                }) if subscription_id == ASSIGNMENT_SUB_ID => {
-                    // Drop the connection lock before touching `self.desired`
-                    // — this iteration no longer needs the connection, and
-                    // dropping explicitly sidesteps any doubt about whether
-                    // the borrow checker would see `conn`/`desired` as
-                    // disjoint fields through the `guard` indirection.
-                    drop(guard);
-                    let mut state = self.lock_desired();
-                    let changed = apply_assignment_event(
-                        &mut state,
-                        &event,
-                        &self.inner.node_keys,
-                        &self.inner.owner_pubkey,
-                    );
-                    if changed {
-                        return Some(state.desired.values().cloned().collect());
-                    }
-                    // Stale, malformed, or targets neither us nor an agent
-                    // we previously held — no desired-state change to
-                    // surface; keep waiting.
-                }
-                Ok(_other) => {
-                    // EOSE / OK / NOTICE / AUTH / CLOSED / unrelated EVENT —
-                    // no desired-state change; keep waiting.
-                }
-                Err(WsClientError::Timeout) => {
-                    // No news within this poll window; loop and read again.
-                    // The engine's own `select!` against its reconcile
-                    // ticker can still preempt this future at any `.await`.
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "assignment stream read failed; reconnecting");
-                    *guard = None;
-                }
+            // The `assignment_rx` lock is released the moment `recv()`
+            // resolves (it's a temporary, not bound to a name) — well
+            // before `self.lock_desired()` below, so the two never overlap.
+            let event = handle.assignment_rx.lock().await.recv().await?;
+            let mut state = self.lock_desired();
+            let changed = apply_assignment_event(
+                &mut state,
+                &event,
+                &self.inner.node_keys,
+                &self.inner.owner_pubkey,
+            );
+            if changed {
+                return Some(state.desired.values().cloned().collect());
             }
+            // Stale, malformed, or targets neither us nor an agent we
+            // previously held — no desired-state change to surface; keep
+            // waiting.
         }
     }
 
@@ -655,20 +1055,20 @@ impl NodeRelay for NostrNodeRelay {
     }
 
     async fn next_status(&self) -> Option<AgentNodeStatus> {
-        // Phase 5 batch A ships the move gate's pure logic
-        // (`crate::move_gate`) and its `FakeRelay` wiring, proven by
-        // `engine::run`'s unit tests, but does NOT yet subscribe this real
-        // relay client to peer `AGENT_NODE_STATUS` events. Doing so
-        // correctly needs a background task multiplexing two live
-        // subscriptions over one connection — this method must stay
-        // concurrently pollable with `next_desired` in `engine::run`'s
-        // `select!`, which the current one-reader-per-call design can't do
-        // for two long-lived streams at once. Until that lands, a *real*
-        // node's move gate is reachable only via `MOVE_HANDOFF_TIMEOUT`
-        // (never via an observed peer `stopped`), which still bounds a
-        // move's overlap but not as tightly as intended. Tracked as a
-        // follow-up — see the Phase 5 batch A report.
-        std::future::pending().await
+        // Phase 5 batch C2: real `AGENT_NODE_STATUS` subscription, demuxed
+        // over the same connection `next_desired` uses (see `ActorState`).
+        // `next_valid_status` is the authenticate-before-yield contract
+        // `NodeRelay::next_status`'s doc comment requires — split out as a
+        // free function so it's unit-testable against a hand-fed channel,
+        // without spinning up the real connection-owning actor.
+        let handle = self.inner.actor_handle().await;
+        // Held for the whole call (unlike `next_desired`'s per-`.recv()`
+        // scoping): `next_status` never needs a second lock inside the
+        // loop, and `engine::run`'s `select!` is this trait's only caller —
+        // never two concurrent polls of the same `NostrNodeRelay` — so
+        // there is no one else to block.
+        let mut rx = handle.status_rx.lock().await;
+        next_valid_status(&mut rx).await
     }
 
     fn take_reconnected(&self) -> bool {
@@ -1403,5 +1803,437 @@ mod tests {
         // gives the background tasks a moment to actually run against the
         // real relay before the test process exits.
         let _ = tokio::time::timeout(Duration::from_secs(2), relay.next_desired()).await;
+    }
+
+    // --- ActorState: demux + agent-tracking (Phase 5 batch C2, pure — no
+    // relay required) ---
+
+    use super::{ActorState, Inner, RouteOutcome, ASSIGNMENT_SUB_ID, RESYNC_SUB_ID, STATUS_SUB_ID};
+    use buzz_ws_client::RelayMessage;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, OnceCell};
+
+    /// Build a minimal `Inner` for `ActorState` tests that never actually
+    /// dial a relay (`conn` stays `None` throughout, and `relay_url` is
+    /// never dialed) — only `owner_pubkey` is exercised, by `track_agent`'s
+    /// `validate_envelope` call.
+    fn test_inner(owner_pubkey: nostr::PublicKey) -> Arc<Inner> {
+        Arc::new(Inner {
+            node_keys: Keys::generate(),
+            owner_pubkey,
+            relay_url: "ws://127.0.0.1:1".into(),
+            actor: OnceCell::new(),
+            reconnected: std::sync::atomic::AtomicBool::new(true),
+            has_connected_once: std::sync::atomic::AtomicBool::new(false),
+            coalescer: std::sync::Mutex::new(PublishCoalescer::default()),
+        })
+    }
+
+    /// Build a disconnected `ActorState` (`conn: None` — re-subscribing is
+    /// therefore a safe no-op; the fake-relay-server tests below exercise
+    /// the real re-subscribe-over-the-wire behavior) plus receivers for
+    /// whatever it forwards to `next_desired`/`next_status`.
+    fn test_actor_state(
+        owner_pubkey: nostr::PublicKey,
+    ) -> (
+        ActorState,
+        mpsc::UnboundedReceiver<nostr::Event>,
+        mpsc::UnboundedReceiver<nostr::Event>,
+    ) {
+        let (assignment_tx, assignment_rx) = mpsc::unbounded_channel();
+        let (status_tx, status_rx) = mpsc::unbounded_channel();
+        let state = ActorState {
+            inner: test_inner(owner_pubkey),
+            conn: None,
+            known_agents: BTreeSet::new(),
+            assignment_tx,
+            status_tx,
+        };
+        (state, assignment_rx, status_rx)
+    }
+
+    fn event_message(subscription_id: &str, event: nostr::Event) -> RelayMessage {
+        RelayMessage::Event {
+            subscription_id: subscription_id.to_string(),
+            event: Box::new(event),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_or_collect_forwards_an_assignment_event_and_learns_its_agent() {
+        let (owner, node, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (mut state, mut assignment_rx, mut status_rx) = test_actor_state(owner.public_key());
+        let ev = make_assignment(&owner, &agent, &node, AssignState::Assigned);
+
+        let outcome = state
+            .route_or_collect(event_message(ASSIGNMENT_SUB_ID, ev.clone()))
+            .await;
+
+        assert!(matches!(outcome, RouteOutcome::Other));
+        assert_eq!(assignment_rx.try_recv().unwrap(), ev);
+        assert!(
+            status_rx.try_recv().is_err(),
+            "must not also land on the status channel"
+        );
+        assert!(state.known_agents.contains(&agent.public_key()));
+    }
+
+    #[tokio::test]
+    async fn route_or_collect_forwards_a_status_event_without_learning_anything() {
+        let (owner, node, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (mut state, mut assignment_rx, mut status_rx) = test_actor_state(owner.public_key());
+        let ev = status_event(&node, &agent, 1);
+
+        let outcome = state
+            .route_or_collect(event_message(STATUS_SUB_ID, ev.clone()))
+            .await;
+
+        assert!(matches!(outcome, RouteOutcome::Other));
+        assert_eq!(status_rx.try_recv().unwrap(), ev);
+        assert!(assignment_rx.try_recv().is_err());
+        assert!(
+            state.known_agents.is_empty(),
+            "a status event is node-authored, not owner-signed, and must never grow the scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_or_collect_collects_a_resync_event_without_forwarding_it_live() {
+        let (owner, node, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (mut state, mut assignment_rx, mut status_rx) = test_actor_state(owner.public_key());
+        let ev = make_assignment(&owner, &agent, &node, AssignState::Assigned);
+
+        let outcome = state
+            .route_or_collect(event_message(RESYNC_SUB_ID, ev.clone()))
+            .await;
+
+        match outcome {
+            RouteOutcome::ResyncEvent(boxed) => assert_eq!(*boxed, ev),
+            _ => panic!("expected a ResyncEvent outcome"),
+        }
+        assert!(
+            assignment_rx.try_recv().is_err(),
+            "a resync-collected event must not also reach the live tail"
+        );
+        assert!(status_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_or_collect_signals_resync_eose() {
+        let owner = Keys::generate();
+        let (mut state, _assignment_rx, _status_rx) = test_actor_state(owner.public_key());
+
+        let outcome = state
+            .route_or_collect(RelayMessage::Eose {
+                subscription_id: RESYNC_SUB_ID.to_string(),
+            })
+            .await;
+
+        assert!(matches!(outcome, RouteOutcome::ResyncEose));
+    }
+
+    #[tokio::test]
+    async fn route_or_collect_ignores_an_unrecognized_subscription() {
+        let (owner, node, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (mut state, mut assignment_rx, mut status_rx) = test_actor_state(owner.public_key());
+        let ev = make_assignment(&owner, &agent, &node, AssignState::Assigned);
+
+        let outcome = state
+            .route_or_collect(event_message("some-other-subscription", ev))
+            .await;
+
+        assert!(matches!(outcome, RouteOutcome::Other));
+        assert!(assignment_rx.try_recv().is_err());
+        assert!(status_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn track_agent_ignores_a_forged_non_owner_assignment_event() {
+        let (owner, attacker, node, agent) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let (mut state, ..) = test_actor_state(owner.public_key());
+        // Signed by `attacker`, not `owner` -- `validate_envelope` must
+        // reject it, so it must never be allowed to steer which `#d`
+        // values this node subscribes to.
+        let forged = make_assignment(&attacker, &agent, &node, AssignState::Assigned);
+
+        state.track_agent(&forged).await;
+
+        assert!(
+            state.known_agents.is_empty(),
+            "a forged event must not grow the status scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn track_agent_ignores_a_wrong_kind_event() {
+        let owner = Keys::generate();
+        let (mut state, ..) = test_actor_state(owner.public_key());
+        let not_an_assignment = nostr::EventBuilder::new(nostr::Kind::TextNote, "hi")
+            .sign_with_keys(&owner)
+            .expect("sign");
+
+        state.track_agent(&not_an_assignment).await;
+
+        assert!(state.known_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn track_agent_does_not_regrow_an_already_known_agent() {
+        let (owner, node, agent) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let (mut state, ..) = test_actor_state(owner.public_key());
+        let ev = make_assignment(&owner, &agent, &node, AssignState::Assigned);
+
+        state.track_agent(&ev).await;
+        state.track_agent(&ev).await;
+
+        assert_eq!(state.known_agents.len(), 1);
+    }
+
+    // --- next_valid_status: authenticate-before-yield (Phase 5 batch C2) ---
+
+    use super::next_valid_status;
+
+    #[tokio::test]
+    async fn next_valid_status_yields_a_well_formed_status() {
+        let node = Keys::generate();
+        let agent = Keys::generate();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let status = sample_status_for(&node, &agent);
+        tx.send(buzz_core::node_status::build_status(&node, &status, 1_785_780_000).unwrap())
+            .unwrap();
+
+        assert_eq!(next_valid_status(&mut rx).await, Some(status));
+    }
+
+    #[tokio::test]
+    async fn next_valid_status_drops_a_wrong_kind_event_then_yields_the_next_valid_one() {
+        let node = Keys::generate();
+        let agent = Keys::generate();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(
+            nostr::EventBuilder::new(nostr::Kind::TextNote, "not a status")
+                .sign_with_keys(&node)
+                .expect("sign"),
+        )
+        .unwrap();
+        let status = sample_status_for(&node, &agent);
+        tx.send(buzz_core::node_status::build_status(&node, &status, 1_785_780_000).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            next_valid_status(&mut rx).await,
+            Some(status),
+            "a wrong-kind event must be dropped, not returned or fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_valid_status_drops_a_tampered_event() {
+        let node = Keys::generate();
+        let agent = Keys::generate();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let status = sample_status_for(&node, &agent);
+        let mut tampered =
+            buzz_core::node_status::build_status(&node, &status, 1_785_780_000).unwrap();
+        // Mutate content after signing: `id`/`sig` no longer match what's on
+        // the wire, so `validate_status`'s `verify_id`/`verify_signature`
+        // check must fail -- this is the "bad-sig" half of the
+        // authenticate-before-yield contract.
+        tampered.content.push_str("tampered");
+        tx.send(tampered).unwrap();
+        drop(tx);
+
+        assert_eq!(
+            next_valid_status(&mut rx).await,
+            None,
+            "a tampered event must be dropped; with nothing valid behind it the stream ends"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_valid_status_returns_none_once_the_channel_closes() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<nostr::Event>();
+        drop(tx);
+        assert_eq!(next_valid_status(&mut rx).await, None);
+    }
+
+    // --- NostrNodeRelay against a fake in-process relay (Phase 5 batch C2:
+    // real dual-subscription multiplexing + reconnect) ---
+    //
+    // Mirrors `buzz-acp/src/relay.rs`'s `test_ws_pair`/`next_test_frame`
+    // pattern: a real `tokio_tungstenite` server socket on localhost, so the
+    // REAL `NostrNodeRelay`/`ActorState` wiring (dial, NIP-42 auth, REQ,
+    // reconnect) runs end to end without any live external relay. This is
+    // the one property in this batch that genuinely needs wire-level
+    // observation — the demux/track_agent logic above is proven without a
+    // socket at all.
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::WebSocketStream;
+
+    /// A local TCP listener a test can [`Self::accept_authenticated`]
+    /// against repeatedly, so one test can script a disconnect + reconnect
+    /// without rebinding.
+    struct FakeRelayServer {
+        listener: TcpListener,
+    }
+
+    impl FakeRelayServer {
+        async fn bind() -> (String, Self) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake relay listener");
+            let addr = listener.local_addr().expect("read fake relay address");
+            (format!("ws://{addr}"), Self { listener })
+        }
+
+        /// Accept the next incoming connection and play the server side of
+        /// the NIP-42 handshake (challenge → AUTH → OK), leaving the
+        /// connection ready for the test to script REQ/EVENT/EOSE traffic.
+        async fn accept_authenticated(&self) -> WebSocketStream<TcpStream> {
+            let (stream, _) = self
+                .listener
+                .accept()
+                .await
+                .expect("accept fake relay connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("complete server websocket handshake");
+            ws.send(Message::Text(
+                serde_json::json!(["AUTH", "test-challenge"])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send AUTH challenge");
+            let auth_frame = next_frame(&mut ws).await;
+            assert_eq!(auth_frame[0], "AUTH");
+            let event_id = auth_frame[1]["id"]
+                .as_str()
+                .expect("auth event carries an id")
+                .to_string();
+            ws.send(Message::Text(
+                serde_json::json!(["OK", event_id, true, ""])
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send AUTH ok");
+            ws
+        }
+    }
+
+    async fn next_frame(ws: &mut WebSocketStream<TcpStream>) -> serde_json::Value {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("fake relay stream ended")
+            .expect("read fake relay frame");
+        serde_json::from_str(msg.to_text().expect("expected a text frame"))
+            .expect("parse fake relay frame as json")
+    }
+
+    async fn send_event_frame(
+        ws: &mut WebSocketStream<TcpStream>,
+        sub_id: &str,
+        event: &nostr::Event,
+    ) {
+        ws.send(Message::Text(
+            serde_json::json!(["EVENT", sub_id, event])
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send EVENT frame");
+    }
+
+    /// The end-to-end proof for this batch: a real `NostrNodeRelay` learns
+    /// an agent from the assignment tail, proactively (re)subscribes
+    /// `AGENT_NODE_STATUS` scoped to exactly that agent, demuxes a peer
+    /// status to `next_status` while `next_desired` stays independently
+    /// pollable, and — after a simulated disconnect — reconnects with BOTH
+    /// subscriptions re-established at the same scope.
+    #[tokio::test]
+    async fn reconnect_reestablishes_both_live_subscriptions_scoped_to_learned_agents() {
+        let (url, server) = FakeRelayServer::bind().await;
+        let owner = Keys::generate();
+        let node = Keys::generate();
+        let relay = NostrNodeRelay::new(url, node.clone(), owner.public_key());
+        let agent = Keys::generate();
+        let agent_pubkey = agent.public_key();
+
+        let server_task = tokio::spawn(async move {
+            // --- First connection: only the assignment tail starts out
+            // subscribed -- nothing is known to scope status to yet.
+            let mut ws = server.accept_authenticated().await;
+            let first_req = next_frame(&mut ws).await;
+            assert_eq!(first_req[0], "REQ");
+            assert_eq!(first_req[1], ASSIGNMENT_SUB_ID);
+
+            // The owner assigns `agent` to `node` -- the actor learns the
+            // agent pubkey from this and must proactively subscribe status.
+            let assignment = build_assignment(
+                &owner,
+                &node.public_key(),
+                &secret_for(&owner, &agent, &node),
+                AssignState::Assigned,
+                1_785_780_000,
+            )
+            .expect("build assignment");
+            send_event_frame(&mut ws, ASSIGNMENT_SUB_ID, &assignment).await;
+
+            let status_req = next_frame(&mut ws).await;
+            assert_eq!(status_req[0], "REQ");
+            assert_eq!(status_req[1], STATUS_SUB_ID);
+            assert_eq!(
+                status_req[2]["#d"],
+                serde_json::json!([agent.public_key().to_hex()]),
+                "the status subscription must be scoped to exactly the learned agent"
+            );
+
+            // A real peer status flows through the just-opened subscription.
+            let peer = Keys::generate();
+            let peer_status = status_event(&peer, &agent, 1);
+            send_event_frame(&mut ws, STATUS_SUB_ID, &peer_status).await;
+
+            // --- Simulate a disconnect: drop the socket, then accept again.
+            drop(ws);
+            let mut ws2 = server.accept_authenticated().await;
+            let mut reqs = [next_frame(&mut ws2).await, next_frame(&mut ws2).await];
+            reqs.sort_by(|a, b| a[1].as_str().cmp(&b[1].as_str()));
+            assert_eq!(reqs[0][1], ASSIGNMENT_SUB_ID);
+            assert_eq!(reqs[1][1], STATUS_SUB_ID);
+            assert_eq!(
+                reqs[1][2]["#d"],
+                serde_json::json!([agent.public_key().to_hex()]),
+                "reconnect must re-scope status to the SAME known agent, not start over empty"
+            );
+        });
+
+        let desired = tokio::time::timeout(Duration::from_secs(5), relay.next_desired())
+            .await
+            .expect("next_desired timed out")
+            .expect("a desired-set change");
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].agent_pubkey, agent_pubkey);
+
+        let status = tokio::time::timeout(Duration::from_secs(5), relay.next_status())
+            .await
+            .expect("next_status timed out")
+            .expect("a peer status");
+        assert_eq!(status.agent_pubkey, agent_pubkey.to_hex());
+
+        tokio::time::timeout(Duration::from_secs(10), server_task)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
     }
 }

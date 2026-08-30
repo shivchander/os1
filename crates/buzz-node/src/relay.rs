@@ -31,6 +31,21 @@ pub trait NodeRelay: Send + Sync {
     /// (including this one). Feeds
     /// [`crate::move_gate::PeerStatusView`] so a spawn can defer while a
     /// different node still reports the same agent alive (spec I4).
+    ///
+    /// Implementations MUST authenticate each event with
+    /// [`buzz_core::node_status::validate_status`] (or equivalent —
+    /// signature, kind, and self-authorship all verified) before yielding
+    /// it here, and drop anything that fails validation instead of
+    /// returning it. [`crate::move_gate::PeerStatusView::record`] does not
+    /// re-verify: it only hex-parses the pubkeys on an already-typed
+    /// `AgentNodeStatus`, trusting this method to have done that work — the
+    /// same implicit contract [`Self::next_desired`] already has via its own
+    /// decrypt-implies-authentic envelope check.
+    /// [`crate::nostr_relay::NostrNodeRelay`]'s real implementation
+    /// delegates to a private `next_valid_status` helper that does exactly
+    /// this; `FakeRelay` (below, cfg-gated out of non-test builds) is exempt
+    /// since its statuses are injected directly by tests, never parsed off
+    /// the wire.
     async fn next_status(&self) -> Option<AgentNodeStatus>;
     /// Test-and-clear: true at most once per underlying (re)connect. Always
     /// true before the first call, so the engine's first check also drives

@@ -1167,6 +1167,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "futures-util",
  "keyring",
  "nix 0.31.3",
  "nostr 0.44.7",
@@ -1176,6 +1177,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.29.0",
  "tracing",
  "zeroize",
 ]

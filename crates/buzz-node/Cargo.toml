@@ -51,3 +51,11 @@ test-utils = []
 # Mirrors buzz-acp/buzz-cli's dev-dependency-only `test-util` opt-in.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+# Raw WebSocket server plumbing for `nostr_relay`'s in-process fake-relay
+# test harness (accept a TCP connection, speak the NIP-42 handshake, script
+# REQ/EVENT/EOSE frames) — proves `NostrNodeRelay`'s real dual-subscription
+# multiplexing and reconnect behavior without a live relay. Mirrors
+# `buzz-acp`'s identical `tokio::net::TcpListener` + `tokio_tungstenite`
+# dev-dependency-only test pattern.
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

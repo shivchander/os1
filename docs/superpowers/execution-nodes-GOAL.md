@@ -33,9 +33,20 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
-- [~] Phase 5 — presence-cadence + Batch A + Batch B + **Batch C1 (process adoption + agents SURVIVE graceful restart [pre-existing kill_on_drop cascade fixed] + getpgid pid corroboration; publish coalescing; publish_announce test; resync watermark carry-forward) DONE + reviewed + pushed**. Remaining — C2: real next_status subscription [real cross-node moves are 30s-timeout-only until then] + validate_status doc · C3: two-node e2e #[ignore]. Deferred (non-blocking): AcpRuntime real probe RPC (buzz-acp control channel); provider-secret retrieval at spawn; observe()-poll pid re-corroboration (subset of accepted v1 bare-pid risk); engine.rs:180-181 residual-limitations doc-staleness
+- [~] Phase 5 — presence-cadence + Batch A + Batch B + C1 + **C2 (real next_status subscription via a background connection-actor: cross-node moves fire on peer-Stopped not just the 30s timeout; actor-death is now fail-loud → non-zero exit → OS supervision restarts; folded observe() getpgid) DONE + reviewed + pushed**. Remaining — C3: two-node e2e #[ignore] (assign→move→kill single-live-instance proof; needs a live relay). Deferred (non-blocking): AcpRuntime real probe RPC (buzz-acp control channel); provider-secret retrieval at spawn (build_child_env); actor-leak-on-NostrNodeRelay-drop (unreachable in the current single-instance-per-process lifecycle)
 
 ## Running log (loop updates this — newest first)
+- 2026-08-30 (Phase 5 C2 ✅ — cross-node moves are now fast): replaced NostrNodeRelay's per-call
+  connection-locking with a single background actor that owns the one relay connection and multiplexes
+  two live subscriptions (AGENT_ASSIGNMENT + AGENT_NODE_STATUS) into independent channels — so the move
+  gate fires the instant a peer node reports the agent Stopped, instead of always waiting the 30s
+  handoff timeout. Deep concurrency review (no deadlock/backpressure-stall/starvation, cancel-safe,
+  reconnect re-establishes both subs, next_desired not regressed, authenticate-before-yield) came back
+  APPROVED; its one Important — an actor death would have exited the daemon with a CLEAN code 0,
+  indistinguishable from an intentional stop, so systemd/launchd wouldn't restart it — was fixed to
+  fail-loud (engine::run returns Err → non-zero exit → OS supervision restarts), with the deliberate-
+  shutdown path verified to still exit 0. buzz-node 128 lib tests incl a real-socket NIP-42 reconnect
+  harness; re-review clean; pushed. → C3 (the two-node #[ignore] e2e proof — the last piece).
 - 2026-08-30 (Phase 5 Batch C1 ✅ — agents genuinely survive node restart now): implemented process
   adoption (per-agent PID file → unix liveness + getpgid group-leader corroboration → adopt live
   survivors into an AgentSlot::Adopted so full_resync reconciles NoOp instead of double-spawning). The

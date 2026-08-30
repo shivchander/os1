@@ -486,7 +486,7 @@ export function ProfileSettingsCard({
       <div>
         <SettingsSectionHeader
           title="Profile"
-          description="Update how your name, avatar, and bio appear across Buzz."
+          description="Update how your name, avatar, and bio appear across OS1."
         />
 
         <div className="space-y-3">

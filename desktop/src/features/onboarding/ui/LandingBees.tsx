@@ -1,7 +1,7 @@
 import * as React from "react";
 
-import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 import { FlappingBee } from "@/shared/ui/buzz-logo/FlappingBee";
+import os1MarkUrl from "@/shared/ui/os1-mark.svg";
 
 type Bee = {
   top: string;
@@ -141,8 +141,8 @@ export function LandingBees() {
       aria-hidden
       className="pointer-events-none absolute inset-0 overflow-hidden"
     >
-      <span className="absolute left-6 top-12 block w-11 text-[#231E1E]">
-        <BuzzMark className="h-auto w-full" />
+      <span className="absolute left-6 top-12 block w-11">
+        <img alt="" className="h-auto w-full" src={os1MarkUrl} />
       </span>
       {BEES.map((bee, i) => (
         <span

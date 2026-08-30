@@ -357,7 +357,7 @@ export function DefaultConfigStep({
           Configure your default model settings
         </h1>
         <p className="mx-auto mt-3 max-w-[440px] text-sm leading-5 text-foreground/80">
-          This will be set as your default model configuration across Buzz. You
+          This will be set as your default model configuration across OS1. You
           can always change this in your Settings or give specific agents a
           different configuration.
         </p>

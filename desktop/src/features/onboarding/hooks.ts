@@ -159,15 +159,11 @@ export async function initializeStarterChannels(
     }
     const focusChannelId = focus ? welcomeChannel.id : undefined;
     return { ok: true, focusChannelId };
-  } catch (error) {
-    console.warn("Failed to initialize starter channels.", error);
-    return {
-      ok: false,
-      reason:
-        error instanceof Error
-          ? error.message
-          : "Failed to set up starter channels",
-    };
+  } catch {
+    // Unreachable under the os1 clean-slate early-return above; kept so the
+    // original seeding body stays intact for easy revert. Binding-free so tsc
+    // doesn't hit TS18046 (no flow-narrowing of `error` in unreachable code).
+    return { ok: false, reason: "Failed to set up starter channels" };
   }
 }
 

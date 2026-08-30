@@ -32,7 +32,7 @@ import {
   ONBOARDING_INK_ICON_CLASS,
   ONBOARDING_PRIMARY_CTA_CLASS,
 } from "@/features/onboarding/ui/OnboardingChrome";
-import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
+import os1MarkUrl from "@/shared/ui/os1-mark.svg";
 import {
   Dialog,
   DialogContent,
@@ -474,7 +474,7 @@ export function HostedCommunityOnboarding({
         surface="textured"
       >
         <div className="mx-auto flex w-full max-w-sm flex-col items-center py-2 text-center">
-          <BuzzMark className="mb-5 h-auto w-9 text-foreground" />
+          <img alt="" className="mb-5 h-auto w-9" src={os1MarkUrl} />
 
           {!auth ? (
             <>

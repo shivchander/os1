@@ -175,7 +175,7 @@ export function CommunitySwitcher({
       if (result?.status === "already-absent") {
         toast("Community removed", {
           description:
-            "You were no longer a member, so Buzz removed the community from this device.",
+            "You were no longer a member, so OS1 removed the community from this device.",
         });
       }
     } catch (error) {

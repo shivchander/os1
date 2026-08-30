@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Buzz",
+  "productName": "OS1",
   "version": "0.5.20",
   "identifier": "xyz.block.buzz.app",
   "build": {
@@ -16,7 +16,7 @@
   "app": {
     "windows": [
       {
-        "title": "",
+        "title": "OS1",
         "width": 800,
         "height": 600,
         "maximized": true,

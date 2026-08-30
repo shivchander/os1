@@ -638,7 +638,7 @@ function ThemeSettingsCard() {
     >
       <SettingsSectionHeader
         title="Appearance"
-        description="Choose how Buzz looks and feels."
+        description="Choose how OS1 looks and feels."
       />
 
       <SettingsOptionGroupList>
@@ -698,7 +698,7 @@ function ThemeSettingsCard() {
                 className="text-sm font-normal text-muted-foreground/70"
                 data-settings-subcopy
               >
-                Choose the colors used throughout Buzz.
+                Choose the colors used throughout OS1.
               </p>
             </div>
             <button

@@ -248,7 +248,17 @@ impl LocalProcessSubstrate {
             }
         };
 
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to read an entry while scanning agents dir for pid adoption"
+                    );
+                    continue;
+                }
+            };
             if !entry.path().is_dir() {
                 continue;
             }
@@ -272,7 +282,7 @@ impl LocalProcessSubstrate {
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok());
             match recorded_pid {
-                Some(pid) if pid_is_alive(pid) => {
+                Some(pid) if pid_is_alive(pid) && is_own_group_leader(pid) => {
                     tracing::info!(
                         agent = %agent.to_hex(),
                         pid,
@@ -285,6 +295,22 @@ impl LocalProcessSubstrate {
                             reported_crash: false,
                         },
                     );
+                }
+                Some(pid) if pid_is_alive(pid) => {
+                    // Alive, but not its own process-group leader: every
+                    // genuine agent is spawned into its own group
+                    // (`AgentRuntime::spawn`'s contract), so this pid record
+                    // now names an unrelated process that happens to have
+                    // reused the recorded pid -- a pid-reuse collision, not
+                    // our agent. Reject rather than adopt (see
+                    // `is_own_group_leader`'s doc comment).
+                    tracing::warn!(
+                        agent = %agent.to_hex(),
+                        pid,
+                        "pid record names a live process that is not its own process-group \
+                         leader; treating as a pid-reuse collision, not adopting"
+                    );
+                    let _ = std::fs::remove_file(&pid_path);
                 }
                 _ => {
                     // Dead pid, unreadable/corrupt record, or none at all:
@@ -439,6 +465,45 @@ fn pid_is_alive(_pid: u32) -> bool {
     true
 }
 
+/// True iff `pid` is the leader of its own process group (`getpgid(pid) ==
+/// pid`) — the invariant every process this substrate spawns satisfies by
+/// construction (every [`AgentRuntime::spawn`] implementation is required
+/// to call `process_group(0)`). `pid_is_alive` alone only proves SOME
+/// process currently has this pid — on a long-lived box, an OS can recycle
+/// a pid for a completely unrelated process between this agent stopping
+/// and a much-later restart's adoption scan. Corroborating group
+/// leadership doesn't fully close that (an impostor could coincidentally
+/// also be a group leader), but it's cheap and meaningfully narrows it, and
+/// it's the difference between merely mis-observing an impostor as
+/// `Running` (bad but contained) and `killpg`-signaling an entirely
+/// unrelated process group when that impostor is later "stopped" (much
+/// worse — see [`terminate_adopted`]). Used both at adoption time
+/// ([`LocalProcessSubstrate::adopt_existing`], to decide whether to adopt
+/// at all) and again right before actually signaling
+/// ([`terminate_adopted`], defense-in-depth against the narrow window
+/// where a pid is reused between those two points).
+#[cfg(unix)]
+fn is_own_group_leader(pid: u32) -> bool {
+    use nix::unistd::{getpgid, Pid};
+    let target = Pid::from_raw(pid as i32);
+    getpgid(Some(target)) == Ok(target)
+}
+
+/// Windows has no `unsafe`-FFI-free equivalent of process-group leadership
+/// to check, and [`terminate_adopted`]'s Windows arm doesn't use `killpg`
+/// (it targets a specific pid's whole tree via `taskkill /T` instead), so
+/// the risk this guards against on unix doesn't apply the same way here —
+/// always true so it never blocks Windows adoption/termination.
+#[cfg(windows)]
+fn is_own_group_leader(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_own_group_leader(_pid: u32) -> bool {
+    true
+}
+
 /// Terminate the process group rooted at `pid` when there is no [`Child`]
 /// handle to poll/reap — i.e. an [`AgentSlot::Adopted`] process this
 /// substrate discovered rather than spawned itself. Signals exactly like
@@ -454,6 +519,18 @@ async fn terminate_adopted(pid: u32) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
 
+    // Defense-in-depth re-check (see `is_own_group_leader`'s doc comment):
+    // `adopt_existing` already corroborated this at adoption time, but
+    // re-verify right before actually signaling in case the pid was reused
+    // in the window since. `killpg` on an impostor's group would otherwise
+    // signal an unrelated process tree.
+    if !is_own_group_leader(pid) {
+        tracing::warn!(
+            pid,
+            "refusing to killpg a pid that is no longer its own process-group leader"
+        );
+        return;
+    }
     let pgid = Pid::from_raw(pid as i32);
     let _ = killpg(pgid, Signal::SIGTERM);
     let deadline = Instant::now() + STOP_GRACE;
@@ -949,35 +1026,43 @@ mod tests {
 
     // --- Process adoption across a simulated restart (spec §13 I3/I4) ---
 
-    /// Spawns `sleep 30` WITHOUT `kill_on_drop`, so the OS process survives
-    /// when the returned `Child` (and, transitively, the substrate/table
-    /// that owns it) is dropped. This models how a real agent process
-    /// survives THIS process's own exit today: `main.rs` calls
-    /// `std::process::exit`, which skips Rust destructors entirely, so
-    /// `AcpRuntime`'s `kill_on_drop(true)` "abnormal drop" safety net never
-    /// actually fires on a normal daemon shutdown (see its doc comment) —
-    /// the agent process is simply left running. Using `kill_on_drop(false)`
-    /// here reaches the same end state (a Rust-side handle drop that does
-    /// NOT touch the real OS process) without needing to exec a second real
-    /// OS process just for this test.
-    struct SurvivingSleepRuntime;
-    #[async_trait::async_trait]
-    impl crate::runtime::AgentRuntime for SurvivingSleepRuntime {
-        async fn spawn(
-            &self,
-            _desired: &DesiredAgent,
-            workspace: &std::path::Path,
-            _relay_url: &str,
-        ) -> Result<tokio::process::Child, NodeError> {
-            let mut cmd = tokio::process::Command::new("/bin/sh");
-            cmd.args(["-c", "sleep 30"]).current_dir(workspace);
-            #[cfg(unix)]
-            cmd.process_group(0);
-            cmd.spawn()
-                .map_err(|e| NodeError::Substrate(format!("spawn: {e}")))
-        }
-        async fn probe(&self, _agent: &PublicKey) -> Result<(), NodeError> {
-            Ok(())
+    /// Build a runtime factory (fresh `Arc` per call, since
+    /// `LocalProcessSubstrate::new` takes ownership) using the REAL
+    /// production [`crate::runtime::AcpRuntime`] pointed at a harmless
+    /// `sleep` instead of `buzz-acp` — not a bespoke test fixture — so the
+    /// adoption test below actually exercises `AcpRuntime`'s real spawn
+    /// behavior (notably: no `kill_on_drop`). Review round 1 caught exactly
+    /// the gap a fixture would paper over: an earlier version of this test
+    /// used its own fixture that already omitted `kill_on_drop`, which
+    /// proved adoption's OWN logic worked but never actually verified that
+    /// `AcpRuntime` itself left the process alive across the drop --
+    /// `AcpRuntime` still had `kill_on_drop(true)` at the time and would
+    /// have killed it.
+    fn real_agent_runtime() -> std::sync::Arc<dyn crate::runtime::AgentRuntime> {
+        std::sync::Arc::new(crate::runtime::AcpRuntime {
+            harness_command: "/bin/sh".into(),
+            harness_args: vec!["-c".into(), "sleep 30".into()],
+        })
+    }
+
+    /// Poll `pid_is_alive` across a bounded window instead of checking once:
+    /// signal delivery (and, before Batch C1 review round 1's fix, a real
+    /// `kill_on_drop(true)`) isn't necessarily synchronous with the
+    /// triggering event returning, so a single point-in-time check right
+    /// after a drop/signal can observe "alive" even when the process is a
+    /// few microseconds from dying (confirmed empirically while writing
+    /// `runtime::tests::spawned_child_survives_being_dropped_so_a_graceful_shutdown_never_kills_it`).
+    /// Panics with `msg` the first time `pid` is observed dead within the
+    /// window; returns normally once the window elapses with it alive the
+    /// whole time.
+    async fn assert_stays_alive_for(pid: u32, window: Duration, msg: &str) {
+        let deadline = Instant::now() + window;
+        loop {
+            assert!(pid_is_alive(pid), "{msg}");
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -988,7 +1073,9 @@ mod tests {
     /// against that observation yields `Noop`, never a duplicate `Start`.
     /// Also proves `stop()` can terminate an adopted process (no `Child`
     /// handle) via `terminate_adopted`, cleaning up the real `sleep` this
-    /// test spawned.
+    /// test spawned. Uses the real `AcpRuntime` (see `real_agent_runtime`),
+    /// not a fixture, so it actually exercises the whole
+    /// survive-a-graceful-drop -> adopt -> Noop chain end to end.
     #[cfg(unix)]
     #[tokio::test]
     async fn adoption_discovers_a_still_running_process_after_a_simulated_restart() {
@@ -998,10 +1085,12 @@ mod tests {
 
         let pid = {
             // "Incarnation 1": spawn the agent, then drop the substrate --
-            // simulating this process exiting (via `std::process::exit`,
-            // which skips destructors) without ever calling `stop()`.
+            // models `daemon::run_until_shutdown`'s `tokio::select!`
+            // dropping the losing `engine` future (and therefore this
+            // substrate) when the shutdown branch wins a graceful
+            // `buzz-node stop`/ctrl-c, without ever calling `stop()`.
             let sub = LocalProcessSubstrate::new(
-                std::sync::Arc::new(SurvivingSleepRuntime),
+                real_agent_runtime(),
                 "wss://r".into(),
                 dir.path().into(),
             );
@@ -1016,17 +1105,24 @@ mod tests {
                 "sanity: the freshly spawned pid must be alive"
             );
             recorded
-            // `sub` (and its `AgentSlot::Live`'s `Child`, spawned with no
-            // `kill_on_drop`) drops here without touching the real process.
+            // `sub` (and its `AgentSlot::Live`'s real `AcpRuntime`-spawned
+            // `Child`) drops here.
         };
+
+        // The property review round 1 found broken: a graceful shutdown
+        // (substrate drop) must NOT kill the agent. Polled, not a single
+        // check -- see `assert_stays_alive_for`'s doc comment.
+        assert_stays_alive_for(
+            pid,
+            Duration::from_millis(300),
+            "a graceful daemon shutdown (substrate drop) must NOT kill the agent process",
+        )
+        .await;
 
         // "Incarnation 2": a fresh substrate over the SAME root dir, exactly
         // as a restarted daemon would construct one.
-        let sub2 = LocalProcessSubstrate::new(
-            std::sync::Arc::new(SurvivingSleepRuntime),
-            "wss://r".into(),
-            dir.path().into(),
-        );
+        let sub2 =
+            LocalProcessSubstrate::new(real_agent_runtime(), "wss://r".into(), dir.path().into());
         let observed = sub2.observe().await;
         assert_eq!(
             observed.get(&d.agent_pubkey),
@@ -1081,6 +1177,81 @@ mod tests {
             !pid_path.exists(),
             "a stale dead-pid record must be cleaned up during the adoption scan"
         );
+    }
+
+    /// Batch C1 review round 1 IMPORTANT finding: `pid_is_alive` alone
+    /// (`kill(pid, 0)` existence) doesn't prove a recorded pid is actually
+    /// OUR agent -- a pid-reuse collision with SOME unrelated but currently
+    /// alive process would pass it too. Every genuine agent is spawned into
+    /// its own process group (`AgentRuntime::spawn`'s contract), so a real
+    /// adoption target always satisfies `pid == its own pgid`. Spawns a
+    /// real, currently-alive process WITHOUT giving it its own group
+    /// (unlike every genuine agent spawn) to model that collision, and
+    /// proves it is rejected -- not adopted, and the stale record cleaned
+    /// up -- exactly like a dead pid would be.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adoption_rejects_a_live_pid_that_is_not_its_own_process_group_leader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Keys::generate().public_key();
+
+        let mut impostor = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn impostor");
+        let pid = impostor.id().expect("pid");
+
+        let pid_path = pid_file_path(dir.path(), &agent);
+        std::fs::create_dir_all(pid_path.parent().expect("has parent")).expect("create agent dir");
+        std::fs::write(&pid_path, pid.to_string()).expect("write pid record");
+
+        let sub = LocalProcessSubstrate::new(
+            std::sync::Arc::new(SleepRuntime),
+            "wss://r".into(),
+            dir.path().into(),
+        );
+
+        assert!(
+            !sub.observe().await.contains_key(&agent),
+            "a live pid that is not its own process-group leader must not be adopted"
+        );
+        assert!(
+            !pid_path.exists(),
+            "the rejected record must be cleaned up like a dead one"
+        );
+
+        impostor.start_kill().ok();
+        let _ = impostor.wait().await;
+    }
+
+    /// The defensive re-check inside `terminate_adopted` itself, proven in
+    /// isolation: even if something bypassed `adopt_existing`'s own gate,
+    /// `terminate_adopted` must never `killpg` a pid that isn't its own
+    /// process-group leader. Polls across a window (see
+    /// `assert_stays_alive_for`) rather than a single check, so this also
+    /// catches the delayed-effect case, not just an immediate one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_adopted_refuses_to_signal_a_non_group_leader_pid() {
+        let mut impostor = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn impostor");
+        let pid = impostor.id().expect("pid");
+
+        terminate_adopted(pid).await;
+
+        assert_stays_alive_for(
+            pid,
+            Duration::from_millis(300),
+            "terminate_adopted must refuse to killpg a pid that is not its own process-group leader",
+        )
+        .await;
+
+        impostor.start_kill().ok();
+        let _ = impostor.wait().await;
     }
 
     #[tokio::test]

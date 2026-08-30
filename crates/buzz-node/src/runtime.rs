@@ -116,13 +116,33 @@ impl AgentRuntime for AcpRuntime {
         let mut cmd = Command::new(&self.harness_command);
         cmd.args(&self.harness_args)
             .current_dir(workspace)
-            .env_clear()
-            // Safety net only, for an abnormal drop (panic/bug) before the
-            // process table ever registers this child: the *normal* shutdown
-            // path is the substrate's graceful process-*group* kill
-            // (`substrate::kill_group`), which this cannot replace — it has
-            // no knowledge of the child's own descendants.
-            .kill_on_drop(true);
+            .env_clear();
+        // Deliberately NOT `kill_on_drop(true)` (Batch C1 review round 1
+        // CRITICAL finding): agents must survive their `Child` handle being
+        // dropped, full stop — that drop happens not just on an abnormal
+        // panic but on every GRACEFUL daemon shutdown too.
+        // `daemon::run_until_shutdown`'s `tokio::select!` drops the losing
+        // `engine` future (and therefore every `Live` slot's `Child`) the
+        // instant a `buzz-node stop`/ctrl-c wins the race — while the tokio
+        // runtime is still fully alive, which is a completely different
+        // event from `main.rs`'s later `std::process::exit()` (that one
+        // skips destructors, but only runs long after this drop already
+        // happened). A `kill_on_drop(true)` `Child` would have been killed
+        // right there, silently contradicting the documented "node
+        // shutdown deliberately leaves agents running" invariant
+        // `crate::engine::full_resync` and
+        // `crate::substrate::LocalProcessSubstrate::adopt_existing` depend
+        // on — see `tests::spawned_child_survives_being_dropped_so_a_graceful_shutdown_never_kills_it`.
+        // The only intentional termination paths are now
+        // `Substrate::stop`'s explicit graceful process-*group* kill
+        // (`substrate::kill_group`) and a human directly signaling the
+        // process. The one thing `kill_on_drop(true)` used to also guard —
+        // an abnormal drop (panic) between a successful spawn and the
+        // process table registering the child — is narrower now than it
+        // looks: `LocalProcessSubstrate::start` persists the pid record
+        // (`record_pid`) before that registration, so even that window
+        // leaves a discoverable orphan (adopted on the next restart)
+        // instead of a silently killed one.
         // Preserve enough host env for the harness to resolve its own tools.
         for key in ["PATH", "HOME", "USER", "LANG", "TMPDIR"] {
             if let Ok(v) = std::env::var(key) {
@@ -235,5 +255,76 @@ mod tests {
         // `sleep` process behind.
         child.start_kill().ok();
         let _ = child.wait().await;
+    }
+
+    /// Batch C1 review round 1 CRITICAL finding: agents must survive a
+    /// GRACEFUL daemon shutdown, not just an OS-level process exit.
+    /// `daemon::run_until_shutdown`'s `tokio::select!` DROPS the losing
+    /// `engine` future (and therefore the `Arc<dyn Substrate>`/`Child`
+    /// handles it owns) the instant the shutdown branch wins a normal
+    /// `buzz-node stop`/ctrl-c — this happens while the tokio runtime is
+    /// very much alive, which is a completely different event from
+    /// `main.rs`'s final `std::process::exit()` (which skips destructors
+    /// entirely, but only runs long after this drop has already happened).
+    /// A `kill_on_drop(true)` `Child` WOULD be killed by that select-drop,
+    /// which contradicts the documented "node shutdown deliberately leaves
+    /// agents running" invariant `crate::engine::full_resync` and
+    /// `crate::substrate::LocalProcessSubstrate::adopt_existing` are built
+    /// on. Models the select-drop directly: spawn, then drop the `Child`
+    /// while this test's own tokio runtime is still running, exactly like
+    /// the losing branch of a `tokio::select!` would be dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_child_survives_being_dropped_so_a_graceful_shutdown_never_kills_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = AcpRuntime {
+            harness_command: "/bin/sh".into(),
+            harness_args: vec!["-c".into(), "sleep 5".into()],
+        };
+        let (agent, node, owner) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let desired =
+            crate::model::fake_desired(&agent, &node, &owner, buzz_core::AssignState::Assigned);
+
+        let pid = {
+            let child = rt
+                .spawn(&desired, dir.path(), "wss://relay.example")
+                .await
+                .expect("spawn");
+            child.id().expect("pid")
+            // `child` drops here, uncollected -- models `tokio::select!`
+            // dropping the losing `engine` future during a graceful
+            // shutdown race.
+        };
+
+        // A single point-in-time check right after the drop would race a
+        // real kill_on_drop(true): `SIGKILL` delivery isn't necessarily
+        // synchronous with the sending process's `kill()` call returning,
+        // so a check on literally the next line can observe "still alive"
+        // even when the process is a few microseconds from being killed
+        // (confirmed empirically while writing this test — an un-delayed
+        // check passed against the unfixed code). Poll repeatedly across a
+        // window comfortably longer than any realistic signal-delivery
+        // delay instead: a real kill_on_drop(true) reliably shows up as
+        // "dead" well within it, while a genuinely surviving process (this
+        // is a `sleep 5`) stays alive through the whole window.
+        let target = nix::unistd::Pid::from_raw(pid as i32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        loop {
+            assert!(
+                nix::sys::signal::kill(target, None).is_ok(),
+                "the agent process must survive its Child handle being dropped -- \
+                 a graceful daemon shutdown must never kill it"
+            );
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Cleanup: this test's process is the real OS parent throughout (no
+        // real restart happened), so — deliberately not relying on
+        // `kill_on_drop` — clean up and reap explicitly.
+        let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(target, None);
     }
 }

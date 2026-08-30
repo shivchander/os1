@@ -492,6 +492,16 @@ impl NostrNodeRelay {
         });
     }
 
+    /// Test-only: number of distinct publish keys currently claimed
+    /// in-flight by the coalescer. Used to prove the coalescing bound
+    /// end-to-end, through the real `spawn_publish`/`tokio::spawn`/
+    /// `publish_with_retry` wiring — not just the pure `PublishCoalescer`
+    /// unit (see the `PublishCoalescer` test section below).
+    #[cfg(test)]
+    fn inflight_publish_count(&self) -> usize {
+        self.inner.lock_coalescer().inflight.len()
+    }
+
     /// Lock `self.desired`, recovering from a poisoned mutex rather than
     /// panicking (mirrors `LocalProcessSubstrate`'s `lock_table`/observe`
     /// precedent): another call already panicked while holding it, which
@@ -1210,10 +1220,18 @@ mod tests {
     use crate::relay::NodeRelay;
 
     fn sample_status(node: &Keys) -> buzz_core::AgentNodeStatus {
+        sample_status_for(node, &Keys::generate())
+    }
+
+    /// Like `sample_status`, but for a caller-supplied `agent` instead of a
+    /// fresh random one each call — needed by the coalescing test, which
+    /// must reuse the SAME agent (and therefore the same `d`-tag/coalescing
+    /// key) across repeated publishes.
+    fn sample_status_for(node: &Keys, agent: &Keys) -> buzz_core::AgentNodeStatus {
         buzz_core::AgentNodeStatus {
             format: buzz_core::node_status::FORMAT.into(),
             version: buzz_core::node_status::VERSION,
-            agent_pubkey: Keys::generate().public_key().to_hex(),
+            agent_pubkey: agent.public_key().to_hex(),
             node_pubkey: node.public_key().to_hex(),
             health: buzz_core::AgentHealth::Running,
             reason: None,
@@ -1249,6 +1267,42 @@ mod tests {
             .await
             .expect("publish_status must return promptly (enqueue-and-return), not block on the relay being unreachable");
         result.expect("building/enqueueing the status event must still succeed synchronously");
+    }
+
+    /// The coalescing bound proven end-to-end (Phase 5 cleanup c): the pure
+    /// `PublishCoalescer` unit tests above prove the data-structure
+    /// invariant in isolation; this drives the REAL
+    /// `spawn_publish`/`tokio::spawn`/`publish_with_retry` wiring against
+    /// an actually-unreachable relay — the exact "long outage" scenario the
+    /// cleanup exists for — and proves the bound holds there too.
+    #[tokio::test]
+    async fn spawn_publish_coalesces_rapid_repeated_publishes_against_an_unreachable_relay() {
+        let node = Keys::generate();
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let relay = NostrNodeRelay::new(
+            UNREACHABLE_RELAY_URL.into(),
+            node.clone(),
+            owner.public_key(),
+        );
+
+        // Simulates the engine republishing the SAME agent's status on
+        // every reconcile tick throughout a long relay outage. Each call
+        // enqueues-and-returns immediately (proven above); the first spawns
+        // a background task that gets stuck retrying `ensure_connected`
+        // against the unreachable relay, so the `inflight` slot for this
+        // agent's key is never drained during this loop.
+        for _ in 0..50 {
+            let status = sample_status_for(&node, &agent);
+            relay.publish_status(&status).await.expect("enqueue status");
+        }
+
+        assert_eq!(
+            relay.inflight_publish_count(),
+            1,
+            "must coalesce to at most one in-flight task for this agent's status stream, \
+             not spawn 50 concurrent retry loops during the outage"
+        );
     }
 
     #[tokio::test]

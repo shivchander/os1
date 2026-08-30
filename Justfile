@@ -694,6 +694,51 @@ production *ARGS: bootstrap _ensure-sidecar-stubs
     echo "Starting production on Vite port ${BUZZ_VITE_PORT}, relay ${BUZZ_RELAY_URL}"
     pnpm exec tauri dev ${FEATURES[@]+"${FEATURES[@]}"} --config "$BUZZ_TAURI_CONFIG" {{ARGS}}
 
+# Run the desktop against a REMOTE relay (e.g. a Tailscale-reachable execution
+# node) using the identity in $BUZZ_PRIVATE_KEY (nsec or hex). Auto-connects and
+# skips onboarding (BUZZ_SHARE_IDENTITY). Unlike `just dev`, it does NOT start a
+# local relay — so it works when :3000 is a forwarded/remote relay.
+# Usage: BUZZ_PRIVATE_KEY=<nsec> just desktop-remote ws://100.88.16.15:3000
+desktop-remote relay: _ensure-sidecar-stubs
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    [[ -n "${BUZZ_PRIVATE_KEY:-}" ]] || { echo "ERROR: set BUZZ_PRIVATE_KEY (nsec or hex) — the identity the desktop connects as" >&2; exit 1; }
+    cargo build -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
+    # Explicitly rebuild the Tauri backend: it's excluded from the root
+    # workspace, and `tauri dev` does NOT reliably recompile it after src-tauri
+    # source edits — leaving a stale binary that ignores your latest changes.
+    cargo build --manifest-path desktop/src-tauri/Cargo.toml
+    TARGET=$(rustc -vV | sed -n 's|host: ||p')
+    TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).target_directory")
+    for bin in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+        cp "${TARGET_DIR}/debug/${bin}" "desktop/src-tauri/binaries/${bin}-${TARGET}"
+        chmod +x "desktop/src-tauri/binaries/${bin}-${TARGET}"
+    done
+    cd {{desktop_dir}}
+    [[ -d node_modules ]] || pnpm install
+    export BUZZ_RELAY_URL="{{relay}}"
+    export BUZZ_SHARE_IDENTITY=1
+    _injected_key="$BUZZ_PRIVATE_KEY"
+    source ../scripts/instance-env.sh
+    # In a worktree, instance-env.sh may replace BUZZ_PRIVATE_KEY with a shared
+    # dev-keyring identity. Re-assert the caller's key so it always wins.
+    export BUZZ_PRIVATE_KEY="$_injected_key"
+    export BUZZ_RELAY_URL="{{relay}}"
+    echo "Starting desktop against ${BUZZ_RELAY_URL} (identity from BUZZ_PRIVATE_KEY), Vite ${BUZZ_VITE_PORT}"
+    pnpm exec tauri dev --config "$BUZZ_TAURI_CONFIG"
+
+# Launch the desktop against the execution node over Tailscale, signed in as the
+# owner identity cached in ~/.buzz-owner.nsec. One command, no args needed.
+# Usage: just desktop-node   (or: just desktop-node ws://<other-host>:3000)
+desktop-node relay="ws://100.88.16.15:3000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    [[ -s "$HOME/.buzz-owner.nsec" ]] || { echo "ERROR: ~/.buzz-owner.nsec not found — that file holds the owner identity the desktop signs in as" >&2; exit 1; }
+    export BUZZ_PRIVATE_KEY="$(cat "$HOME/.buzz-owner.nsec")"
+    exec just desktop-remote "{{relay}}"
+
 # Run the desktop frontend dev server (port derived from worktree)
 desktop-dev:
     #!/usr/bin/env bash

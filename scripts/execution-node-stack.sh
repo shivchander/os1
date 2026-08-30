@@ -65,6 +65,11 @@ ensure_env() {
   [ -f .env ] || cp .env.example .env
   grep -q '^BUZZ_RELAY_PRIVATE_KEY=' .env || echo "BUZZ_RELAY_PRIVATE_KEY=$(openssl rand -hex 32)" >> .env
   grep -q '^BUZZ_AUTO_MIGRATE=' .env && sed -i 's/^BUZZ_AUTO_MIGRATE=.*/BUZZ_AUTO_MIGRATE=true/' .env || echo "BUZZ_AUTO_MIGRATE=true" >> .env
+  # RELAY_URL is the relay's canonical host: it bootstraps the community
+  # (tenant binding) AND is used in NIP-42 auth challenges. Every participant —
+  # relay, node agent, owner_driver, desktop — must address the relay by this
+  # exact host, so set it here from the script's RELAY_URL (e.g. a Tailscale IP).
+  grep -q '^RELAY_URL=' .env && sed -i "s|^RELAY_URL=.*|RELAY_URL=$RELAY_URL|" .env || echo "RELAY_URL=$RELAY_URL" >> .env
 }
 
 relay() {
@@ -79,7 +84,19 @@ relay() {
 
 enroll() {
   require_build
-  if [ -f "$NODE_HOME/config.json" ]; then log "already enrolled ($NODE_HOME/config.json) — skipping"; return; fi
+  if [ -f "$NODE_HOME/config.json" ]; then
+    if grep -qF "$RELAY_URL" "$NODE_HOME/config.json"; then
+      log "already enrolled at $RELAY_URL — skipping"; return
+    fi
+    # Host changed (e.g. localhost -> Tailscale IP): the community is per-host,
+    # so the old enrollment is in a different community. Re-provision the node
+    # identity under the new host. owner_driver's owner/agent keys are kept.
+    log "config relay_url != $RELAY_URL — re-provisioning node under new host"
+    pkill -9 -x buzz-node 2>/dev/null || true
+    pkill -9 -x buzz-acp 2>/dev/null || true
+    pkill -9 -x codex 2>/dev/null || true
+    rm -f "$NODE_HOME/config.json" "$NODE_HOME/secrets/node-key"
+  fi
   cd "$REPO_DIR"
   log "enrolling node"
   : > /tmp/enroll.log

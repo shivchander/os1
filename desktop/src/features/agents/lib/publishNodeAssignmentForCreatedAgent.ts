@@ -20,11 +20,13 @@ import type { BackendIntent } from "./instanceInputForDefinition";
  *
  * We convey the agent's own **system prompt** in `launch.env` as
  * `BUZZ_ACP_SYSTEM_PROMPT` so the node-hosted harness honors its instructions
- * (without it, codex/goose runs with its default identity). We deliberately
- * send ONLY the agent's instructions here — NOT the full persona/model/policy
- * env layering, which is still resolved only inside the Rust local-spawn path
- * (`start_local_agent_with_preflight` and friends); re-deriving that here is
- * the drift the spec warns against (see
+ * (without it, codex/goose runs with its default identity), and — when the
+ * agent has a concrete, non-default model pinned — its **model** as
+ * `BUZZ_ACP_MODEL` (buzz-acp's `--model`/`BUZZ_ACP_MODEL` arg, applied to
+ * every new ACP session). We deliberately send ONLY these two fields here —
+ * NOT the full persona/policy env layering, which is still resolved only
+ * inside the Rust local-spawn path (`start_local_agent_with_preflight` and
+ * friends); re-deriving that here is the drift the spec warns against (see
  * `docs/superpowers/specs/2026-08-29-execution-nodes-design.md` §9 "Config
  * without drift"). Provider credentials are supplied by the node itself
  * (`NodeConfig.agent_env` + the provider secret store), not from here.
@@ -44,6 +46,9 @@ export async function publishNodeAssignmentForCreatedAgent(
   const env: Record<string, string> = {};
   if (createdAgent.systemPrompt) {
     env.BUZZ_ACP_SYSTEM_PROMPT = createdAgent.systemPrompt;
+  }
+  if (createdAgent.model) {
+    env.BUZZ_ACP_MODEL = createdAgent.model;
   }
   await publishAgentAssignment({
     agentId: createdAgent.pubkey,

@@ -27,11 +27,20 @@ const RESERVED_ENV_KEYS: &[&str] = &[
 
 /// Build the child environment for an agent harness process.
 ///
-/// Precedence (later overrides earlier): `launch.policy_env` < `launch.env`
-/// < `secret.env_vars` < authoritative identity. Any user-supplied reserved
-/// key (see [`RESERVED_ENV_KEYS`]) is dropped before the merge, so identity
-/// can never be overridden by policy/launch/user env.
-pub fn build_child_env(secret: &AssignmentSecret, relay_url: &str) -> Vec<(String, String)> {
+/// Precedence (later overrides earlier): `node_env` < `launch.policy_env` <
+/// `launch.env` < `secret.env_vars` < authoritative identity. `node_env` is
+/// the node-wide base layer (this node's [`crate::enroll::NodeConfig::agent_env`]
+/// non-secret defaults plus any configured provider API key — see
+/// [`crate::secret_store`]) injected so an agent still gets a usable
+/// environment even when its own per-agent assignment carries no
+/// credentials. Any user-supplied reserved key (see [`RESERVED_ENV_KEYS`])
+/// is dropped before the merge — from `node_env` too — so identity can never
+/// be overridden by node/policy/launch/user env.
+pub fn build_child_env(
+    secret: &AssignmentSecret,
+    relay_url: &str,
+    node_env: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let merge = |m: &BTreeMap<String, String>, env: &mut BTreeMap<String, String>| {
         for (k, v) in m {
@@ -40,6 +49,7 @@ pub fn build_child_env(secret: &AssignmentSecret, relay_url: &str) -> Vec<(Strin
             }
         }
     };
+    merge(node_env, &mut env);
     merge(&secret.launch.policy_env, &mut env);
     merge(&secret.launch.env, &mut env);
     merge(&secret.env_vars, &mut env);
@@ -94,6 +104,12 @@ pub struct AcpRuntime {
     pub harness_command: String,
     /// Extra harness CLI arguments (default empty).
     pub harness_args: Vec<String>,
+    /// Node-wide base environment layer, merged into every spawned harness
+    /// beneath the per-agent `launch.policy_env`/`launch.env`/`env_vars`
+    /// (see [`build_child_env`]'s precedence doc comment). Populated by
+    /// `daemon::up_foreground` from [`crate::enroll::NodeConfig::agent_env`]
+    /// plus any configured [`crate::secret_store`] provider secret.
+    pub node_env: BTreeMap<String, String>,
 }
 
 impl Default for AcpRuntime {
@@ -101,6 +117,7 @@ impl Default for AcpRuntime {
         Self {
             harness_command: "buzz-acp".into(),
             harness_args: Vec::new(),
+            node_env: BTreeMap::new(),
         }
     }
 }
@@ -155,7 +172,7 @@ impl AgentRuntime for AcpRuntime {
         // after — this cannot scrub the `Command`'s internal copy or the
         // OS's copy of the child's environment block, but it does close the
         // window where our own transient `String` sits in memory unscrubbed.
-        for (k, mut v) in build_child_env(&desired.secret, relay_url) {
+        for (k, mut v) in build_child_env(&desired.secret, relay_url, &self.node_env) {
             cmd.env(&k, v.as_str());
             v.zeroize();
         }
@@ -219,9 +236,10 @@ mod tests {
 
     #[test]
     fn env_builder_sets_identity_and_strips_reserved_user_keys() {
-        let env: BTreeMap<String, String> = build_child_env(&secret(), "wss://relay.example")
-            .into_iter()
-            .collect();
+        let env: BTreeMap<String, String> =
+            build_child_env(&secret(), "wss://relay.example", &BTreeMap::new())
+                .into_iter()
+                .collect();
         assert_eq!(env["BUZZ_PRIVATE_KEY"], "nsec1exampleexampleexample");
         assert_eq!(env["BUZZ_RELAY_URL"], "wss://relay.example");
         assert_eq!(env["NOSTR_PRIVATE_KEY"], "nsec1exampleexampleexample");
@@ -234,12 +252,49 @@ mod tests {
         assert_ne!(env["BUZZ_PRIVATE_KEY"], "attacker");
     }
 
+    #[test]
+    fn env_builder_injects_node_env_as_a_base_layer() {
+        let node_env = BTreeMap::from([("NODE_DEFAULT".to_string(), "from-node".to_string())]);
+        let env: BTreeMap<String, String> =
+            build_child_env(&secret(), "wss://relay.example", &node_env)
+                .into_iter()
+                .collect();
+        assert_eq!(env["NODE_DEFAULT"], "from-node");
+    }
+
+    #[test]
+    fn env_builder_launch_env_overrides_a_same_key_node_env_entry() {
+        // `secret()`'s `launch.env` sets GOOSE_MODEL="sonnet" -- a node_env
+        // entry for the same key must lose to it (node_env is the lowest
+        // layer).
+        let node_env = BTreeMap::from([("GOOSE_MODEL".to_string(), "node-default".to_string())]);
+        let env: BTreeMap<String, String> =
+            build_child_env(&secret(), "wss://relay.example", &node_env)
+                .into_iter()
+                .collect();
+        assert_eq!(env["GOOSE_MODEL"], "sonnet");
+    }
+
+    #[test]
+    fn env_builder_drops_a_reserved_key_from_node_env_so_identity_still_wins() {
+        let node_env = BTreeMap::from([(
+            "BUZZ_PRIVATE_KEY".to_string(),
+            "node-supplied-attacker".to_string(),
+        )]);
+        let env: BTreeMap<String, String> =
+            build_child_env(&secret(), "wss://relay.example", &node_env)
+                .into_iter()
+                .collect();
+        assert_eq!(env["BUZZ_PRIVATE_KEY"], "nsec1exampleexampleexample");
+    }
+
     #[tokio::test]
     async fn acp_runtime_spawns_a_child_in_workspace() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = AcpRuntime {
             harness_command: "/bin/sh".into(),
             harness_args: vec!["-c".into(), "sleep 5".into()],
+            node_env: BTreeMap::new(),
         };
         let (agent, node, owner) = (Keys::generate(), Keys::generate(), Keys::generate());
         let desired =
@@ -280,6 +335,7 @@ mod tests {
         let rt = AcpRuntime {
             harness_command: "/bin/sh".into(),
             harness_args: vec!["-c".into(), "sleep 5".into()],
+            node_env: BTreeMap::new(),
         };
         let (agent, node, owner) = (Keys::generate(), Keys::generate(), Keys::generate());
         let desired =

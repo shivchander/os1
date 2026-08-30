@@ -1057,6 +1057,7 @@ mod tests {
         std::sync::Arc::new(crate::runtime::AcpRuntime {
             harness_command: "/bin/sh".into(),
             harness_args: vec!["-c".into(), "sleep 30".into()],
+            node_env: std::collections::BTreeMap::new(),
         })
     }
 

@@ -23,6 +23,9 @@ use buzz_node::model::NodeError;
 use buzz_node::nostr_relay::NostrNodeRelay;
 use buzz_node::relay::NodeRelay;
 use buzz_node::runtime::AcpRuntime;
+use buzz_node::secret_store::{
+    provider_env_var, provider_secret_key, resolve_provider_secret_store,
+};
 use buzz_node::substrate::{LocalProcessSubstrate, Substrate};
 use nostr::PublicKey;
 
@@ -299,8 +302,29 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
     let owner_pubkey = PublicKey::from_hex(&cfg.owner_pubkey)
         .map_err(|e| NodeError::Config(format!("stored owner_pubkey is invalid: {e}")))?;
 
+    // Base env layer injected into EVERY agent harness this node spawns:
+    // this node's own non-secret `agent_env` defaults, plus (for each
+    // provider this node has a stored key for) that provider's API key --
+    // so an agent still gets a usable environment even when its own
+    // per-agent assignment carries no credentials. See
+    // `runtime::build_child_env`'s precedence doc comment for how this
+    // layers under the per-agent launch/env_vars.
+    let mut node_env = cfg.agent_env.clone();
+    let provider_store = resolve_provider_secret_store()?;
+    for provider in &cfg.providers {
+        if let Some(var) = provider_env_var(provider) {
+            if let Some(secret) = provider_store.get(&provider_secret_key(provider))? {
+                node_env.entry(var.to_string()).or_insert(secret);
+            }
+        }
+    }
+
     let substrate: Arc<dyn Substrate> = Arc::new(LocalProcessSubstrate::new(
-        Arc::new(AcpRuntime::default()),
+        Arc::new(AcpRuntime {
+            harness_command: "buzz-acp".into(),
+            harness_args: Vec::new(),
+            node_env,
+        }),
         cfg.relay_url.clone(),
         cfg.workspace_root.clone(),
     ));
@@ -309,6 +333,22 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
         node_keys.clone(),
         owner_pubkey,
     ));
+    // Re-announce this node's capabilities on every `up`, not only at `enroll`
+    // time. NODE_ANNOUNCE (kind 39500) is what the desktop "Run on node" picker
+    // and node roster read; without re-announcing, a node that restarts — or
+    // whose relay store was reset — keeps publishing presence but never
+    // reappears as an assignable node. Enqueued here; flushed on the same
+    // connection by the engine's startup presence publish.
+    let caps = buzz_core::NodeCapabilities {
+        format: buzz_core::node::FORMAT.into(),
+        version: buzz_core::node::VERSION,
+        node_pubkey: node_keys.public_key().to_hex(),
+        os: std::env::consts::OS.to_string(),
+        runtimes: vec!["acp".to_string()],
+        workspace_root: cfg.workspace_root.to_string_lossy().into_owned(),
+        max_agents: None,
+    };
+    relay_for_engine.publish_announce(&caps).await?;
     // A second, independent connection used only for the final, AWAITED
     // offline-presence publish on shutdown — see `run_until_shutdown`'s doc
     // comment: `engine::run` no longer attempts this on its own at all, so
@@ -453,6 +493,7 @@ mod tests {
             relay_url: "wss://r".into(),
             workspace_root: "/tmp/x".into(),
             providers: Vec::new(),
+            agent_env: Default::default(),
         }
     }
 

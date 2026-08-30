@@ -10,10 +10,17 @@
 //! config carries only the provider name (see [`provider_secret_key`]); the
 //! key value lives here, never on disk.
 //!
-//! v1 LIMITATION: this module only provides the store + the name/key
-//! mapping. Nothing yet reads a configured provider's secret back out at
-//! agent-spawn time — that consumption (e.g. threading it into
-//! `runtime::build_child_env`'s injected environment) is follow-on work.
+//! [`resolve_provider_secret_store`] chooses the concrete backend
+//! (OS keychain, or a `0600` [`FileProviderSecretStore`] on headless
+//! nodes — mirrors [`crate::enroll::resolve_secret_store`]'s exact
+//! selection logic), and [`provider_env_var`] maps a provider name to the
+//! environment variable an agent harness expects it under.
+//! `daemon::up_foreground` is the consumer: it resolves each name in
+//! [`crate::enroll::NodeConfig::providers`] back out to its stored secret
+//! and folds it into the ACP runtime's `node_env` base layer
+//! (`runtime::build_child_env`'s injected environment).
+use std::path::PathBuf;
+
 use crate::model::NodeError;
 
 /// Default keychain service namespace for provider secrets — distinct from
@@ -124,6 +131,129 @@ impl ProviderSecretStore for MemorySecretStore {
     }
 }
 
+/// A `0600`-file-backed [`ProviderSecretStore`] for headless nodes with no
+/// OS secret-service, mirroring [`crate::enroll::FileStore`]'s on-disk
+/// posture exactly: each secret is one file, mode `0600`, inside a `0700`
+/// directory. Uses the same filename sanitization
+/// ([`crate::enroll::file_key_name`]) so a provider secret key (e.g.
+/// `"provider:anthropic"`) can never escape the store directory.
+pub struct FileProviderSecretStore {
+    dir: PathBuf,
+}
+
+impl FileProviderSecretStore {
+    /// Store secrets as `0600` files under `dir`. Explicit-dir constructor
+    /// (mirrors [`crate::enroll::FileStore::new`]) so tests can point this
+    /// at a tempdir instead of the real node home directory.
+    pub fn in_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// Store secrets under this node's default provider-secrets directory:
+    /// `<node_home_dir>/provider-secrets`.
+    pub fn new() -> Result<Self, NodeError> {
+        Ok(Self::in_dir(default_provider_secrets_dir()?))
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        self.dir.join(crate::enroll::file_key_name(key))
+    }
+}
+
+impl ProviderSecretStore for FileProviderSecretStore {
+    fn set(&self, key: &str, value: &str) -> Result<(), NodeError> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| NodeError::Secret(format!("create provider secret dir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: keep the secrets directory owner-only.
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = self.path_for(key);
+        std::fs::write(&path, value)
+            .map_err(|e| NodeError::Secret(format!("write provider secret file {key}: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| NodeError::Secret(format!("chmod provider secret file {key}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, NodeError> {
+        match std::fs::read_to_string(self.path_for(key)) {
+            Ok(v) => Ok(Some(v.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(NodeError::Secret(format!(
+                "read provider secret file {key}: {e}"
+            ))),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), NodeError> {
+        match std::fs::remove_file(self.path_for(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(NodeError::Secret(format!(
+                "delete provider secret file {key}: {e}"
+            ))),
+        }
+    }
+}
+
+/// Directory (under [`crate::enroll::node_home_dir`]) for the file-backed
+/// provider-secret store. Mirrors `enroll::file_keystore_dir`.
+fn default_provider_secrets_dir() -> Result<PathBuf, NodeError> {
+    Ok(crate::enroll::node_home_dir()?.join("provider-secrets"))
+}
+
+/// Canary key used only to probe keychain availability in
+/// [`resolve_provider_secret_store`] (mirrors
+/// [`crate::enroll::resolve_secret_store`]'s probe against its own
+/// `NODE_KEY_ENTRY`) — the exact key name is arbitrary, since `Ok(None)`
+/// already proves the backend itself is reachable; only `Err` means
+/// unavailable.
+const KEYCHAIN_PROBE_KEY: &str = "keychain-probe";
+
+/// Choose the node's [`ProviderSecretStore`]. Mirrors
+/// [`crate::enroll::resolve_secret_store`]'s exact selection logic: the OS
+/// keychain ([`KeychainSecretStore`]) is the preferred default, but this
+/// transparently falls back to a `0600` [`FileProviderSecretStore`] under
+/// `~/.buzz-node/provider-secrets` when either (a)
+/// [`crate::enroll::FILE_KEYSTORE_ENV`] is set, or (b) a probe of the
+/// keychain fails (e.g. the "not activatable" DBus error on a headless
+/// Linux box).
+pub fn resolve_provider_secret_store() -> Result<Box<dyn ProviderSecretStore>, NodeError> {
+    if std::env::var_os(crate::enroll::FILE_KEYSTORE_ENV).is_some() {
+        return Ok(Box::new(FileProviderSecretStore::new()?));
+    }
+    let keychain = KeychainSecretStore::default();
+    match keychain.get(KEYCHAIN_PROBE_KEY) {
+        Ok(_) => Ok(Box::new(keychain)),
+        Err(e) => {
+            let dir = default_provider_secrets_dir()?;
+            eprintln!(
+                "buzz-node: OS keychain unavailable ({e}); falling back to 0600 file provider-secret store at {}",
+                dir.display()
+            );
+            Ok(Box::new(FileProviderSecretStore::in_dir(dir)))
+        }
+    }
+}
+
+/// Map a provider name (case-insensitive) to the environment variable an
+/// agent harness expects its API key under. `None` for an unrecognized
+/// provider — callers should skip injection rather than guess a name.
+pub fn provider_env_var(provider: &str) -> Option<&'static str> {
+    match provider.to_ascii_lowercase().as_str() {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +319,65 @@ mod tests {
         let key = provider_secret_key(&cfg.providers[0]);
         store.set(&key, "sk-live-secret").unwrap();
         assert_eq!(store.get(&key).unwrap().as_deref(), Some("sk-live-secret"));
+    }
+
+    // --- provider_env_var ---
+
+    #[test]
+    fn provider_env_var_maps_known_providers_case_insensitively() {
+        assert_eq!(provider_env_var("openai"), Some("OPENAI_API_KEY"));
+        assert_eq!(provider_env_var("OpenAI"), Some("OPENAI_API_KEY"));
+        assert_eq!(provider_env_var("OPENAI"), Some("OPENAI_API_KEY"));
+        assert_eq!(provider_env_var("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(provider_env_var("Anthropic"), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn provider_env_var_is_none_for_an_unrecognized_provider() {
+        assert_eq!(provider_env_var("someothervendor"), None);
+    }
+
+    // --- FileProviderSecretStore (headless fallback — tempdir, no real keychain/home) ---
+
+    #[test]
+    fn file_provider_secret_store_round_trips_missing_returns_none_and_is_owner_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileProviderSecretStore::in_dir(dir.path().join("provider-secrets"));
+        let key = provider_secret_key("anthropic");
+
+        assert_eq!(store.get(&key).expect("get"), None);
+        store.set(&key, "sk-live-secret").expect("set");
+        assert_eq!(
+            store.get(&key).expect("get").as_deref(),
+            Some("sk-live-secret")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(
+                dir.path()
+                    .join("provider-secrets")
+                    .join(crate::enroll::file_key_name(&key)),
+            )
+            .expect("metadata")
+            .permissions()
+            .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn file_provider_secret_store_delete_is_idempotent_and_removes_the_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileProviderSecretStore::in_dir(dir.path().join("provider-secrets"));
+        let key = provider_secret_key("openai");
+
+        store.set(&key, "sk-live-secret").expect("set");
+        store.delete(&key).expect("delete");
+        assert_eq!(store.get(&key).expect("get"), None);
+
+        // Idempotent: deleting an already-absent secret must not error.
+        store.delete(&key).expect("delete again");
     }
 }

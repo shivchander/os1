@@ -97,7 +97,10 @@ async fn main() {
             // codex-acp is the ACP adapter that wraps the codex CLI (npm i -g
             // @agentclientprotocol/codex-acp). buzz-acp's normalize_agent_args
             // strips the legacy "acp" default arg for codex-acp, so command alone suffices.
-            env.insert("BUZZ_ACP_AGENT_COMMAND".to_string(), "codex-acp".to_string());
+            env.insert(
+                "BUZZ_ACP_AGENT_COMMAND".to_string(),
+                "codex-acp".to_string(),
+            );
             env.insert("OPENAI_API_KEY".to_string(), openai);
             // codex-acp only consumes OPENAI_API_KEY once the api-key auth
             // method is selected, and buzz-acp never issues an ACP

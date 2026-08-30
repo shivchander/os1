@@ -42,14 +42,23 @@ pub struct NodeConfig {
     /// key from the name), never here. `#[serde(default)]` so a config
     /// persisted before this field existed still loads.
     ///
-    /// v1 LIMITATION: recording a name here does not yet make the
-    /// corresponding secret available to a running agent — nothing reads
-    /// `providers` back out at spawn time (e.g. into
-    /// `runtime::build_child_env`'s injected environment). That wiring is
-    /// follow-on work; today this field only proves the on-disk config can
-    /// name a provider without ever carrying its secret value.
+    /// Consumed at spawn time by `daemon::up_foreground`, which resolves
+    /// each name here back out to its stored secret (via
+    /// [`crate::secret_store::resolve_provider_secret_store`] and
+    /// [`crate::secret_store::provider_env_var`]) and folds it into the ACP
+    /// runtime's `node_env` base layer — see `runtime::build_child_env`'s
+    /// precedence doc comment.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// Non-secret environment defaults merged into every agent harness this
+    /// node spawns, beneath any per-agent `launch`/`env_vars` override (see
+    /// `runtime::build_child_env`'s `node_env` parameter and precedence doc
+    /// comment) — e.g. a default model name. Provider API keys do NOT
+    /// belong here: see `providers` above and
+    /// [`crate::secret_store::ProviderSecretStore`]. `#[serde(default)]` so
+    /// a config persisted before this field existed still loads.
+    #[serde(default)]
+    pub agent_env: std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -65,6 +74,7 @@ impl NodeConfig {
             relay_url: "wss://r".into(),
             workspace_root: "/tmp/x".into(),
             providers: vec![provider.to_string()],
+            agent_env: Default::default(),
         }
     }
 }
@@ -134,8 +144,10 @@ impl SecretStore for KeychainStore {
 }
 
 /// Filename-safe rendering of a secret key for [`FileStore`] (keys like
-/// `"provider:anthropic"` must not escape the store directory).
-fn file_key_name(key: &str) -> String {
+/// `"provider:anthropic"` must not escape the store directory). `pub(crate)`
+/// so [`crate::secret_store::FileProviderSecretStore`] can reuse the exact
+/// same sanitization instead of duplicating it.
+pub(crate) fn file_key_name(key: &str) -> String {
     key.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
@@ -488,6 +500,7 @@ pub async fn enroll(
         relay_url: relay_url.to_string(),
         workspace_root: PathBuf::from(&caps.workspace_root),
         providers: Vec::new(),
+        agent_env: Default::default(),
     };
     save_node_config(&cfg)?;
     Ok(cfg)
@@ -523,6 +536,7 @@ mod tests {
             relay_url: "wss://r".into(),
             workspace_root: "/tmp/x".into(),
             providers: Vec::new(),
+            agent_env: Default::default(),
         }
     }
 

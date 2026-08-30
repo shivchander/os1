@@ -84,6 +84,7 @@ pub fn start_node(
     let stub_runtime = AcpRuntime {
         harness_command: stub_agent_path().to_string_lossy().into_owned(),
         harness_args: Vec::new(),
+        node_env: std::collections::BTreeMap::new(),
     };
     let substrate: Arc<dyn Substrate> = Arc::new(LocalProcessSubstrate::new(
         Arc::new(stub_runtime),

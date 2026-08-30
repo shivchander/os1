@@ -18,7 +18,23 @@ use crate::model::{DesiredAgent, NodeError};
 /// shared reference at once.
 #[async_trait]
 pub trait NodeRelay: Send + Sync {
-    /// Await the next desired-state snapshot for this node. `None` = shut down.
+    /// Await the next desired-state snapshot for this node.
+    ///
+    /// `None` means this stream has ended. There is currently no
+    /// intentional, in-band way for an implementation to request a graceful
+    /// stop through this trait — a real shutdown is handled entirely
+    /// externally, by racing [`crate::engine::run`]'s future against an OS
+    /// signal (`buzz-node`'s `daemon::run_until_shutdown`), which *drops*
+    /// the losing `run()` future rather than letting it observe anything.
+    /// So [`crate::engine::run`] treats `None` here (or from
+    /// [`Self::next_status`]) as an unplanned termination of the
+    /// underlying connection — for [`crate::nostr_relay::NostrNodeRelay`]
+    /// this means its connection-owning actor task died — and returns
+    /// `Err` rather than a clean `Ok(())`, so `daemon::dispatch` exits
+    /// non-zero and OS process supervision (systemd `Restart=on-failure`,
+    /// launchd `KeepAlive`) restarts the daemon instead of a dead relay
+    /// connection silently ending every managed agent's supervision under
+    /// an exit code indistinguishable from a deliberate `buzz-node stop`.
     async fn next_desired(&self) -> Option<Vec<DesiredAgent>>;
     /// Fetch a fresh snapshot of this node's desired agents directly from
     /// the relay, bypassing the live tail. Used by
@@ -31,6 +47,9 @@ pub trait NodeRelay: Send + Sync {
     /// (including this one). Feeds
     /// [`crate::move_gate::PeerStatusView`] so a spawn can defer while a
     /// different node still reports the same agent alive (spec I4).
+    ///
+    /// `None` carries the same "this stream ended unexpectedly" meaning as
+    /// [`Self::next_desired`]'s — see its doc comment.
     ///
     /// Implementations MUST authenticate each event with
     /// [`buzz_core::node_status::validate_status`] (or equivalent —
@@ -169,7 +188,11 @@ pub struct FakeRelay {
 impl FakeRelay {
     /// Build a fake relay from a script of desired-sets. Returns the relay and a
     /// reader handle to its published-event logs. `next_desired` returns
-    /// `None` once `script` is exhausted, ending [`crate::engine::run`]'s loop.
+    /// `None` once `script` is exhausted, which now makes
+    /// [`crate::engine::run`] return `Err` (an unplanned stream-end, per
+    /// [`NodeRelay::next_desired`]'s doc comment) rather than `Ok(())` —
+    /// tests that just want `run()` to finish successfully after a scripted
+    /// sequence should still expect that `Err`, not treat it as a bug.
     pub fn new(script: Vec<Vec<DesiredAgent>>) -> (Self, FakeRelayHandle) {
         Self::build(script, false)
     }

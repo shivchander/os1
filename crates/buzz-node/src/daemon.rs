@@ -198,10 +198,15 @@ async fn wait_for_shutdown_signal() {
 /// `final_publish` always runs, regardless of *why* the race ended
 /// (shutdown signal, the engine returning `Ok`, or the engine returning
 /// `Err`): the "clean shutdown ⇒ offline presence delivered" guarantee must
-/// hold on every exit path, not just the happy one. Against a real
-/// [`NostrNodeRelay`], `final_publish` should be
-/// [`NostrNodeRelay::publish_presence_awaited`] — unlike `engine::run`'s own
-/// end-of-loop `publish_presence(false)` (fire-and-forget; see
+/// hold on every exit path, not just the happy one — `engine::run` itself no
+/// longer attempts this at all (Phase 5 batch C2 fix round 1: its own
+/// end-of-loop publish was removed along with the `None`-from-the-relay
+/// `break`, since that path now always means an unplanned termination, not
+/// a graceful stop — see `NodeRelay::next_desired`'s doc comment), so this
+/// is the daemon's *only* "tell the relay we're offline" mechanism. Against
+/// a real [`NostrNodeRelay`], `final_publish` should be
+/// [`NostrNodeRelay::publish_presence_awaited`] on an independent
+/// connection: unlike a fire-and-forget publish (see
 /// `NostrNodeRelay::spawn_publish`), this variant blocks until the relay
 /// actually accepts the event, so it isn't dropped when the process exits
 /// right behind it.
@@ -306,8 +311,11 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
     ));
     // A second, independent connection used only for the final, AWAITED
     // offline-presence publish on shutdown — see `run_until_shutdown`'s doc
-    // comment for why `engine::run`'s own fire-and-forget end-of-loop
-    // publish can't be relied on for this.
+    // comment: `engine::run` no longer attempts this on its own at all, so
+    // this is the sole "tell the relay we're offline" mechanism, and it
+    // must be an independent connection/awaited publish rather than
+    // whatever `relay_for_engine`'s own (possibly already-dead) connection
+    // could still manage.
     let shutdown_relay =
         NostrNodeRelay::new(cfg.relay_url.clone(), node_keys.clone(), owner_pubkey);
 

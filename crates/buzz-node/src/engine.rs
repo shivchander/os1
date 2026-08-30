@@ -65,7 +65,13 @@ struct LoopState {
     last_probe_result: HashMap<PublicKey, bool>,
 }
 
-/// Run the node engine until the relay's desired-state stream ends (`None`).
+/// Run the node engine until either of the relay's live streams ends
+/// (`None`) — which returns `Err` (Phase 5 batch C2 fix round 1), not a
+/// clean `Ok(())` — or the process is asked to stop through some other
+/// means entirely external to this function (see
+/// [`NodeRelay::next_desired`]'s doc comment: a real, intentional shutdown
+/// never lets `run()` return at all — the caller races this future against
+/// an OS signal and drops it if the signal wins).
 pub async fn run(
     substrate: Arc<dyn Substrate>,
     relay: Box<dyn NodeRelay>,
@@ -113,10 +119,10 @@ pub async fn run(
         tokio::select! {
             maybe = relay.next_desired() => match maybe {
                 Some(desired) => current = desired,
-                None => break,
+                None => return Err(relay_stream_ended_unexpectedly()),
             },
-            maybe_status = relay.next_status() => {
-                if let Some(s) = maybe_status {
+            maybe_status = relay.next_status() => match maybe_status {
+                Some(s) => {
                     if status_view.record(&s).is_err() {
                         tracing::warn!(
                             agent_pubkey = %s.agent_pubkey,
@@ -125,7 +131,8 @@ pub async fn run(
                         );
                     }
                 }
-            }
+                None => return Err(relay_stream_ended_unexpectedly()),
+            },
             _ = ticker.tick() => {}
             _ = presence_ticker.tick() => {
                 // A heartbeat, not a reconcile trigger: refresh the relay's
@@ -146,9 +153,30 @@ pub async fn run(
         )
         .await?;
     }
+    // Unreachable: the loop above only ever exits via `return` (the two
+    // `relay_stream_ended_unexpectedly()` cases above, or a propagated `?`
+    // error) — never a `break` — so its type is `!`, coercing to this
+    // function's `Result<(), NodeError>`. There is deliberately no trailing
+    // "publish offline, then return `Ok(())`" here anymore (Phase 5 batch C2
+    // fix round 1): that path only ever fired for a `FakeRelay` test's
+    // finite script running out, never in production (a real
+    // [`NostrNodeRelay`]'s streams don't end on their own, and an actual OS
+    // shutdown signal never lets this future return at all — see
+    // `NodeRelay::next_desired`'s doc comment). The daemon's own
+    // `run_until_shutdown`/`final_publish` — via an independent connection,
+    // and actually awaited rather than fire-and-forget — is what now owns
+    // "tell the relay we're offline" on every exit path, not this function.
+}
 
-    relay.publish_presence(false).await?;
-    Ok(())
+/// The relay's live streams ending — see [`NodeRelay::next_desired`]'s doc
+/// comment for the full contract this implements. A tiny helper so the two
+/// call sites above (`next_desired`/`next_status`) can't drift onto
+/// different wording for the same condition.
+fn relay_stream_ended_unexpectedly() -> NodeError {
+    NodeError::Relay(
+        "relay stream ended without a shutdown signal — the connection-owning actor likely terminated"
+            .into(),
+    )
 }
 
 /// Rebuild `current` from a fresh relay snapshot and immediately reconcile
@@ -412,14 +440,36 @@ mod tests {
         }
     }
 
+    /// Run to completion against a `relay` whose live streams will
+    /// naturally end (a non-hanging `FakeRelay`'s finite script running
+    /// out), asserting the resulting `Err` rather than treating it as a
+    /// bug. Phase 5 batch C2 fix round 1: `run()` now returns `Err` for any
+    /// unplanned stream-end — see its doc comment — so every test in this
+    /// file that only used a finite script as a mechanism to let the loop
+    /// finish (not to test shutdown semantics itself) goes through this
+    /// helper instead of repeating the same assertion at each call site.
+    /// Every side effect the script drove (spawns, published statuses,
+    /// startup presence) has already happened by the time this returns —
+    /// only the old "reached the end gracefully" expectation is gone.
+    async fn run_to_stream_end(
+        substrate: Arc<dyn Substrate>,
+        relay: Box<dyn NodeRelay>,
+        node_keys: Keys,
+        cfg: EngineConfig,
+    ) {
+        let result = run(substrate, relay, node_keys, cfg).await;
+        assert!(
+            result.is_err(),
+            "a relay stream ending without a shutdown signal must be an error, not Ok(())"
+        );
+    }
+
     #[tokio::test]
     async fn assign_starts_agent_and_reports_running() {
         let (a, n, o) = (Keys::generate(), Keys::generate(), Keys::generate());
         let substrate = Arc::new(FakeSubstrate::new());
         let (relay, handle) = FakeRelay::new(vec![vec![fake_desired(&a, &n, &o, Assigned)]]);
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         assert_eq!(*substrate.starts.lock().unwrap(), vec![a.public_key()]);
         assert_eq!(
@@ -432,21 +482,15 @@ mod tests {
                 && s.node_pubkey == n.public_key().to_hex()
                 && s.health == AgentHealth::Running
         }));
-        // Shape, not exact equality: a healthy engine now re-publishes online
-        // presence on a heartbeat cadence (see `presence_heartbeat_republishes_online_on_cadence`
-        // below), so the log may carry extra `true`s beyond the one at
-        // startup — only the first (startup) and last (shutdown) entries are
-        // guaranteed.
-        let presence = handle.presence.lock().unwrap().clone();
+        // `run()` no longer publishes a final `false` on this path (that job
+        // now belongs entirely to the daemon's own `run_until_shutdown` /
+        // `final_publish`, over an independent connection — see
+        // `engine::run`'s doc comment) — only the startup `true` is
+        // guaranteed here.
         assert_eq!(
-            presence.first(),
+            handle.presence.lock().unwrap().first(),
             Some(&true),
             "must announce online at startup"
-        );
-        assert_eq!(
-            presence.last(),
-            Some(&false),
-            "must announce offline at shutdown"
         );
     }
 
@@ -456,9 +500,7 @@ mod tests {
         let substrate = Arc::new(FakeSubstrate::new());
         substrate.set(a.public_key(), Observed::Running);
         let (relay, handle) = FakeRelay::new(vec![vec![fake_desired(&a, &n, &o, Unassigned)]]);
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         assert_eq!(*substrate.stops.lock().unwrap(), vec![a.public_key()]);
         assert_eq!(
@@ -482,9 +524,7 @@ mod tests {
         let substrate = Arc::new(FakeSubstrate::new());
         substrate.set(a.public_key(), Observed::Crashed { code: Some(1) });
         let (relay, _handle) = FakeRelay::new(vec![vec![fake_desired(&a, &n, &o, Assigned)]]);
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         assert!(substrate.stops.lock().unwrap().contains(&a.public_key()));
         assert_eq!(*substrate.starts.lock().unwrap(), vec![a.public_key()]);
@@ -780,14 +820,13 @@ mod tests {
             vec![fake_desired(&agent, &node_m, &owner, Assigned)],
             vec![fake_desired(&agent, &node_m, &owner, Assigned)],
         ]);
-        run(
+        run_to_stream_end(
             substrate.clone(),
             Box::new(relay),
             node_m.clone(),
             cfg(&node_m),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(
             substrate
@@ -814,14 +853,13 @@ mod tests {
             vec![fake_desired(&agent, &node_m, &owner, Assigned)],
             vec![],
         ]);
-        run(
+        run_to_stream_end(
             substrate.clone(),
             Box::new(relay),
             node_m.clone(),
             cfg(&node_m),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(*substrate.stops.lock().unwrap(), vec![agent.public_key()]);
     }
@@ -837,9 +875,7 @@ mod tests {
         let (relay, handle) = FakeRelay::new(vec![]);
         handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
 
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         let statuses = handle.statuses.lock().unwrap();
         let s = statuses
@@ -858,9 +894,7 @@ mod tests {
         let (relay, handle) = FakeRelay::new(vec![]);
         handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
 
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         assert_eq!(
             *substrate.probes.lock().unwrap(),
@@ -892,9 +926,7 @@ mod tests {
             vec![fake_desired(&a, &n, &o, Assigned)],
         ]);
 
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         let statuses: Vec<_> = handle
             .statuses
@@ -939,9 +971,7 @@ mod tests {
         let (relay, handle) = FakeRelay::new(vec![]);
         handle.set_snapshot(vec![fake_desired(&a, &n, &o, Assigned)]);
 
-        run(substrate.clone(), Box::new(relay), n.clone(), cfg(&n))
-            .await
-            .unwrap();
+        run_to_stream_end(substrate.clone(), Box::new(relay), n.clone(), cfg(&n)).await;
 
         assert!(
             substrate.starts.lock().unwrap().is_empty(),
@@ -1110,5 +1140,41 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    // --- Phase 5 batch C2 fix round 1: unplanned relay termination must be
+    // fail-loud (Err), not a clean Ok(()) indistinguishable from a
+    // deliberate shutdown ---
+
+    /// The core regression this fix round closes. Before it, `next_desired`
+    /// returning `None` (exactly what a real `NostrNodeRelay` yields if its
+    /// connection-owning actor task ever dies — see
+    /// `crate::nostr_relay::run_actor`) made `run()` return a clean
+    /// `Ok(())`, identical at the process-exit-code level
+    /// (`daemon::dispatch`) to a deliberate `buzz-node stop`. That silently
+    /// defeats OS process supervision (systemd `Restart=on-failure`,
+    /// launchd `KeepAlive`): a dead relay connection would take down every
+    /// agent this node manages with no restart and no way to tell it apart
+    /// from an intentional stop in logs or exit code. `run()` must now
+    /// return `Err` instead — this test drives that with a plain,
+    /// immediately-exhausted `FakeRelay` (no shutdown signal exists at this
+    /// layer at all; a *real* deliberate shutdown is handled entirely
+    /// externally by racing this future against an OS signal and dropping
+    /// it if the signal wins — see `NodeRelay::next_desired`'s doc comment
+    /// — so this future reaching its own end on its own is always exactly
+    /// this scenario, real relay or fake).
+    #[tokio::test]
+    async fn relay_stream_ending_without_a_shutdown_signal_is_an_error_not_ok() {
+        let n = Keys::generate();
+        let substrate = Arc::new(FakeSubstrate::new());
+        let (relay, _handle) = FakeRelay::new(vec![]);
+
+        let result = run(substrate, Box::new(relay), n.clone(), cfg(&n)).await;
+
+        assert!(
+            result.is_err(),
+            "an unplanned relay stream end must return Err so the daemon exits non-zero \
+             and OS process supervision restarts it"
+        );
     }
 }

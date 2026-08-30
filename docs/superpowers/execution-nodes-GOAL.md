@@ -33,9 +33,22 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
-- [~] Phase 5 — presence-cadence + Batch A + Batch B + C1 + **C2 (real next_status subscription via a background connection-actor: cross-node moves fire on peer-Stopped not just the 30s timeout; actor-death is now fail-loud → non-zero exit → OS supervision restarts; folded observe() getpgid) DONE + reviewed + pushed**. Remaining — C3: two-node e2e #[ignore] (assign→move→kill single-live-instance proof; needs a live relay). Deferred (non-blocking): AcpRuntime real probe RPC (buzz-acp control channel); provider-secret retrieval at spawn (build_child_env); actor-leak-on-NostrNodeRelay-drop (unreachable in the current single-instance-per-process lifecycle)
+- [x] Phase 5 — presence-cadence + Batch A (safe bounded moves + startup/reconnect resync + LWW one-live-instance) + Batch B (smoke-probe health/breaker vocab + at-rest provider secrets) + C1 (process adoption; agents survive graceful daemon restart) + C2 (real peer-status subscription via a background connection-actor → cross-node moves fire on peer-Stopped; actor-death fail-loud → OS restarts) + C3 (two-node #[ignore] e2e proving I4, with the double-run detector unit-tested in the default suite) — ALL DONE + reviewed + pushed. **PHASE 5 COMPLETE.** Deferred (non-blocking): desktop assignment empty launch.env; provider-secret retrieval at spawn (build_child_env); AcpRuntime real probe RPC (buzz-acp control channel); actor-leak-on-NostrNodeRelay-drop (unreachable today); launch.command dead in buzz-node vs honored in buzz-backend-kubernetes
 
 ## Running log (loop updates this — newest first)
+- 2026-08-30 (Phase 5 C3 ✅ → EXECUTION-NODES FEATURE COMPLETE): the two-node #[ignore] e2e (enroll →
+  assign → move → kill, proving the single-live-instance invariant over a real relay) landed, with its
+  double-run detector extracted, seeded with the known prior-alive node, and unit-tested in the DEFAULT
+  suite (9 tests) so the invariant is CI-guarded rather than only exercised by the manual live test.
+  Reviewed clean. **All 5 phases of the execution-nodes subsystem are implemented, adversarially
+  reviewed, and pushed to spec/execution-nodes.** End-to-end capability: create an agent in the desktop
+  app → pick "Run on: <node>" → it runs on that remote node → survives app quit AND a daemon restart
+  (detached daemon + PID-file process adoption) → safe bounded moves between nodes with a
+  one-live-instance guarantee (fast handoff via real peer-status) → active health/breaker classification
+  → provider keys encrypted at rest → separate work/personal communities. Green under `cargo test` +
+  desktop mock-bridge suite; the two-node e2e needs live infra to RUN (`just relay` +
+  BUZZ_TEST_RELAY_URL). Deferred non-blocking follow-ups tracked in the Phase-5 checklist line above.
+  Autonomous SDD loop stopping — feature done.
 - 2026-08-30 (Phase 5 C2 ✅ — cross-node moves are now fast): replaced NostrNodeRelay's per-call
   connection-locking with a single background actor that owns the one relay connection and multiplexes
   two live subscriptions (AGENT_ASSIGNMENT + AGENT_NODE_STATUS) into independent channels — so the move

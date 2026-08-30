@@ -123,7 +123,14 @@ async fn assign_move_and_kill_keeps_single_live_instance() {
         harness::collect_status(&mut owner_client, node_m.public_key(), MOVE_DEADLINE).await;
 
     assert!(
-        harness::never_two_running(&timeline),
+        // Seeded with `Some(node_n)`, not `None`: step 3 already confirmed
+        // N alive immediately before this timeline starts, and an unseeded
+        // `None` would miss a double-run whose very first captured event is
+        // M reporting alive with no prior value to conflict against -- see
+        // `harness::never_two_running`'s doc comment and its
+        // `seeding_with_none_when_a_prior_alive_node_is_known_misses_a_double_run`
+        // unit test.
+        harness::never_two_running(&timeline, Some(node_n.public_key())),
         "I4 violated: two nodes reported the agent alive with no intervening stop: {timeline:?}"
     );
     assert!(
@@ -148,6 +155,15 @@ async fn assign_move_and_kill_keeps_single_live_instance() {
     );
 
     // --- 5. Kill N's engine task; A must stay Running on M.
+    // This aborts only N's `engine::run` reconcile loop. `NostrNodeRelay`'s
+    // connection-owning actor is a separately `tokio::spawn`ed task (see
+    // `nostr_relay::ActorHandle::spawn`) that this does not reach: it keeps
+    // N's socket open and its own reconnect-forever loop alive for the rest
+    // of this test process (harmless here -- nothing reads its channels
+    // once the engine task is gone, and it publishes nothing on its own).
+    // This models an engine/reconcile-loop death, not a full node process
+    // death (which would also drop the TCP connection) -- the same
+    // engine-task-only abort `tests/e2e_node.rs` already uses.
     n.task.abort();
     harness::await_status(
         &mut owner_client,

@@ -281,18 +281,34 @@ pub fn saw(timeline: &[StatusEvent], node: PublicKey, health: AgentHealth) -> bo
         .any(|e| e.node == node && e.health == health)
 }
 
+/// True iff `health` counts as "the agent is alive" for I4 purposes --
+/// matches `move_gate::PeerStatusView::peer_blocks_spawn`'s own definition
+/// (`Starting`/`Running`).
+fn is_alive(health: AgentHealth) -> bool {
+    matches!(health, AgentHealth::Starting | AgentHealth::Running)
+}
+
 /// The I4 proof: true iff `timeline` never shows two distinct nodes both
-/// reporting the agent alive (`Starting`/`Running` -- the same "alive" test
-/// `move_gate::PeerStatusView::peer_blocks_spawn` uses) with no intervening
+/// reporting the agent alive (see [`is_alive`]) with no intervening
 /// non-alive report for the first. Tracks, at each point in the timeline,
-/// which single node (if any) is the "currently alive" one; a second,
-/// different node reporting itself alive while that's still set is a
-/// double-live-instance violation.
-pub fn never_two_running(timeline: &[StatusEvent]) -> bool {
-    fn is_alive(health: AgentHealth) -> bool {
-        matches!(health, AgentHealth::Starting | AgentHealth::Running)
-    }
-    let mut alive_node: Option<PublicKey> = None;
+/// which single node (if any) is the "currently alive" one, seeded from
+/// `initial_alive`; a second, different node reporting itself alive while
+/// that's still set is a double-live-instance violation.
+///
+/// `initial_alive` MUST be the node already confirmed alive immediately
+/// before `timeline`'s first event, when one is known -- pass `None` only
+/// when truly nothing about prior state is known yet (e.g. the very start
+/// of a fresh subscription). Seeding with `None` when a prior alive node
+/// IS already known is a real blind spot: the first event for a *second*
+/// node reporting itself alive would have no prior value to conflict
+/// against and would be silently accepted as the new baseline, so an
+/// out-of-order or too-fast double-spawn occurring before the first node's
+/// own next incidental status republish would go undetected. See
+/// `tests::seeding_with_none_when_a_prior_alive_node_is_known_misses_a_double_run`
+/// below for the exact false negative this guards against, and
+/// `tests::seeded_initial_alive_catches_an_immediate_double_run` for the fix.
+pub fn never_two_running(timeline: &[StatusEvent], initial_alive: Option<PublicKey>) -> bool {
+    let mut alive_node = initial_alive;
     for event in timeline {
         if is_alive(event.health) {
             if let Some(prev) = alive_node {
@@ -306,4 +322,137 @@ pub fn never_two_running(timeline: &[StatusEvent]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::Keys;
+
+    fn event(node: PublicKey, health: AgentHealth) -> StatusEvent {
+        StatusEvent { node, health }
+    }
+
+    #[test]
+    fn saw_finds_a_matching_entry() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![
+            event(n, AgentHealth::Running),
+            event(m, AgentHealth::Stopped),
+        ];
+        assert!(saw(&timeline, n, AgentHealth::Running));
+        assert!(saw(&timeline, m, AgentHealth::Stopped));
+    }
+
+    #[test]
+    fn saw_is_false_for_an_absent_node_health_pair() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![event(n, AgentHealth::Running)];
+        // Right node, wrong health, and wrong node, right health both miss.
+        assert!(!saw(&timeline, n, AgentHealth::Stopped));
+        assert!(!saw(&timeline, m, AgentHealth::Running));
+    }
+
+    #[test]
+    fn legit_handoff_is_not_a_violation_regardless_of_seed() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![
+            event(n, AgentHealth::Running),
+            event(n, AgentHealth::Stopped),
+            event(m, AgentHealth::Running),
+        ];
+        assert!(
+            never_two_running(&timeline, None),
+            "a clean stop-then-start handoff must never be flagged, unseeded"
+        );
+        assert!(
+            never_two_running(&timeline, Some(n)),
+            "a clean stop-then-start handoff must never be flagged, seeded with the prior alive node"
+        );
+    }
+
+    #[test]
+    fn concurrent_running_with_no_intervening_stop_is_a_violation() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![
+            event(n, AgentHealth::Running),
+            event(m, AgentHealth::Running),
+        ];
+        assert!(!never_two_running(&timeline, None));
+    }
+
+    #[test]
+    fn same_node_repeat_report_is_not_a_violation() {
+        let n = Keys::generate().public_key();
+        let timeline = vec![
+            event(n, AgentHealth::Running),
+            event(n, AgentHealth::Running),
+        ];
+        assert!(never_two_running(&timeline, None));
+    }
+
+    #[test]
+    fn an_unrelated_third_node_report_does_not_disturb_tracking() {
+        let (n, m, c) = (
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+        );
+        // C was never alive; its Stopped report must be a no-op, not
+        // something that clears or otherwise perturbs N's tracked state.
+        let timeline = vec![
+            event(n, AgentHealth::Running),
+            event(c, AgentHealth::Stopped),
+            event(n, AgentHealth::Stopped),
+            event(m, AgentHealth::Running),
+        ];
+        assert!(never_two_running(&timeline, None));
+    }
+
+    /// The exact false negative Important #1 (review round 1) identified:
+    /// seeding with `None` when a prior alive node IS already known means
+    /// the first event for a genuinely second live node has nothing to
+    /// conflict against, so it is wrongly accepted as the new baseline
+    /// instead of being flagged.
+    #[test]
+    fn seeding_with_none_when_a_prior_alive_node_is_known_misses_a_double_run() {
+        // `_n` stands in for the already-known-alive node (e.g. confirmed
+        // by an earlier, separate read) that this test deliberately does
+        // NOT pass as the seed -- that omission is exactly the blind spot
+        // being documented, so it is never referenced below.
+        let (_n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        // The timeline handed to `never_two_running` starts directly with M
+        // also reporting alive -- no intervening N-stop.
+        let timeline = vec![event(m, AgentHealth::Running)];
+        assert!(
+            never_two_running(&timeline, None),
+            "documents the blind spot: unseeded, this looks clean"
+        );
+    }
+
+    /// The fix for the above: seeding with the already-known prior alive
+    /// node catches the same timeline as a violation.
+    #[test]
+    fn seeded_initial_alive_catches_an_immediate_double_run() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![event(m, AgentHealth::Running)];
+        assert!(
+            !never_two_running(&timeline, Some(n)),
+            "seeded with the already-known alive node N, M reporting alive with no \
+             intervening N-stop must be flagged"
+        );
+    }
+
+    #[test]
+    fn starting_counts_as_alive_too() {
+        let (n, m) = (Keys::generate().public_key(), Keys::generate().public_key());
+        let timeline = vec![
+            event(n, AgentHealth::Starting),
+            event(m, AgentHealth::Running),
+        ];
+        assert!(
+            !never_two_running(&timeline, None),
+            "Starting must count as alive, matching move_gate::PeerStatusView"
+        );
+    }
 }

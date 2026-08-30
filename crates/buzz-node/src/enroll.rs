@@ -133,6 +133,108 @@ impl SecretStore for KeychainStore {
     }
 }
 
+/// Filename-safe rendering of a secret key for [`FileStore`] (keys like
+/// `"provider:anthropic"` must not escape the store directory).
+fn file_key_name(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A 0600-file-backed [`SecretStore`] for headless server nodes that have no
+/// OS secret-service (the primary "always-on box I own" deployment). Each
+/// secret is one file under `dir`, mode `0600`, inside a `0700` directory —
+/// the same on-disk posture as `~/.buzz-node/config.json` or an SSH private
+/// key. This deliberately relaxes [`KeychainStore`]'s "never on disk" rule
+/// for nodes where a keychain does not exist; on desktops the keychain stays
+/// the default (see [`resolve_secret_store`]).
+pub struct FileStore {
+    dir: PathBuf,
+}
+
+impl FileStore {
+    /// Store secrets as `0600` files under `dir`.
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        self.dir.join(file_key_name(key))
+    }
+}
+
+impl SecretStore for FileStore {
+    fn get(&self, key: &str) -> Result<Option<String>, NodeError> {
+        match std::fs::read_to_string(self.path_for(key)) {
+            Ok(v) => Ok(Some(v.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(NodeError::Config(format!("read key file {key}: {e}"))),
+        }
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), NodeError> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| NodeError::Config(format!("create key dir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: keep the key directory owner-only.
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = self.path_for(key);
+        std::fs::write(&path, value)
+            .map_err(|e| NodeError::Config(format!("write key file {key}: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| NodeError::Config(format!("chmod key file {key}: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// Environment variable that forces the file-backed key store. Set to any
+/// value on a headless server to skip the keychain entirely and use a 0600
+/// [`FileStore`] under `~/.buzz-node/secrets`.
+pub const FILE_KEYSTORE_ENV: &str = "BUZZ_NODE_FILE_KEYSTORE";
+
+/// Directory (under [`node_home_dir`]) for the file-backed key store.
+fn file_keystore_dir() -> Result<PathBuf, NodeError> {
+    Ok(node_home_dir()?.join("secrets"))
+}
+
+/// Choose the node's [`SecretStore`]. The OS keychain ([`KeychainStore`]) is
+/// the preferred default, but a headless server usually has no secret-service,
+/// so this transparently uses a 0600 [`FileStore`] under `~/.buzz-node/secrets`
+/// when either (a) [`FILE_KEYSTORE_ENV`] is set, or (b) a probe of the keychain
+/// fails (e.g. the "not activatable" DBus error on a headless Linux box). This
+/// is what lets `buzz-node enroll`/`up` run on the "always-on box I own" that
+/// is the primary deployment target, while keeping the keychain on desktops.
+pub fn resolve_secret_store() -> Result<Box<dyn SecretStore>, NodeError> {
+    if std::env::var_os(FILE_KEYSTORE_ENV).is_some() {
+        return Ok(Box::new(FileStore::new(file_keystore_dir()?)));
+    }
+    let keychain = KeychainStore;
+    match keychain.get(NODE_KEY_ENTRY) {
+        Ok(_) => Ok(Box::new(keychain)),
+        Err(e) => {
+            let dir = file_keystore_dir()?;
+            eprintln!(
+                "buzz-node: OS keychain unavailable ({e}); falling back to 0600 file key store at {}",
+                dir.display()
+            );
+            Ok(Box::new(FileStore::new(dir)))
+        }
+    }
+}
+
 /// In-memory [`SecretStore`] for tests. Never touches the real keychain, so
 /// unit tests can exercise [`load_or_create_node_keys`] headlessly.
 #[cfg(any(test, feature = "test-utils"))]
@@ -483,6 +585,38 @@ mod tests {
         let store = InMemorySecretStore::default();
         store.set(NODE_KEY_ENTRY, "not-an-nsec").expect("set");
         assert!(load_or_create_node_keys(&store).is_err());
+    }
+
+    // --- FileStore (headless fallback — tempdir, no real keychain/home) ---
+
+    #[test]
+    fn file_store_round_trips_missing_returns_none_and_is_owner_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileStore::new(dir.path().join("secrets"));
+        assert!(store.get(NODE_KEY_ENTRY).expect("get").is_none());
+        store.set(NODE_KEY_ENTRY, "nsec1example").expect("set");
+        assert_eq!(
+            store.get(NODE_KEY_ENTRY).expect("get").as_deref(),
+            Some("nsec1example")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("secrets").join(NODE_KEY_ENTRY))
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn load_or_create_node_keys_works_with_file_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileStore::new(dir.path().join("secrets"));
+        let first = load_or_create_node_keys(&store).expect("generate");
+        let second = load_or_create_node_keys(&store).expect("reuse");
+        assert_eq!(first.public_key(), second.public_key());
     }
 
     // --- accept_enrollment (pure) ---

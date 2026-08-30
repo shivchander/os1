@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use buzz_node::engine;
-use buzz_node::enroll::{self, KeychainStore, NodeConfig};
+use buzz_node::enroll::{self, NodeConfig};
 use buzz_node::model::NodeError;
 use buzz_node::nostr_relay::NostrNodeRelay;
 use buzz_node::relay::NodeRelay;
@@ -288,7 +288,7 @@ fn ensure_identity_matches_config(
 }
 
 async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
-    let node_keys = enroll::load_or_create_node_keys(&KeychainStore)?;
+    let node_keys = enroll::load_or_create_node_keys(enroll::resolve_secret_store()?.as_ref())?;
     let cfg = enroll::load_node_config()?.ok_or_else(|| {
         NodeError::Config(
             "no enrollment found; run `buzz-node enroll --relay-url <URL>` first".into(),
@@ -350,7 +350,7 @@ async fn cmd_enroll(relay_url_flag: Option<String>) -> Result<(), NodeError> {
         .ok_or_else(|| {
             NodeError::Config("pass --relay-url or set BUZZ_RELAY_URL to enroll".into())
         })?;
-    let node_keys = enroll::load_or_create_node_keys(&KeychainStore)?;
+    let node_keys = enroll::load_or_create_node_keys(enroll::resolve_secret_store()?.as_ref())?;
     let workspace_root = enroll::node_home_dir()?;
     let caps = buzz_core::NodeCapabilities {
         format: buzz_core::node::FORMAT.into(),

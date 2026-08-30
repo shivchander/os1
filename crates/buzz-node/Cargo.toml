@@ -59,3 +59,8 @@ tempfile = "3"
 # dev-dependency-only test pattern.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+# Owner-side test client (connect/authenticate/subscribe/collect) for the
+# gated two-node e2e proof (`tests/e2e_nodes.rs`) — publishes
+# NODE_ENROLLMENT/AGENT_ASSIGNMENT and observes AGENT_NODE_STATUS against a
+# real relay. Mirrors `buzz-relay`'s identical dev-dependency-only use.
+buzz-test-client = { path = "../buzz-test-client" }

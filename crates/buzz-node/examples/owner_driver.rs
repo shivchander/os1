@@ -94,7 +94,10 @@ async fn main() {
             // BUZZ_ACP_AGENT_COMMAND to pick the agent (codex here) and passes
             // its env down to the agent process.
             let mut env = BTreeMap::new();
-            env.insert("BUZZ_ACP_AGENT_COMMAND".to_string(), "codex".to_string());
+            // codex-acp is the ACP adapter that wraps the codex CLI (npm i -g
+            // @agentclientprotocol/codex-acp). buzz-acp's normalize_agent_args
+            // strips the legacy "acp" default arg for codex-acp, so command alone suffices.
+            env.insert("BUZZ_ACP_AGENT_COMMAND".to_string(), "codex-acp".to_string());
             env.insert("OPENAI_API_KEY".to_string(), openai);
 
             let secret = AssignmentSecret {
@@ -109,7 +112,7 @@ async fn main() {
                     // Inert (AcpRuntime never reads launch.command) but kept
                     // structurally valid; the real selector is env's
                     // BUZZ_ACP_AGENT_COMMAND above.
-                    command: "codex".into(),
+                    command: "codex-acp".into(),
                     args: vec![],
                     env,
                     policy_env: BTreeMap::new(),

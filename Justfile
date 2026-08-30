@@ -287,6 +287,45 @@ desktop-release-build target="aarch64-apple-darwin":
     pnpm install
     cd {{desktop_dir}} && pnpm tauri build --features mesh-llm --target {{target}}
 
+# Build a local, OS1-branded macOS .app that opens from Finder and connects to
+# the given relay (default: the WorkOS1 execution node over Tailscale). Lean
+# build (no mesh-llm — agents run on the node via codex), ad-hoc signed for
+# local use (no notarization). Output:
+#   desktop/src-tauri/target/release/bundle/macos/OS1.app
+# Usage: just os1-app            (WorkOS1 node)
+#        just os1-app ws://host:3000
+os1-app relay="ws://100.88.16.15:3000":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    TARGET=$(rustc -vV | sed -n 's|host: ||p')
+    echo "==> building release sidecars"
+    cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p buzz-cli -p git-credential-nostr
+    TDIR=$(cargo metadata --format-version 1 --no-deps | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).target_directory")
+    mkdir -p desktop/src-tauri/binaries
+    for bin in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+        cp "$TDIR/release/$bin" "desktop/src-tauri/binaries/$bin-$TARGET"
+        chmod +x "desktop/src-tauri/binaries/$bin-$TARGET"
+    done
+    echo "==> building OS1.app (relay baked: {{relay}})"
+    cd {{desktop_dir}}
+    [[ -d node_modules ]] || pnpm install
+    # --bundles app: skip the DMG (bundle_dmg.sh is flaky locally and we only
+    # need the openable .app).
+    BUZZ_DESKTOP_BUILD_RELAY_URL="{{relay}}" pnpm tauri build --bundles app
+    APP="src-tauri/target/release/bundle/macos/OS1.app"
+    if [[ -d "$APP" ]]; then
+        echo "==> ad-hoc signing + installing to /Applications"
+        codesign --force --deep --sign - "$APP" 2>/dev/null || true
+        rm -rf /Applications/OS1.app && cp -R "$APP" /Applications/OS1.app
+        codesign --force --deep --sign - /Applications/OS1.app 2>/dev/null || true
+        echo "Installed /Applications/OS1.app — open from Launchpad/Finder."
+        echo "(First launch: if Gatekeeper blocks an ad-hoc build, right-click the app → Open once.)"
+    else
+        echo "ERROR: build finished but $APP not found; check target/release/bundle/macos" >&2
+        exit 1
+    fi
+
 # Run desktop checks suitable for CI / pre-push
 desktop-ci: desktop-check desktop-test desktop-tauri-fmt-check desktop-build desktop-tauri-check desktop-tauri-test
 

@@ -18,14 +18,17 @@ import type { BackendIntent } from "./instanceInputForDefinition";
  * `buildInstanceInputForDefinition`'s single-mapping contract so the
  * assign-on-create behavior cannot drift per caller.
  *
- * `env`/`policyEnv` are sent empty: the effective launch env (persona/model
- * layering, policy-controlled overrides) is resolved today only inside the
- * Rust local-spawn path (`start_local_agent_with_preflight` and friends) —
- * there is no desktop-frontend resolver for it yet, and inventing one here
- * would re-derive logic the spec explicitly warns against duplicating (see
+ * We convey the agent's own **system prompt** in `launch.env` as
+ * `BUZZ_ACP_SYSTEM_PROMPT` so the node-hosted harness honors its instructions
+ * (without it, codex/goose runs with its default identity). We deliberately
+ * send ONLY the agent's instructions here — NOT the full persona/model/policy
+ * env layering, which is still resolved only inside the Rust local-spawn path
+ * (`start_local_agent_with_preflight` and friends); re-deriving that here is
+ * the drift the spec warns against (see
  * `docs/superpowers/specs/2026-08-29-execution-nodes-design.md` §9 "Config
- * without drift"). `command`/`args` come straight off the just-created
- * record, which is the same value the record itself persists.
+ * without drift"). Provider credentials are supplied by the node itself
+ * (`NodeConfig.agent_env` + the provider secret store), not from here.
+ * `command`/`args` come straight off the just-created record.
  */
 export async function publishNodeAssignmentForCreatedAgent(
   backendIntent: BackendIntent | null | undefined,
@@ -38,13 +41,17 @@ export async function publishNodeAssignmentForCreatedAgent(
       "Could not resolve your identity to assign this agent to a node.",
     );
   }
+  const env: Record<string, string> = {};
+  if (createdAgent.systemPrompt) {
+    env.BUZZ_ACP_SYSTEM_PROMPT = createdAgent.systemPrompt;
+  }
   await publishAgentAssignment({
     agentId: createdAgent.pubkey,
     nodePubkey: backendIntent.nodePubkey,
     launch: {
       command: createdAgent.agentCommand,
       args: createdAgent.agentArgs,
-      env: {},
+      env,
       policyEnv: {},
       ownerPubkey,
     },

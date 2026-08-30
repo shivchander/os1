@@ -82,6 +82,17 @@ ps:
 logs *ARGS:
     docker compose logs -f {{ARGS}}
 
+# Bring up a full self-contained execution-node stack on THIS host (no Docker,
+# no desktop): relay backend (podman) + relay + node enroll + daemon + a codex
+# agent. Run ON the node. `all` needs OPENAI_API_KEY exported to assign codex.
+# Subcommands: backend | relay | enroll | up | assign | status | down | all
+# Example: OPENAI_API_KEY=sk-... just node-stack all   ;   just node-stack status
+node-stack cmd="status":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="{{justfile_directory()}}/bin:$PATH"
+    exec {{justfile_directory()}}/scripts/execution-node-stack.sh {{cmd}}
+
 # ─── Build & Check ───────────────────────────────────────────────────────────
 
 # Build the Rust workspace

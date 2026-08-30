@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use buzz_auth::Scope;
 use buzz_core::kind::{
+    KIND_AGENT_ASSIGNMENT, KIND_AGENT_NODE_STATUS, KIND_NODE_ANNOUNCE, KIND_NODE_ENROLLMENT,
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
@@ -542,6 +543,12 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
         KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
         KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
+        // Execution-node control plane (39500-39503): NODE_ANNOUNCE /
+        // AGENT_NODE_STATUS are node-authored, NODE_ENROLLMENT / AGENT_ASSIGNMENT
+        // owner-authored; all are community-wide addressable state (no channel
+        // scope), the same ownership shape as the managed-agent kinds above.
+        KIND_NODE_ANNOUNCE | KIND_NODE_ENROLLMENT | KIND_AGENT_ASSIGNMENT
+        | KIND_AGENT_NODE_STATUS => Ok(Scope::UsersWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -697,6 +704,12 @@ pub(crate) fn is_global_only_kind(kind: u32) -> bool {
             | KIND_AGENT_TURN_METRIC
             // NIP-PL leases are author-owned, addressable global state.
             | super::push_lease::KIND_PUSH_LEASE
+            // Execution-node control plane (39500-39503): community-wide
+            // addressable state, never channel-scoped (no `h` tag).
+            | KIND_NODE_ANNOUNCE
+            | KIND_NODE_ENROLLMENT
+            | KIND_AGENT_ASSIGNMENT
+            | KIND_AGENT_NODE_STATUS
     )
 }
 

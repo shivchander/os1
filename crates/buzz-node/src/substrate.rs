@@ -1148,8 +1148,13 @@ mod tests {
 
         // The no-dup-spawn property itself: reconciling `d` (still desired
         // Assigned) against this observation must NOT emit a Start/Restart
-        // for an agent that's already (adopted-)Running.
-        let actions = crate::reconcile::reconcile(std::slice::from_ref(&d), &observed);
+        // for an agent that's already (adopted-)Running. `applied` is empty
+        // here on purpose — this fresh `sub2`/incarnation-2 engine has no
+        // in-memory record of ever having started this agent itself (it was
+        // adopted, not started by us), which is exactly the "unknown
+        // applied hash" case that must never be spuriously restarted.
+        let actions =
+            crate::reconcile::reconcile(std::slice::from_ref(&d), &observed, &BTreeMap::new());
         assert_eq!(
             actions,
             vec![crate::model::Action::Noop(d.agent_pubkey)],

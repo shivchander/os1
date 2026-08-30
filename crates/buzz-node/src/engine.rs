@@ -1,7 +1,7 @@
 //! The node engine: on each new desired-set, peer status, or periodic tick,
 //! observe → reconcile → apply → publish status. Controlled entirely via
 //! the relay.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use buzz_core::{AgentNodeStatus, AssignState};
 use crate::health;
 use crate::model::{Action, DesiredAgent, NodeError, Observed};
 use crate::move_gate::{self, PeerStatusView, MOVE_HANDOFF_TIMEOUT};
-use crate::reconcile::reconcile;
+use crate::reconcile::{reconcile, secret_launch_hash};
 use crate::relay::NodeRelay;
 use crate::substrate::Substrate;
 
@@ -63,6 +63,16 @@ struct LoopState {
     /// heal back to `Running` on the very next non-probing pass, for lack
     /// of new evidence rather than any actual recovery.
     last_probe_result: HashMap<PublicKey, bool>,
+    /// The launch hash ([`secret_launch_hash`]) actually applied the last
+    /// time this engine started or restarted each agent. Populated only by
+    /// our own `Start`/`Restart` handling in `apply_action`, and cleared on
+    /// `Stop` — never persisted, so it is empty after a daemon restart. A
+    /// `Running` agent absent from this map (e.g. adopted from a prior
+    /// incarnation) is therefore never treated as having a stale launch by
+    /// `reconcile`; only an agent we ourselves started, whose desired
+    /// launch has since diverged from this recorded hash, gets restarted
+    /// (live-edit propagation).
+    applied: BTreeMap<PublicKey, u64>,
 }
 
 /// Run the node engine until either of the relay's live streams ends
@@ -289,7 +299,8 @@ async fn reconcile_and_apply(
         .collect();
 
     let observed = substrate.observe().await;
-    for action in reconcile(current, &observed) {
+    let actions = reconcile(current, &observed, &state.applied);
+    for action in actions {
         apply_action(substrate, status_view, state, me, &due, action).await?;
     }
 
@@ -348,6 +359,9 @@ async fn reconcile_and_apply(
 
 /// Apply one reconcile [`Action`], routing `Start`/`Restart` through
 /// [`start_gated`] so a move never produces two live instances (spec I4).
+/// Also maintains `state.applied` — the launch hash ([`secret_launch_hash`])
+/// this engine actually started each agent with — so a later reconcile pass
+/// can detect a stale (edited) launch on an otherwise-`Running` agent.
 async fn apply_action(
     substrate: &Arc<dyn Substrate>,
     status_view: &PeerStatusView,
@@ -357,10 +371,20 @@ async fn apply_action(
     action: Action,
 ) -> Result<(), NodeError> {
     match action {
-        Action::Start(d) => start_gated(substrate, status_view, state, me, due, *d).await,
+        Action::Start(d) => {
+            let key = d.agent_pubkey;
+            let hash = secret_launch_hash(&d.secret);
+            start_gated(substrate, status_view, state, me, due, *d).await?;
+            state.applied.insert(key, hash);
+            Ok(())
+        }
         Action::Restart(d) => {
-            substrate.stop(&d.agent_pubkey).await?;
-            start_gated(substrate, status_view, state, me, due, *d).await
+            let key = d.agent_pubkey;
+            let hash = secret_launch_hash(&d.secret);
+            substrate.stop(&key).await?;
+            start_gated(substrate, status_view, state, me, due, *d).await?;
+            state.applied.insert(key, hash);
+            Ok(())
         }
         Action::Stop(pk) => {
             // Clear any stale deferral so a later re-assignment of this
@@ -369,6 +393,7 @@ async fn apply_action(
             state.pending_spawns.remove(&pk);
             state.last_probe.remove(&pk);
             state.last_probe_result.remove(&pk);
+            state.applied.remove(&pk);
             substrate.stop(&pk).await
         }
         Action::Noop(_) => Ok(()),

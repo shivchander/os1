@@ -33,9 +33,23 @@ committed piece will actually pass its tests.
 - [x] Phase 2 — buzz-node reconciler core + engine vs fakes (21/21, clippy -D warnings + fmt clean; reviewed ✅)
 - [x] Phase 3 — buzz-node execution-node runtime COMPLETE: Groups A/B/C incl. Task 6 gated e2e_node.rs (enroll→assign→running, #[ignore], compiles) + spawn_detached test. 66 tests + 3 gated, clippy -D warnings + fmt clean, binary builds. (2 Phase-2-file correctness gaps carried to Phase 5: presence-cadence [product-blocking], shutdown-stops-agents.)
 - [x] Phase 4 — G1 (Tauri node commands) + G2 (nodes store/panel/enrollment, presence author-scoped) + G3 (Run-on picker + agent-card status/controls; local-lifecycle gated on node-assignment) COMPLETE + reviewed + pushed. G3 Critical (local double-spawn of node-hosted agents) took 3 fix rounds + a fail-closed backstop; 7 distinct local-spawn bypasses closed; re-review clean.
-- [~] Phase 5 — presence-cadence + **Batch A (move gate + resync + LWW one-live-instance) + Batch B (smoke-probe health/classify incl breaker-open Stopped-not-Crashed vocab + at-rest provider secret store) DONE + reviewed + pushed**. Remaining — Batch C: process adoption [PID+liveness so a daemon restart can't dup-spawn] + node-restart test; real next_status subscription [real cross-node moves are 30s-timeout-only until then] + validate_status doc; per-tick publish coalescing; publish_announce promptness test; resync watermark carry-forward; two-node e2e #[ignore]. Deferred (non-blocking): AcpRuntime real probe RPC (needs buzz-acp control channel); provider-secret retrieval at spawn (build_child_env)
+- [~] Phase 5 — presence-cadence + Batch A + Batch B + **Batch C1 (process adoption + agents SURVIVE graceful restart [pre-existing kill_on_drop cascade fixed] + getpgid pid corroboration; publish coalescing; publish_announce test; resync watermark carry-forward) DONE + reviewed + pushed**. Remaining — C2: real next_status subscription [real cross-node moves are 30s-timeout-only until then] + validate_status doc · C3: two-node e2e #[ignore]. Deferred (non-blocking): AcpRuntime real probe RPC (buzz-acp control channel); provider-secret retrieval at spawn; observe()-poll pid re-corroboration (subset of accepted v1 bare-pid risk); engine.rs:180-181 residual-limitations doc-staleness
 
 ## Running log (loop updates this — newest first)
+- 2026-08-30 (Phase 5 Batch C1 ✅ — agents genuinely survive node restart now): implemented process
+  adoption (per-agent PID file → unix liveness + getpgid group-leader corroboration → adopt live
+  survivors into an AgentSlot::Adopted so full_resync reconciles NoOp instead of double-spawning). The
+  adversarial review COMPILED A REPRO proving the feature's premise was false: a pre-existing
+  kill_on_drop(true) on agent children meant every graceful `buzz-node stop` SIGKILLed all agents (the
+  daemon's shutdown select! drops the engine future → drops the substrate → drops the Child handles) —
+  so adoption only ever helped after a crash. Fixed properly (removed kill_on_drop from the production
+  spawn; explicit stop()-on-unassign still kills) so agents now survive a graceful daemon restart AND a
+  disorderly kill, then get re-adopted — the core "agents keep running in the background" promise is now
+  real end-to-end, not just documented. Also landed 4 cleanups (last_probe_result latch-clear, LWW
+  watermark carry-forward, publish-task coalescing, publish_announce promptness). buzz-node 113 lib
+  tests; re-review clean (reviewer re-ran the load-bearing tests + zombie-checked); pushed. Accepted v1
+  residual: bare-pid+group-leader identity (no start-time token) — self-healing, boxes-I-own scope.
+  → C2 (real peer-status subscription so cross-node moves fire immediately, not on the 30s timeout).
 - 2026-08-29 (Phase 5 Batch B ✅): active smoke-probe health classification (classify checks
   breaker-open FIRST → a breaker-cooldown agent reports Stopped/"breaker-open", not a fresh Crashed) +
   at-rest OS-keychain secret store for provider API keys (new ProviderSecretStore, distinct from the

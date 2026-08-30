@@ -1,19 +1,19 @@
 @layer base {
   :root {
-    /* Catppuccin Latte (mauve accent) */
+    /* OS1 Day — warm cream canvas, terracotta accent */
     --radius: 0.625rem;
-    --background: 220 23.08% 94.9%;
-    --foreground: 234 16.02% 35.49%;
-    --card: 220 23.08% 94.9%;
-    --card-foreground: 234 16.02% 35.49%;
-    --popover: 220 23.08% 94.9%;
-    --popover-foreground: 234 16.02% 35.49%;
-    --primary: 266 85.05% 58.04%;
-    --primary-foreground: 220 23.08% 94.9%;
-    --secondary: 223 15.91% 82.75%;
-    --secondary-foreground: 234 16.02% 35.49%;
-    --muted: 223 15.91% 82.75%;
-    --muted-foreground: 233 12.8% 41.37%;
+    --background: 34 43% 96%;
+    --foreground: 22 24% 16%;
+    --card: 36 50% 98%;
+    --card-foreground: 22 24% 16%;
+    --popover: 36 50% 98%;
+    --popover-foreground: 22 24% 16%;
+    --primary: 16 63% 47%;
+    --primary-foreground: 36 60% 97%;
+    --secondary: 32 38% 89%;
+    --secondary-foreground: 22 24% 16%;
+    --muted: 32 34% 90%;
+    --muted-foreground: 26 15% 42%;
     --huddle-drawer-surface: 0 0% 0%;
     --huddle-control-surface: 0 0% 20%;
     --huddle-control-hover-surface: 0 0% 24%;
@@ -24,41 +24,41 @@
     --huddle-popover-border: 0 0% 24%;
     --huddle-tooltip-surface: 0 0% 20%;
     --huddle-tooltip-foreground: 0 0% 98%;
-    --accent: 223 15.91% 82.75%;
-    --accent-foreground: 234 16.02% 35.49%;
-    --destructive: 347 86.67% 44.12%;
-    --destructive-foreground: 220 23.08% 94.9%;
-    --border: 225 13.56% 76.86%;
-    --input: 225 13.56% 76.86%;
-    --ring: 234 16.02% 35.49%;
-    --chart-1: 345 57.65% 74.12%;
-    --chart-2: 185 37.25% 70.59%;
-    --chart-3: 219 81.96% 78.43%;
-    --chart-4: 35 61.18% 76.86%;
-    --chart-5: 113 32.94% 73.33%;
-    --sidebar: 218 25.1% 93.73%;
-    --sidebar-background: 218 25.1% 93.73%;
-    --sidebar-foreground: 234 16.02% 35.49%;
-    --sidebar-primary: 266 85.05% 58.04%;
-    --sidebar-primary-foreground: 220 23.08% 94.9%;
+    --accent: 30 44% 87%;
+    --accent-foreground: 22 24% 16%;
+    --destructive: 4 68% 47%;
+    --destructive-foreground: 36 60% 97%;
+    --border: 31 31% 82%;
+    --input: 31 31% 82%;
+    --ring: 16 63% 47%;
+    --chart-1: 16 63% 55%;
+    --chart-2: 33 55% 60%;
+    --chart-3: 8 60% 58%;
+    --chart-4: 42 60% 55%;
+    --chart-5: 25 40% 50%;
+    --sidebar: 34 43% 96%;
+    --sidebar-background: 34 43% 96%;
+    --sidebar-foreground: 22 24% 16%;
+    --sidebar-primary: 16 63% 47%;
+    --sidebar-primary-foreground: 36 60% 97%;
     --sidebar-active: var(--sidebar-primary);
     --sidebar-active-foreground: var(--sidebar-primary-foreground);
-    --sidebar-accent: 220 23.08% 94.9%;
-    --sidebar-accent-foreground: 234 16.02% 35.49%;
-    --sidebar-border: 225 13.56% 76.86%;
-    --sidebar-ring: 225 13.56% 76.86%;
+    --sidebar-accent: 34 43% 96%;
+    --sidebar-accent-foreground: 22 24% 16%;
+    --sidebar-border: 31 31% 82%;
+    --sidebar-ring: 31 31% 82%;
     /* Exact Buzz palette tokens; components consume these semantically. */
-    --buzz-gradient-light-top: #e6e6b6;
-    --buzz-gradient-light-bottom: #c4d0da;
-    --buzz-gradient-dark-top: #4a4616;
-    --buzz-gradient-dark-bottom: #0a1423;
-    --buzz-content-dark: 0 0% 10.1960784314%;
+    --buzz-gradient-light-top: #c8693e;
+    --buzz-gradient-light-bottom: #de4f2a;
+    --buzz-gradient-dark-top: #7a2f18;
+    --buzz-gradient-dark-bottom: #2a1209;
+    --buzz-content-dark: 20 16% 11%;
     /* Hosted-community onboarding intentionally keeps this light palette in
        both app themes; semantic tokens keep component code color-agnostic. */
     --buzz-hosted-community-surface-fg: 23 23 23;
-    --buzz-hosted-community-divider-border: 150 150 10;
-    --buzz-hosted-community-action-bg: 240 240 205;
-    --buzz-hosted-community-action-bg-hover: 232 232 188;
+    --buzz-hosted-community-divider-border: 196 105 62;
+    --buzz-hosted-community-action-bg: 246 230 211;
+    --buzz-hosted-community-action-bg-hover: 238 216 194;
     --buzz-hosted-community-input-bg: 255 255 255;
     --buzz-hosted-community-modal-action-fg: 255 255 255;
     --buzz-hosted-community-modal-overlay-bg: 0 0 0;
@@ -66,20 +66,20 @@
   }
 
   .dark {
-    /* Catppuccin Macchiato (mauve accent) */
+    /* OS1 Night — warm espresso canvas, ember accent */
     --radius: 0.625rem;
-    --background: 232 23.4% 18.43%;
-    --foreground: 227 68.25% 87.65%;
-    --card: 232 23.4% 18.43%;
-    --card-foreground: 227 68.25% 87.65%;
-    --popover: 232 23.4% 18.43%;
-    --popover-foreground: 227 68.25% 87.65%;
-    --primary: 267 82.69% 79.61%;
-    --primary-foreground: 232 23.4% 18.43%;
-    --secondary: 230 18.8% 26.08%;
-    --secondary-foreground: 227 68.25% 87.65%;
-    --muted: 230 18.8% 26.08%;
-    --muted-foreground: 228 39.22% 80%;
+    --background: 20 16% 10%;
+    --foreground: 33 44% 90%;
+    --card: 22 18% 13%;
+    --card-foreground: 33 44% 90%;
+    --popover: 22 18% 13%;
+    --popover-foreground: 33 44% 90%;
+    --primary: 14 78% 54%;
+    --primary-foreground: 24 30% 12%;
+    --secondary: 24 20% 17%;
+    --secondary-foreground: 33 44% 90%;
+    --muted: 24 18% 18%;
+    --muted-foreground: 30 22% 66%;
     --huddle-drawer-surface: 230 18.8% 26.08%;
     --huddle-control-surface: 231 15.61% 33.92%;
     --huddle-control-hover-surface: 231 15.61% 38%;
@@ -90,29 +90,29 @@
     --huddle-popover-border: 231 15.61% 38%;
     --huddle-tooltip-surface: 231 15.61% 33.92%;
     --huddle-tooltip-foreground: 227 68.25% 87.65%;
-    --accent: 230 18.8% 26.08%;
-    --accent-foreground: 227 68.25% 87.65%;
-    --destructive: 351 73.91% 72.94%;
-    --destructive-foreground: 232 23.4% 18.43%;
-    --border: 231 15.61% 33.92%;
-    --input: 231 15.61% 33.92%;
-    --ring: 227 68.25% 87.65%;
-    --chart-1: 333 20.78% 38.04%;
-    --chart-2: 193 19.61% 38.04%;
-    --chart-3: 224 26.67% 41.18%;
-    --chart-4: 30 8.24% 42.35%;
-    --chart-5: 139 10.98% 38.82%;
-    --sidebar: 234 22.75% 17.25%;
-    --sidebar-background: 234 22.75% 17.25%;
-    --sidebar-foreground: 227 68.25% 87.65%;
-    --sidebar-primary: 267 82.69% 79.61%;
-    --sidebar-primary-foreground: 232 23.4% 18.43%;
+    --accent: 24 22% 19%;
+    --accent-foreground: 33 44% 90%;
+    --destructive: 6 64% 52%;
+    --destructive-foreground: 33 44% 92%;
+    --border: 26 22% 19%;
+    --input: 26 22% 19%;
+    --ring: 14 78% 54%;
+    --chart-1: 14 70% 52%;
+    --chart-2: 33 50% 55%;
+    --chart-3: 8 55% 52%;
+    --chart-4: 42 55% 50%;
+    --chart-5: 25 35% 45%;
+    --sidebar: 20 18% 9%;
+    --sidebar-background: 20 18% 9%;
+    --sidebar-foreground: 33 44% 90%;
+    --sidebar-primary: 14 78% 54%;
+    --sidebar-primary-foreground: 24 30% 12%;
     --sidebar-active: var(--sidebar-primary);
     --sidebar-active-foreground: var(--sidebar-primary-foreground);
-    --sidebar-accent: 232 23.4% 18.43%;
-    --sidebar-accent-foreground: 227 68.25% 87.65%;
-    --sidebar-border: 231 15.61% 33.92%;
-    --sidebar-ring: 231 15.61% 33.92%;
+    --sidebar-accent: 22 18% 13%;
+    --sidebar-accent-foreground: 33 44% 90%;
+    --sidebar-border: 26 22% 19%;
+    --sidebar-ring: 26 22% 19%;
   }
 
   * {
@@ -231,16 +231,24 @@
 :root[data-buzz-sidebar] {
   --buzz-gradient-top: var(--buzz-gradient-light-top);
   --buzz-gradient-bottom: var(--buzz-gradient-light-bottom);
-  --buzz-muted-foreground: rgb(0 0 0 / 40%);
-  --buzz-search-surface: rgb(0 0 0 / 4%);
-  --buzz-chrome-foreground: rgb(0 0 0 / 50%);
+  /* OS1's brand sidebar is a saturated terracotta→orange ramp, so its text
+     and controls read light-on-color (like the dark variant) rather than the
+     dark-on-light treatment the original pale Buzz gradient used. */
+  /* Light sidebar text for the saturated OS1 gradient. This is the pre-engine
+     fallback; in the app ThemeProvider.applyTheme also pins it inline (which
+     wins over the base fg the theme engine derives). */
+  --sidebar-foreground: 36 55% 95%;
+  --sidebar-row-subtle-active-surface: rgb(255 255 255 / 20%);
+  --buzz-muted-foreground: rgb(255 255 255 / 66%);
+  --buzz-search-surface: rgb(255 255 255 / 14%);
+  --buzz-chrome-foreground: rgb(255 255 255 / 74%);
   --buzz-channel-fg: inherit;
   --buzz-dm-fg: inherit;
   --buzz-nav-fg: inherit;
-  --buzz-hover-surface: rgb(0 0 0 / 4%);
+  --buzz-hover-surface: rgb(255 255 255 / 14%);
   --buzz-sidebar-scrollbar-thumb: var(--buzz-hover-surface);
-  --buzz-active-fill: 0 0% 0%;
-  --buzz-active-foreground: var(--foreground);
+  --buzz-active-fill: 0 0% 100%;
+  --buzz-active-foreground: 0 0% 100%;
 }
 
 /*

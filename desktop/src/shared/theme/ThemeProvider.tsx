@@ -251,11 +251,22 @@ export function isBuzzTheme(themeName: string): boolean {
  * Resolve the accent to actually apply for a theme: Buzz themes are pinned to
  * the neutral accent; every other theme uses the stored/selected accent.
  */
+/**
+ * OS1's branded theme carries a fixed terracotta brand accent rather than the
+ * old neutral (GitHub black/white) pin. Light uses clay terracotta; dark uses a
+ * brighter ember so it reads on the espresso canvas. The appearance panel still
+ * hides the accent picker for the branded theme, so this is its one accent.
+ */
+const OS1_ACCENT_LIGHT = "#c4562c";
+const OS1_ACCENT_DARK = "#e5532c";
+
 function resolveEffectiveAccent(
   themeName: string,
   accentColor: string,
 ): string {
-  return isBuzzTheme(themeName) ? NEUTRAL_ACCENT : accentColor;
+  if (themeName === "buzz") return OS1_ACCENT_LIGHT;
+  if (themeName === "buzz-dark") return OS1_ACCENT_DARK;
+  return accentColor;
 }
 
 /** Toggle the Buzz-specific gradient marker independently from glass. */
@@ -435,15 +446,36 @@ async function applyTheme(name: SyntaxThemeName): Promise<{
   if (requestToken !== themeApplyRequest) return null;
 
   const info = extractThemeInfo(name, themeData);
-  const { isDark, vars } = createThemeVars(info.bg, info.fg, info.comment, {
-    added: info.added,
-    deleted: info.deleted,
-    modified: info.modified,
-  });
+  // The OS1 (buzz) themes borrow a GitHub syntax palette for code blocks only;
+  // the app chrome derives from OS1's warm brand base instead of GitHub's
+  // neutral bg/fg, so the content canvas reads warm rather than stark white.
+  const uiBase =
+    name === "buzz"
+      ? { bg: "#faf5ee", fg: "#2c221b", comment: "#8f7a63" }
+      : name === "buzz-dark"
+        ? { bg: "#1d1714", fg: "#f1e4d4", comment: "#a08a76" }
+        : { bg: info.bg, fg: info.fg, comment: info.comment };
+  const { isDark, vars } = createThemeVars(
+    uiBase.bg,
+    uiBase.fg,
+    uiBase.comment,
+    {
+      added: info.added,
+      deleted: info.deleted,
+      modified: info.modified,
+    },
+  );
 
   const root = document.documentElement;
   for (const [key, value] of Object.entries(vars)) {
     root.style.setProperty(key, value);
+  }
+
+  // Under the saturated OS1 gradient the sidebar needs light text, but the
+  // derived base fg is dark in light mode. Pin the branded sidebar foreground
+  // inline so it wins over the value createThemeVars just set above.
+  if (name === "buzz" || name === "buzz-dark") {
+    root.style.setProperty("--sidebar-foreground", "36 55% 95%");
   }
 
   root.classList.remove("light", "dark");

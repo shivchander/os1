@@ -237,6 +237,9 @@ export const settingsSections: SettingsSectionDescriptor[] = [
 ];
 
 function formatThemeLabel(name: string): string {
+  // The branded theme is presented as "OS1"; its id stays "buzz" internally.
+  if (name === "buzz") return "OS1";
+  if (name === "buzz-dark") return "OS1 Dark";
   return name
     .split("-")
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))

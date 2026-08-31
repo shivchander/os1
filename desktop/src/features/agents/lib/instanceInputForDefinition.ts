@@ -13,6 +13,7 @@ import {
   resolveManagedAgentAvatarUrl,
   type UploadMediaBytes,
 } from "../ui/managedAgentAvatar";
+import { adapterCommandForRuntimeId } from "./runtimeAdapterCommand";
 
 type RuntimesQueryLike = {
   isFetched: boolean;
@@ -148,7 +149,10 @@ export async function buildInstanceInputForDefinition(
     return {
       ...base,
       acpCommand: "buzz-acp",
-      agentCommand: runtime.command,
+      // The runtime's local command is null when its adapter is not installed
+      // on this Mac; the target node supplies the binary, so fall back to the
+      // adapter command the node is expected to run (fix a).
+      agentCommand: runtime.command ?? adapterCommandForRuntimeId(runtime.id),
       agentArgs: [],
       mcpCommand: runtime.mcpCommand ?? "",
       harnessOverride: !persona.runtime || persona.runtime === runtime.id,

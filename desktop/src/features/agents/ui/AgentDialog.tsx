@@ -6,6 +6,7 @@ import type {
   ManagedAgent,
   UpdatePersonaInput,
 } from "@/shared/api/types";
+import { getNodesSnapshot, subscribeNodes } from "@/shared/api/nodesStore";
 import {
   runLocationForBackend,
   runLocationForRunOn,
@@ -24,6 +25,7 @@ import { WhereToRunSection } from "./WhereToRunSection";
 import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
+  nodePubkeyFromRunOn,
   resolveBackendIntent,
 } from "./whereToRunIntent";
 
@@ -140,6 +142,20 @@ function AgentCreateDialogRouter({
     [providedInitialValues],
   );
 
+  // The runtimes advertised by the node the "Run on" draft targets, if any.
+  // Passed to the harness picker so a node-hostable runtime is offered even
+  // when its adapter is missing on this Mac (fix a). Undefined for
+  // local/provider targets, where only local availability governs the picker.
+  const nodes = React.useSyncExternalStore(subscribeNodes, getNodesSnapshot);
+  const selectedNodePubkey = nodePubkeyFromRunOn(runDraft.runOn);
+  const nodeRuntimeIds = React.useMemo(
+    () =>
+      selectedNodePubkey
+        ? nodes.find((node) => node.nodePubkey === selectedNodePubkey)?.runtimes
+        : undefined,
+    [nodes, selectedNodePubkey],
+  );
+
   const copy = createPersonaDialogState();
 
   return (
@@ -147,7 +163,7 @@ function AgentCreateDialogRouter({
     // because it owns the "Run on" draft.
     <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
       <AgentDefinitionDialog
-        createRunSection={
+        createRunSection={(selectedRuntimeId) => (
           <WhereToRunSection
             draft={runDraft}
             isPending={isDefinitionPending}
@@ -155,9 +171,11 @@ function AgentCreateDialogRouter({
               setRunDraft(nextDraft);
               onDirtyChange?.(true);
             }}
+            selectedRuntimeId={selectedRuntimeId}
           />
-        }
+        )}
         createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
+        nodeRuntimeIds={nodeRuntimeIds}
         description={copy.description}
         embedded={embedded}
         error={definitionError}

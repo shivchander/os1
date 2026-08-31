@@ -22,10 +22,15 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "./lib/instanceInputForDefinition";
+import { nodeRuntimeForCreate } from "./lib/runtimeAdapterCommand";
 import { publishNodeAssignmentForCreatedAgent } from "./lib/publishNodeAssignmentForCreatedAgent";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { isAgentNodeHosted, nodePubkeyForAgent } from "@/shared/api/nodesStore";
+import {
+  getNodesSnapshot,
+  isAgentNodeHosted,
+  nodePubkeyForAgent,
+} from "@/shared/api/nodesStore";
 import { listManagedAgents } from "@/shared/api/tauri";
 import { classifyAgentManagementOrigin } from "./agentManagementBuffer";
 import { useChannelsQuery } from "@/features/channels/hooks";
@@ -192,9 +197,18 @@ export function useAgentManagement() {
     try {
       assertAgentCanActFromOrigin(request.request.channelId);
       const runtimes = await availableRuntimesForStart(runtimesQuery);
-      const runtime = runtimes.find(
-        (candidate) => candidate.id === input.runtime,
-      );
+      const runtime =
+        runtimes.find((candidate) => candidate.id === input.runtime) ??
+        // Node target: allow a runtime this Mac can't run locally when the
+        // chosen node advertises it — the node runs the adapter (fix a).
+        (backendIntent?.type === "node" && input.runtime
+          ? nodeRuntimeForCreate({
+              runtimeId: input.runtime,
+              nodePubkey: backendIntent.nodePubkey,
+              nodes: getNodesSnapshot(),
+              catalogEntries: runtimesQuery.data ?? [],
+            })
+          : null);
       if (!runtime) {
         throw new Error("Choose an available runtime for this agent.");
       }

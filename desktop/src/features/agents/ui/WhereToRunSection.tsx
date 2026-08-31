@@ -9,6 +9,8 @@ import {
   subscribeNodes,
 } from "@/shared/api/nodesStore";
 
+import { nodeAdvertisesRuntime } from "@/features/agents/lib/runtimeAdapterCommand";
+
 import { ProviderConfigFields } from "./ProviderConfigFields";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
@@ -28,10 +30,17 @@ export function WhereToRunSection({
   draft,
   isPending,
   onDraftChange,
+  selectedRuntimeId,
 }: {
   draft: WhereToRunDraft;
   isPending: boolean;
   onDraftChange: (next: WhereToRunDraft) => void;
+  /**
+   * The harness the user has picked (fix c). When set, the node options are
+   * filtered to nodes that can host it; a node advertising the legacy "acp"
+   * wildcard matches any runtime. Undefined leaves every online node offered.
+   */
+  selectedRuntimeId?: string;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
   // This section can mount before anything else has started nodesStore's
@@ -48,6 +57,17 @@ export function WhereToRunSection({
     () => nodes.filter((node) => node.online),
     [nodes],
   );
+  // Capability filter (fix c): once a harness is picked, only offer nodes that
+  // can host it. "This computer" and providers are always kept.
+  const runnableNodes = React.useMemo(
+    () =>
+      selectedRuntimeId
+        ? onlineNodes.filter((node) =>
+            nodeAdvertisesRuntime(node.runtimes, selectedRuntimeId),
+          )
+        : onlineNodes,
+    [onlineNodes, selectedRuntimeId],
+  );
   const [probeError, setProbeError] = React.useState<string | null>(null);
   const runOnOptions = React.useMemo(
     () => [
@@ -56,12 +76,12 @@ export function WhereToRunSection({
         label: provider.id,
         value: provider.id,
       })),
-      ...onlineNodes.map((node) => ({
+      ...runnableNodes.map((node) => ({
         label: node.name,
         value: runOnValueForNode(node.nodePubkey),
       })),
     ],
-    [backendProviders, onlineNodes],
+    [backendProviders, runnableNodes],
   );
   const selectedNodePubkey = nodePubkeyFromRunOn(draft.runOn);
   const isProviderMode = draft.runOn !== "local" && !selectedNodePubkey;
@@ -78,6 +98,13 @@ export function WhereToRunSection({
         : null,
     [onlineNodes, selectedNodePubkey],
   );
+  // A prior node selection can stop matching after the user changes the harness
+  // (fix c): the node drops out of the options, so warn instead of silently
+  // dropping the selection.
+  const selectedNodeSupportsRuntime =
+    selectedNode && selectedRuntimeId
+      ? nodeAdvertisesRuntime(selectedNode.runtimes, selectedRuntimeId)
+      : true;
 
   // Latest-state seam for probe resolution: an Effect Event always sees the
   // draft as it is *now*. Without this, the probe promise closes over the
@@ -174,7 +201,15 @@ export function WhereToRunSection({
         </div>
       ) : null}
 
-      {selectedNode ? (
+      {selectedNode && !selectedNodeSupportsRuntime ? (
+        <div className="flex gap-3 rounded-2xl border border-warning/30 bg-warning-bg px-4 py-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+          <p className="text-sm text-warning">
+            <span className="font-medium">{selectedNode.name}</span> can&apos;t
+            run the selected harness. Choose another node or harness.
+          </p>
+        </div>
+      ) : selectedNode ? (
         <div className="flex gap-3 rounded-2xl border border-warning/30 bg-warning-bg px-4 py-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
           <p className="text-sm text-warning">

@@ -37,6 +37,7 @@ import { personaSaveNotice } from "@/features/agents/lib/personaSaveNotice";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
 import { useCommunities } from "@/features/communities/useCommunities";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { getNodesSnapshot } from "@/shared/api/nodesStore";
 import type {
   SnapshotFormat,
   SnapshotMemoryLevel,
@@ -63,6 +64,7 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
+import { nodeRuntimeForCreate } from "../lib/runtimeAdapterCommand";
 import { publishNodeAssignmentForCreatedAgent } from "../lib/publishNodeAssignmentForCreatedAgent";
 
 type PersonaFeedbackSurface = "catalog" | "library";
@@ -206,21 +208,32 @@ export function usePersonaActions() {
           setPersonaNoticeMessage(personaSaveNotice(input.displayName, null));
         }
       } else {
-        const runtime = availableRuntimes.find(
-          (candidate) => candidate.id === input.runtime,
-        );
+        // Stale-intent guard: a definition-only create never carries one.
+        const startIntent =
+          resolveCreateIntent(intent) === "definition_start"
+            ? (backendIntent ?? null)
+            : null;
+
+        const runtime =
+          availableRuntimes.find(
+            (candidate) => candidate.id === input.runtime,
+          ) ??
+          // Node target: allow a runtime this Mac can't run locally when the
+          // chosen node advertises it — the node runs the adapter (fix a).
+          (startIntent?.type === "node" && input.runtime
+            ? nodeRuntimeForCreate({
+                runtimeId: input.runtime,
+                nodePubkey: startIntent.nodePubkey,
+                nodes: getNodesSnapshot(),
+                catalogEntries: acpRuntimesQuery.data ?? [],
+              })
+            : null);
         if (!runtime) {
           setPersonaErrorMessage(
             "Choose an available provider for this agent.",
           );
           return false;
         }
-
-        // Stale-intent guard: a definition-only create never carries one.
-        const startIntent =
-          resolveCreateIntent(intent) === "definition_start"
-            ? (backendIntent ?? null)
-            : null;
 
         const avatarUrl = await resolveManagedAgentAvatarUrl(
           input.avatarUrl,

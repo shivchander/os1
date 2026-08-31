@@ -13,6 +13,7 @@ import {
   MessagesSquare,
   MonitorCog,
   Moon,
+  Server,
   ShieldAlert,
   Smartphone,
   Smile,
@@ -65,6 +66,7 @@ import { ChannelTemplatesSettingsCard } from "./ChannelTemplatesSettingsCard";
 import { ExperimentalFeaturesCard } from "./ExperimentalFeaturesCard";
 import { KeyboardShortcutsCard } from "./KeyboardShortcutsCard";
 import { MeshComputeSettingsCard } from "@/features/mesh-compute/ui/MeshComputeSettingsCard";
+import { NodesPanel } from "@/features/nodes/ui/NodesPanel";
 import { MobilePairingCard } from "./MobilePairingCard";
 import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
@@ -89,6 +91,7 @@ export type SettingsSection =
   | "agents"
   | "channel-templates"
   | "compute"
+  | "nodes"
   | "appearance"
   | "shortcuts"
   | "hosted-communities"
@@ -109,6 +112,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "agents",
   "channel-templates",
   "compute",
+  "nodes",
   "appearance",
   "shortcuts",
   "hosted-communities",
@@ -192,6 +196,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "compute",
     label: "Compute",
     icon: Cpu,
+  },
+  {
+    value: "nodes",
+    label: "Nodes",
+    icon: Server,
   },
   {
     value: "shortcuts",
@@ -841,6 +850,8 @@ export function renderSettingsSection(
       return <ChannelTemplatesSettingsCard />;
     case "compute":
       return <MeshComputeSettingsCard />;
+    case "nodes":
+      return <NodesPanel />;
     case "appearance":
       return <ThemeSettingsCard />;
     case "shortcuts":

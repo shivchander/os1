@@ -45,27 +45,25 @@ import {
   getRuntimePersonaModelOptions,
   NO_RUNTIME_DROPDOWN_VALUE,
   runtimeSupportsLlmProviderSelection,
-  type PersonaDropdownOption,
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
   PERSONA_LABEL_OPTIONAL_CLASS,
   shouldClearKnownModelForSelectionScope,
 } from "./agentConfigOptions";
-import { RequiredFieldLabel } from "./agentConfigControls";
 import {
-  modelDropdownOptions as buildModelDropdownOptions,
-  relayMeshModelPickerState,
-} from "./relayMeshModelPicker";
+  buildPersonaModelDropdownOptions,
+  buildPersonaProviderDropdownOptions,
+} from "./agentDialogDropdownOptions";
+import { RequiredFieldLabel } from "./agentConfigControls";
+import { relayMeshModelPickerState } from "./relayMeshModelPicker";
+import { nodeAdvertisesRuntime } from "../lib/runtimeAdapterCommand";
 import {
   selectionOnModelDropdownChange,
   selectionOnProviderDropdownChange,
   selectionOnRuntimeChange,
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
-import {
-  MODEL_DISCOVERY_LOADING_VALUE,
-  usePersonaModelDiscovery,
-} from "./usePersonaModelDiscovery";
+import { usePersonaModelDiscovery } from "./usePersonaModelDiscovery";
 import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -110,9 +108,14 @@ type AgentDefinitionDialogProps = {
   ) => Promise<unknown>;
   /** Publishes saved changes when the edited agent is shared in the catalog. */
   publishCatalogUpdatesOnSave?: boolean;
-  createRunSection?: React.ReactNode;
+  /** Create-mode "Run on" section. A render prop so it can capability-filter
+   *  the node list by the picked harness (fix c). */
+  createRunSection?: (selectedRuntimeId: string) => React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
+  /** Runtime ids the selected target node advertises (fix a): lets the picker
+   *  offer a node-hostable runtime whose adapter is missing on this Mac. */
+  nodeRuntimeIds?: string[];
 };
 
 export type AgentDefinitionSubmitOptions = {
@@ -136,7 +139,12 @@ export function AgentDefinitionDialog({
   publishCatalogUpdatesOnSave = false,
   createRunSection,
   createSubmitBlocked = false,
+  nodeRuntimeIds,
 }: AgentDefinitionDialogProps) {
+  // A runtime the selected target node advertises (fix a) — treated as
+  // available even when its adapter is missing on this Mac. Wildcard-aware.
+  const isNodeAvailable = (id: string) =>
+    nodeRuntimeIds !== undefined && nodeAdvertisesRuntime(nodeRuntimeIds, id);
   const runtimesLoading = runtimeCatalogStatus === "loading";
   const [displayName, setDisplayName] = React.useState("");
   const [aiDefaultsOpen, setAiDefaultsOpen] = React.useState(false);
@@ -489,9 +497,12 @@ export function AgentDefinitionDialog({
     { provider, model },
     runtimeCanChooseLlmProvider,
   );
+  // Node target: only node-advertised runtimes count (fix c gate), not local.
   const selectedRuntimeIsAvailable =
     runtime.trim().length === 0 ||
-    selectedRuntime?.availability === "available";
+    (nodeRuntimeIds !== undefined
+      ? isNodeAvailable(runtime)
+      : selectedRuntime?.availability === "available");
   // Gate model/provider validity through missingNormalizedFields — single
   // source of truth with the readiness gate so display and Save can't drift.
   const canSubmit =
@@ -577,6 +588,7 @@ export function AgentDefinitionDialog({
     buildPersonaRuntimeDropdownOptions({
       defaultRuntimeId: defaultRuntime?.id,
       isCreateMode,
+      nodeRuntimeIds,
       runtime,
       runtimes,
       runtimesLoading,
@@ -585,36 +597,22 @@ export function AgentDefinitionDialog({
   const runtimeSummaryLabel = selectedRuntime
     ? formatRuntimeOptionLabel(selectedRuntime)
     : runtime.trim() || "Not configured";
-  const providerDropdownOptions: PersonaDropdownOption[] = [
-    ...providerOptions
-      .filter((option) => option.id.trim().length > 0)
-      .map((option) => ({
-        label: option.label,
-        value: option.id,
-      })),
-    { label: "Custom provider...", value: CUSTOM_PROVIDER_DROPDOWN_VALUE },
-  ];
-  const modelDropdownOptions: PersonaDropdownOption[] =
-    buildModelDropdownOptions({
-      allowCustom: !isRelayMesh,
-      globalModel: undefined,
-      loading: modelDiscoveryLoading && discoveredModelOptions === null,
-      loadingValue: MODEL_DISCOVERY_LOADING_VALUE,
-      options: modelOptions,
-    })
-      .filter(
-        (option) => isRelayMesh || option.value !== AUTO_MODEL_DROPDOWN_VALUE,
-      )
-      .map((option) =>
-        isRelayMesh && option.value === AUTO_MODEL_DROPDOWN_VALUE
-          ? { ...option, label: "Automatic" }
-          : option,
-      );
+  const providerDropdownOptions =
+    buildPersonaProviderDropdownOptions(providerOptions);
+  const modelDropdownOptions = buildPersonaModelDropdownOptions({
+    discoveredModelOptions,
+    isRelayMesh,
+    modelDiscoveryLoading,
+    modelOptions,
+  });
   const previewLabel = displayName.trim() || "Agent name";
   const previewAvatarUrl = avatarUrl.trim() || null;
-  const runtimeWarningText = selectedRuntime
-    ? runtimeAvailabilityWarning(selectedRuntime)
-    : null;
+  // Suppress the local-availability caveat when the target node can host the
+  // runtime (fix a) — that warning does not apply to a node-hosted agent.
+  const runtimeWarningText =
+    selectedRuntime && !isNodeAvailable(runtime)
+      ? runtimeAvailabilityWarning(selectedRuntime)
+      : null;
   const runtimeWarning = runtimeWarningText ? (
     <p className="text-xs text-warning">
       {runtimeWarningText} Visit Settings &gt; Agents to set it up.
@@ -980,7 +978,9 @@ export function AgentDefinitionDialog({
                 transition={advancedFieldsTransition}
               >
                 <PersonaAdvancedFields
-                  afterRespondTo={isCreateMode ? createRunSection : undefined}
+                  afterRespondTo={
+                    isCreateMode ? createRunSection?.(runtime) : undefined
+                  }
                   behaviorDraft={behaviorDraft}
                   disabled={isPending}
                   envVars={envVars}

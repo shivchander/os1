@@ -289,21 +289,24 @@
 
   .buzz-onboarding-neutral-theme.buzz-startup-shell.buzz-onboarding-welcome {
     background-color: var(--buzz-welcome-chartreuse);
-    /* Landing is a flat chartreuse field, so the docked-footer scrim must match
-       it (not the gradient's light-blue bottom) to stay invisible. */
+    /* Landing is a flat coral field, so the docked-footer scrim matches it and
+       text/controls read light-on-coral. */
     --buzz-onboarding-shell-bottom: var(--buzz-welcome-chartreuse);
-    /* Subtle dot grid: 2px dots spaced on a 24px lattice. */
+    --foreground: 40 45% 95%;
+    --muted-foreground: 38 32% 86%;
+    /* Subtle dot grid: cream dots on the coral field. */
     background-image: radial-gradient(
       circle,
-      rgb(0 0 0 / 0.08) 1px,
+      rgb(255 255 255 / 0.14) 1px,
       transparent 1px
     );
     background-size: 24px 24px;
   }
 
   .buzz-onboarding-neutral-theme {
-    /* Landing "chartreuse" — the welcome background; reused for the CTA label. */
-    --buzz-welcome-chartreuse: #d7d72e;
+    /* OS1 coral — the welcome/hero field + onboarding accent (chips, borders).
+       Var name kept to avoid churn; value is the canonical OS1 coral. */
+    --buzz-welcome-chartreuse: #c65a43;
     /* Bottom stop of the onboarding shell gradient; also the docked-footer
        scrim color so content scrolling under the CTA fades into the page. */
     --buzz-onboarding-shell-bottom: #d7e7f6;

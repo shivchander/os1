@@ -8,7 +8,7 @@
     --card-foreground: 22 24% 16%;
     --popover: 36 50% 98%;
     --popover-foreground: 22 24% 16%;
-    --primary: 16 63% 47%;
+    --primary: 9 52% 52%;
     --primary-foreground: 36 60% 97%;
     --secondary: 32 38% 89%;
     --secondary-foreground: 22 24% 16%;
@@ -30,7 +30,7 @@
     --destructive-foreground: 36 60% 97%;
     --border: 31 31% 82%;
     --input: 31 31% 82%;
-    --ring: 16 63% 47%;
+    --ring: 9 52% 52%;
     --chart-1: 16 63% 55%;
     --chart-2: 33 55% 60%;
     --chart-3: 8 60% 58%;
@@ -39,7 +39,7 @@
     --sidebar: 34 43% 96%;
     --sidebar-background: 34 43% 96%;
     --sidebar-foreground: 22 24% 16%;
-    --sidebar-primary: 16 63% 47%;
+    --sidebar-primary: 9 52% 52%;
     --sidebar-primary-foreground: 36 60% 97%;
     --sidebar-active: var(--sidebar-primary);
     --sidebar-active-foreground: var(--sidebar-primary-foreground);
@@ -48,10 +48,10 @@
     --sidebar-border: 31 31% 82%;
     --sidebar-ring: 31 31% 82%;
     /* Exact Buzz palette tokens; components consume these semantically. */
-    --buzz-gradient-light-top: #c8693e;
-    --buzz-gradient-light-bottom: #de4f2a;
-    --buzz-gradient-dark-top: #7a2f18;
-    --buzz-gradient-dark-bottom: #2a1209;
+    --buzz-gradient-light-top: #c65a43;
+    --buzz-gradient-light-bottom: #a84832;
+    --buzz-gradient-dark-top: #8f3a28;
+    --buzz-gradient-dark-bottom: #361711;
     --buzz-content-dark: 20 16% 11%;
     /* Hosted-community onboarding intentionally keeps this light palette in
        both app themes; semantic tokens keep component code color-agnostic. */
@@ -74,7 +74,7 @@
     --card-foreground: 33 44% 90%;
     --popover: 22 18% 13%;
     --popover-foreground: 33 44% 90%;
-    --primary: 14 78% 54%;
+    --primary: 12 58% 61%;
     --primary-foreground: 24 30% 12%;
     --secondary: 24 20% 17%;
     --secondary-foreground: 33 44% 90%;
@@ -96,7 +96,7 @@
     --destructive-foreground: 33 44% 92%;
     --border: 26 22% 19%;
     --input: 26 22% 19%;
-    --ring: 14 78% 54%;
+    --ring: 12 58% 61%;
     --chart-1: 14 70% 52%;
     --chart-2: 33 50% 55%;
     --chart-3: 8 55% 52%;
@@ -105,7 +105,7 @@
     --sidebar: 20 18% 9%;
     --sidebar-background: 20 18% 9%;
     --sidebar-foreground: 33 44% 90%;
-    --sidebar-primary: 14 78% 54%;
+    --sidebar-primary: 12 58% 61%;
     --sidebar-primary-foreground: 24 30% 12%;
     --sidebar-active: var(--sidebar-primary);
     --sidebar-active-foreground: var(--sidebar-primary-foreground);

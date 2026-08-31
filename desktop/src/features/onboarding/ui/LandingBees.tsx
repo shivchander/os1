@@ -1,7 +1,20 @@
 import * as React from "react";
 
-import { FlappingBee } from "@/shared/ui/buzz-logo/FlappingBee";
 import os1MarkUrl from "@/shared/ui/os1-mark.svg";
+
+/** OS1 ring glyph for the scattered landing field (replaces the Buzz bee). */
+function Os1Ring({ className }: { className?: string }) {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 32 32"
+      fill="none"
+      className={className}
+    >
+      <circle cx="16" cy="16" r="12" stroke="currentColor" strokeWidth="2.5" />
+    </svg>
+  );
+}
 
 type Bee = {
   top: string;
@@ -11,8 +24,9 @@ type Bee = {
   color: string;
 };
 
-const WHITE = "#FFFFFF";
-const YELLOW = "#E9E94F";
+// Cream + peach ring tints that read on the coral welcome field.
+const WHITE = "#FBEFE0";
+const YELLOW = "#E6AD86";
 
 // Fixed scatter so the field doesn't shimmer between renders.
 const BEES: Bee[] = [
@@ -160,7 +174,7 @@ export function LandingBees() {
             opacity: 0.9,
           }}
         >
-          <FlappingBee className="w-full" />
+          <Os1Ring className="w-full" />
         </span>
       ))}
     </div>

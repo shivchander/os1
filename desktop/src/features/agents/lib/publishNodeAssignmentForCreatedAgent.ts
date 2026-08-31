@@ -18,19 +18,28 @@ import type { BackendIntent } from "./instanceInputForDefinition";
  * `buildInstanceInputForDefinition`'s single-mapping contract so the
  * assign-on-create behavior cannot drift per caller.
  *
- * We convey the agent's own **system prompt** in `launch.env` as
- * `BUZZ_ACP_SYSTEM_PROMPT` so the node-hosted harness honors its instructions
- * (without it, codex/goose runs with its default identity), and — when the
- * agent has a concrete, non-default model pinned — its **model** as
- * `BUZZ_ACP_MODEL` (buzz-acp's `--model`/`BUZZ_ACP_MODEL` arg, applied to
- * every new ACP session). We deliberately send ONLY these two fields here —
- * NOT the full persona/policy env layering, which is still resolved only
- * inside the Rust local-spawn path (`start_local_agent_with_preflight` and
- * friends); re-deriving that here is the drift the spec warns against (see
+ * We convey three things in `launch.env`:
+ *
+ * - The selected **runtime** as `BUZZ_ACP_AGENT_COMMAND` (the ACP adapter name,
+ *   e.g. `codex-acp` / `claude-agent-acp`). The node's `AcpRuntime` always execs
+ *   `buzz-acp`, which picks the underlying agent from this env var — it does NOT
+ *   read `launch.command`. Without it, a node-hosted agent silently falls back to
+ *   buzz-acp's default harness regardless of the runtime you chose. We send the
+ *   command name (node-portable; the node resolves it on its own PATH) and rely
+ *   on buzz-acp's `default_agent_args` to supply the correct per-adapter args
+ *   (empty for codex-acp / claude-agent-acp), passing `BUZZ_ACP_AGENT_ARGS` only
+ *   when the runtime declares explicit args.
+ * - The agent's **system prompt** as `BUZZ_ACP_SYSTEM_PROMPT` so the harness
+ *   honors its instructions (without it, the runtime uses its default identity).
+ * - When a concrete, non-default **model** is pinned, `BUZZ_ACP_MODEL`.
+ *
+ * We deliberately send ONLY these fields — NOT the full persona/policy env
+ * layering, which is still resolved only inside the Rust local-spawn path
+ * (`start_local_agent_with_preflight` and friends); re-deriving that here is the
+ * drift the spec warns against (see
  * `docs/superpowers/specs/2026-08-29-execution-nodes-design.md` §9 "Config
  * without drift"). Provider credentials are supplied by the node itself
  * (`NodeConfig.agent_env` + the provider secret store), not from here.
- * `command`/`args` come straight off the just-created record.
  */
 export async function publishNodeAssignmentForCreatedAgent(
   backendIntent: BackendIntent | null | undefined,
@@ -44,6 +53,16 @@ export async function publishNodeAssignmentForCreatedAgent(
     );
   }
   const env: Record<string, string> = {};
+  // Runtime selection → the node's buzz-acp harness picker. Command name only
+  // (node-portable); buzz-acp's `default_agent_args` supplies the correct empty
+  // args for codex-acp / claude-agent-acp, so we set BUZZ_ACP_AGENT_ARGS only
+  // when the runtime declares explicit args.
+  if (createdAgent.agentCommand) {
+    env.BUZZ_ACP_AGENT_COMMAND = createdAgent.agentCommand;
+    if (createdAgent.agentArgs.length > 0) {
+      env.BUZZ_ACP_AGENT_ARGS = createdAgent.agentArgs.join(",");
+    }
+  }
   if (createdAgent.systemPrompt) {
     env.BUZZ_ACP_SYSTEM_PROMPT = createdAgent.systemPrompt;
   }

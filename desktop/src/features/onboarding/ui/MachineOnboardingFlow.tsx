@@ -311,11 +311,9 @@ export function MachineOnboardingFlow({
               direction={transitionDirection}
               transitionKey={`machine-identity-${transitionDirection}`}
             >
-              <img
-                alt="Buzz"
-                className="w-full max-w-[600px]"
-                src="/landing/buzz-wordmark.png"
-              />
+              <h1 className="select-none font-thin text-9xl leading-none tracking-[0.15em] text-foreground">
+                OS1
+              </h1>
               <p className="mt-2 max-w-[560px] text-center text-2xl font-normal leading-none text-foreground">
                 Your people, your agents, your projects —<br />
                 all in one place.

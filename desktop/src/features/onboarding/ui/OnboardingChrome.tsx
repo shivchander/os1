@@ -21,11 +21,11 @@ export const ONBOARDING_PRIMARY_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(-
 export const ONBOARDING_SECURITY_PRIMARY_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} bg-white text-black/80 hover:bg-white/90 hover:text-black`;
 
 /**
- * Primary-CTA styling for the landing screen only: the shared pill with the
- * chartreuse label (`--buzz-welcome-chartreuse`). The blue label is reserved
+ * Primary-CTA styling for the landing screen only: the shared dark pill with a
+ * cream label that reads on the coral welcome field. The blue label is reserved
  * for the CTAs inside the steps.
  */
-export const ONBOARDING_LANDING_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[var(--buzz-welcome-chartreuse)]`;
+export const ONBOARDING_LANDING_CTA_CLASS = `${ONBOARDING_CTA_SHAPE} text-[#f7edde]`;
 
 /** Shared quiet pill for secondary actions throughout onboarding. */
 export const ONBOARDING_SECONDARY_CTA_CLASS =

@@ -257,8 +257,8 @@ export function isBuzzTheme(themeName: string): boolean {
  * brighter ember so it reads on the espresso canvas. The appearance panel still
  * hides the accent picker for the branded theme, so this is its one accent.
  */
-const OS1_ACCENT_LIGHT = "#c4562c";
-const OS1_ACCENT_DARK = "#e5532c";
+const OS1_ACCENT_LIGHT = "#c65a43";
+const OS1_ACCENT_DARK = "#d87660";
 
 function resolveEffectiveAccent(
   themeName: string,
@@ -451,9 +451,9 @@ async function applyTheme(name: SyntaxThemeName): Promise<{
   // neutral bg/fg, so the content canvas reads warm rather than stark white.
   const uiBase =
     name === "buzz"
-      ? { bg: "#faf5ee", fg: "#2c221b", comment: "#8f7a63" }
+      ? { bg: "#efe6d5", fg: "#38281e", comment: "#8a7256" }
       : name === "buzz-dark"
-        ? { bg: "#1d1714", fg: "#f1e4d4", comment: "#a08a76" }
+        ? { bg: "#241c17", fg: "#f0e4d4", comment: "#a08a76" }
         : { bg: info.bg, fg: info.fg, comment: info.comment };
   const { isDark, vars } = createThemeVars(
     uiBase.bg,

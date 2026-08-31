@@ -83,10 +83,12 @@ logs *ARGS:
     docker compose logs -f {{ARGS}}
 
 # Bring up a full self-contained execution-node stack on THIS host (no Docker,
-# no desktop): relay backend (podman) + relay + node enroll + daemon + a codex
-# agent. Run ON the node. `all` needs OPENAI_API_KEY exported to assign codex.
-# Subcommands: backend | relay | enroll | up | assign | status | down | all
-# Example: OPENAI_API_KEY=sk-... just node-stack all   ;   just node-stack status
+# no desktop): relay backend (podman) + relay + BOTH runtimes (Codex + Claude
+# Code adapters/CLIs) + node enroll + provider keys + daemon. Run ON the node.
+# `all` loads whichever of OPENAI_API_KEY / ANTHROPIC_API_KEY you export so the
+# desktop can pick either runtime per agent.
+# Subcommands: backend | relay | runtimes | enroll | secrets | up | assign | status | down | all
+# Example: OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... just node-stack all
 node-stack cmd="status":
     #!/usr/bin/env bash
     set -euo pipefail

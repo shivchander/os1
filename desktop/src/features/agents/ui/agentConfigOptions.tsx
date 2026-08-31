@@ -465,7 +465,16 @@ export function shouldClearKnownModelForSelectionScope({
   );
 }
 
-export function formatRuntimeOptionLabel(runtime: AcpRuntimeCatalogEntry) {
+export function formatRuntimeOptionLabel(
+  runtime: AcpRuntimeCatalogEntry,
+  isNodeAvailable = false,
+) {
+  // A runtime the target node can host is offered even when its adapter is
+  // missing on this Mac (fix a): label it "(on node)" rather than surfacing a
+  // local-availability caveat that does not apply to a node-hosted agent.
+  if (runtime.availability !== "available" && isNodeAvailable) {
+    return `${runtime.label} (on node)`;
+  }
   const suffix =
     runtime.availability === "adapter_missing"
       ? " (adapter missing)"
@@ -482,12 +491,20 @@ export function formatRuntimeOptionLabel(runtime: AcpRuntimeCatalogEntry) {
 export function buildPersonaRuntimeDropdownOptions({
   defaultRuntimeId,
   isCreateMode,
+  nodeRuntimeIds,
   runtime,
   runtimes,
   runtimesLoading,
 }: {
   defaultRuntimeId?: string;
   isCreateMode: boolean;
+  /**
+   * Runtime ids the selected target node advertises (fix a). A runtime the node
+   * can host is never disabled and is labelled "(on node)" even when its
+   * adapter is missing on this Mac. Undefined for local/provider targets, where
+   * only local availability governs the option.
+   */
+  nodeRuntimeIds?: string[];
   runtime: string;
   runtimes: AcpRuntimeCatalogEntry[];
   runtimesLoading: boolean;
@@ -495,6 +512,7 @@ export function buildPersonaRuntimeDropdownOptions({
   blankRuntimeOptionLabel: string;
   runtimeDropdownOptions: PersonaDropdownOption[];
 } {
+  const isNodeAvailable = (id: string) => !!nodeRuntimeIds?.includes(id);
   const blankRuntimeOptionLabel = runtimesLoading
     ? "Loading harnesses..."
     : isCreateMode
@@ -513,8 +531,12 @@ export function buildPersonaRuntimeDropdownOptions({
       disabled:
         isCreateMode &&
         defaultRuntimeId !== undefined &&
-        candidate.availability !== "available",
-      label: `${formatRuntimeOptionLabel(candidate)}${
+        candidate.availability !== "available" &&
+        !isNodeAvailable(candidate.id),
+      label: `${formatRuntimeOptionLabel(
+        candidate,
+        isNodeAvailable(candidate.id),
+      )}${
         isCreateMode && candidate.id === defaultRuntimeId ? " (default)" : ""
       }`,
       value: candidate.id,

@@ -255,6 +255,34 @@ fn node_hostname() -> Option<String> {
     }
 }
 
+/// Runtime-registry ids this node can host, detected by probing `PATH` for the
+/// ACP adapter binaries. Advertised in `NodeCapabilities.runtimes` (kind 39500)
+/// so the desktop can match an agent's chosen runtime to a capable node. Falls
+/// back to the generic `"acp"` transport id when no known adapter is found, so
+/// the node stays assignable and backward-compatible with older desktops.
+fn detected_runtimes() -> Vec<String> {
+    let mut runtimes = Vec::new();
+    if command_on_path("codex-acp") {
+        runtimes.push("codex".to_string());
+    }
+    if command_on_path("claude-agent-acp") || command_on_path("claude-code-acp") {
+        runtimes.push("claude".to_string());
+    }
+    if runtimes.is_empty() {
+        runtimes.push("acp".to_string());
+    }
+    runtimes
+}
+
+/// Whether `command` resolves to a file on the current `PATH` — a lightweight
+/// `which` for adapter detection.
+fn command_on_path(command: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(command).is_file())
+}
+
 // ─── `up` ───────────────────────────────────────────────────────────────
 
 async fn cmd_up(foreground: bool) -> Result<(), NodeError> {
@@ -363,7 +391,7 @@ async fn up_foreground(paths: &DaemonPaths) -> Result<(), NodeError> {
         version: buzz_core::node::VERSION,
         node_pubkey: node_keys.public_key().to_hex(),
         os: std::env::consts::OS.to_string(),
-        runtimes: vec!["acp".to_string()],
+        runtimes: detected_runtimes(),
         workspace_root: cfg.workspace_root.to_string_lossy().into_owned(),
         max_agents: None,
         name: cfg.name.clone().or_else(node_hostname),
@@ -417,7 +445,7 @@ async fn cmd_enroll(relay_url_flag: Option<String>) -> Result<(), NodeError> {
         version: buzz_core::node::VERSION,
         node_pubkey: node_keys.public_key().to_hex(),
         os: std::env::consts::OS.to_string(),
-        runtimes: vec!["acp".to_string()],
+        runtimes: detected_runtimes(),
         workspace_root: workspace_root.to_string_lossy().into_owned(),
         max_agents: None,
         name: node_hostname(),

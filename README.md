@@ -1,288 +1,185 @@
-<h1 align="center">Buzz 🐝</h1>
+<h1 align="center">OS1</h1>
 
 <p align="center">
-  <strong>A workspace where humans and agents build together, on a relay you own.</strong>
+  <strong>Your people, your agents, your projects — all in one place, running on compute you own.</strong>
 </p>
 
 <p align="center">
-  <a href="VISION.md">Vision</a> ·
-  <a href="VISION_SOVEREIGN.md">Sovereign</a> ·
-  <a href="VISION_PROJECTS.md">Forge</a> ·
-  <a href="VISION_AGENT.md">Agents</a> ·
   <a href="ARCHITECTURE.md">Architecture</a> ·
-  <a href="RELEASING.md">Releasing</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="TESTING.md">Testing</a> ·
   <a href="LICENSE">Apache 2.0</a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/screenshots/channel-thread.png" alt="A Buzz project channel where people and an agent coordinate on a release plan" width="100%">
-</p>
+---
 
-<p align="center">
-  <sub><em>People and agents building together in the same room.</em></sub>
-</p>
+## What is OS1?
+
+OS1 is a self-hosted workspace where you and your AI agents share the same rooms —
+and where the agents run on **compute you own**.
+
+You create an agent in the desktop app, point it at one of your **execution nodes**
+(a Mac, a Linux box, a cloud VM), and it runs *there*. It keeps working after you
+quit the app, and its whole history — every message, tool call, and result — is a
+signed event on a relay you control.
+
+Under the hood it's a Nostr relay: every message, reaction, and agent action is a
+signed event in one log, with the same identity model whether the author is a
+person or a process. In practice it feels like a team workspace; the difference is
+that the agents in it have their own keys, their own audit trail, and their own
+machines to run on.
 
 ---
 
-## What is this, really?
+## Key ideas
 
-Buzz is a self-hostable workspace where humans and AI agents share the same rooms.
-
-A Buzz **community** is the workspace a user reaches by URL. In the single-relay
-setup that ships today, the relay URL selects exactly one community. A hosted
-operator can serve many communities behind many domains or subdomains, but the
-client-facing rule stays the same: the URL is authoritative for the workspace,
-and all tenant-observable state under that URL is community-local.
-
-It's a Nostr relay: every message, reaction, workflow step, review approval, and git event is a signed event in one log. Same shape, same identity model, same audit trail, whether the author is a person or a process.
-
-In practice it feels like a team workspace. Under the hood it's an event log with taste and a suspicious number of Rust crates.
-
-Yes, it's another AI-adjacent developer tool. We're sorry. The difference is what agents can actually *do* once they're inside: open repos, send patches, review code, run workflows, edit canvases, orchestrate other agents, drop into voice huddles, create channels, and pull in whoever needs to see it. The same affordances as a human teammate, the same audit trail, a different keypair.
+- **Bring your own compute.** Agents don't run inside the app — they run on
+  execution nodes you enroll. Your keys, your machines, your bill.
+- **Agents survive the app.** An agent assigned to a node keeps running after you
+  close the desktop. Reopen it and the history is right where you left it.
+- **Pluggable runtimes.** Agents launch through the Agent Client Protocol (ACP).
+  Codex runs today; Claude Code and other harnesses slot in the same way.
+- **Work and personal, separated.** Each community is its own relay/workspace with
+  its own identity, members, and history. Switch between them without a reload.
+- **One event log.** Messages, agent actions, git events, and workflows are all
+  signed events — all searchable, all auditable, all under one roof.
 
 ---
 
-## Stuff you do in Buzz
+## The pieces
 
-- **Ask the project a question and get an answer with receipts.** Agents search six months of history and post the threads, not vibes.
-- **Let an agent triage a bug without giving it the keys to the kingdom.** Agents have their own keys, their own channel memberships, and their own audit trail. Scoped by identity, not by permission flags — the same way you'd scope a teammate.
-- **Turn a feature branch into a room** where patches, CI, review, and the merge decision live together — so the channel becomes the record of why the code exists.
-- **Search the conversation, the patch, the workflow run, and the approval in one place** — because they're all the same kind of event.
-- **Let an agent run the workspace, not just talk in it.** Channels, canvases, workflows, huddles — agents have the same surface area as humans, with their own keys and their own audit trail.
-
----
-
-## A look inside
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/channel-agents.png" alt="People and agents collaborating in a Buzz engineering channel and reacting with emoji" width="100%"><br>
-      <sub><strong>Agents are members, not bots.</strong> Add an agent to a channel the same way you add a person.</sub>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screenshots/create-channel.png" alt="The Add a channel dialog with search, filters, and channels to join or create" width="100%"><br>
-      <sub><strong>Spin up a room in seconds.</strong> Name it, describe it, make it private.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" valign="top">
-      <img src="docs/assets/screenshots/media-comments.png" alt="A video playing in Buzz with frame-anchored comments in a side panel" width="100%"><br>
-      <sub><strong>Media you can talk about.</strong> Leave comments pinned to specific frames.</sub>
-    </td>
-  </tr>
-</table>
-
----
-
-## Why Buzz is better
-
-One community. One identity model. One event log. Humans, agents, workflows, and repos all speak the same protocol, sign with the same kind of key, and end up in the same search index. In the default self-hosted deployment, one relay hosts one community; in a hosted multi-tenant deployment, each community keeps that same semantic boundary even when the backend shares Postgres, Redis, and object storage.
-
-The bet is that one community can do what teams currently fake with chat, forges, bots, CI dashboards, release tools, search indexes, and a pile of glue code. Not all at once, not magically, but with one substrate instead of seven tabs pretending they know about each other.
-
-Agents are part of the room, not haunted cron jobs.
-
----
-
-## Three little stories
-
-**Incident memory.** It's 2am. You type *"have we seen this error before?"* An agent watching the channel pulls six months of history, posts the threads, the root causes, the fixes, and offers to page whoever shipped the last one. The whole exchange — question, answer, evidence — stays in the channel.
-
-**Branch as room.** You open a feature branch. A channel appears. Patches land as NIP-34 events, CI posts results, an agent runs a first-pass review, teammates react to the parts they care about, and the merge decision lands in the same room as the evidence.
-
-**A release that writes itself.** A workflow fires on a tag. An agent reads the merged PRs from the project channels, drafts the release notes, posts them for human review, gets a 👍 reaction, and ships. Every step signed. Every step searchable.
-
----
-
-## Works today · Being wired up · Strong opinions, pending code
-
-| ✅ Works today | 🚧 Being wired up | 💭 Strong opinions, pending code |
-|---|---|---|
-| Relay, channels, threads, DMs, canvases, media, search, audit log | Mobile clients (iOS + Android, Flutter) | Web-of-trust reputation across relays |
-| Desktop app (Tauri + React) | Workflow approval gates (infra exists, glue still drying) | Push notifications |
-| `buzz-cli` (agent-first, JSON in / JSON out) + ACP harness (Goose, Codex, Claude Code) | Huddle lifecycle events | Culture features |
-| YAML workflows: message / reaction / schedule / webhook triggers | | |
-| Git events (NIP-34: patches, repo announcements, status) | | |
-| Git hosting backend | | |
-
-<sub>Please do not plan your compliance program around the 💭 column yet. The <a href="VISION.md">VISION docs</a> are the long version of what we think this becomes.</sub>
+| Piece | What it is |
+|---|---|
+| **OS1 desktop app** | Tauri + React. Create agents, chat, and choose where each agent runs. Ships as a local `OS1.app`. |
+| **Relay** | The substrate. Self-host it on a node, a VPS, wherever. Clients address it by URL, and the URL *is* the workspace. |
+| **Execution nodes** | `buzz-node` daemons you enroll to a community. They run your agents, reconcile assignments, and report status. |
+| **Runtimes** | ACP-compatible agent harnesses (Codex, Claude Code, …) launched on the node with your provider keys injected node-side. |
+| **CLI** | `buzz` — agent-first, JSON in / JSON out, designed for LLM tool calls. |
 
 ---
 
 ## Getting started
 
-New to Buzz? Pick the path that matches you.
+You'll need [Docker](https://docs.docker.com/get-docker/) and
+[Hermit](https://cashapp.github.io/hermit/) (or Rust 1.88+, Node 24+, pnpm 10+,
+`just`). Hermit auto-downloads the pinned toolchain on first use.
 
-### I just want to try the app
+### 1. Build the desktop app
 
-Grab a packaged build from the [latest release](https://github.com/block/buzz/releases/latest):
-
-| Platform | File |
-|---|---|
-| macOS (Apple Silicon) | `Buzz_<version>_aarch64.dmg` |
-| macOS (Intel) | `Buzz_<version>_x64.dmg` |
-| Linux (x86_64) | `Buzz_<version>_amd64.AppImage` or `Buzz_<version>_amd64.deb` |
-| Windows (x64) | `Buzz_<version>_x64-setup_alpha-unsigned.exe` |
-
-On a Mac, check the Apple menu > About This Mac: "Chip: Apple …" means Apple Silicon; "Processor: Intel …" means Intel.
-
-The Windows build is not code-signed, so SmartScreen may show "Windows protected your PC" on first launch. If available, click **More info**, then **Run anyway**.
-
-
-By default the app connects to `ws://localhost:3000`. To point it at a relay you're running or one someone shared with you, set `BUZZ_RELAY_URL` before launching, or switch the relay from inside the app. If you don't have a relay yet, follow **Build & run from source** below to stand one up locally.
-
-### I want my own hosted relay
-
-To run a relay for your team without managing servers, you can deploy one to Railway in a click:
-
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/buzz-relay-block)
-
-See [here](https://engineering.block.xyz/blog/run-your-own-buzz-relay) for details.
-
-### I work at Block
-
-Don't build from source, and don't use the OSS release — use the internal build. It comes pre-wired to the Block relay and agent provider, so it works out of the box with nothing to configure.
-
-Download the latest build from [`squareup/buzz-releases` releases](https://github.com/squareup/buzz-releases/releases/latest) and install it.
-
-### I want to build & run from source
-
-See **Quick start** below — this is the developer / self-host path.
-
----
-
-## Quick start
-
-You'll need [Docker](https://docs.docker.com/get-docker/) and [Hermit](https://cashapp.github.io/hermit/) (or Rust 1.88+, Node 24+, pnpm 10+, `just`).
-
-**Once:**
 ```bash
-git clone https://github.com/block/buzz.git && cd buzz
-. ./bin/activate-hermit   # pinned toolchain (tools auto-download on first use)
-just setup && just build
-```
-
-`just setup` runs `just bootstrap` automatically — it copies `.env.example` to `.env` if needed, downloads all required tools via Hermit, and starts Docker services + migrations.
-
-**Every day:**
-```bash
+git clone <your-fork-url> os1 && cd os1
 . ./bin/activate-hermit
-just dev   # starts the relay + desktop app together
+just setup                    # deps, Docker services, migrations
+just os1-app                  # builds OS1.app → /Applications/OS1.app
 ```
 
-Relay on `ws://localhost:3000`. Desktop app pops up. You're in.
+Pass a relay to bake in at build time: `just os1-app ws://<relay-host>:3000`.
+For fast iteration use `just desktop-dev` (web-only) or `just dev` (full native
+shell against a local relay).
 
-For a split-terminal workflow (relay logs separate from Vite output), use `just relay` in one terminal and `just desktop-dev` in another.
+### 2. Stand up a compute node
 
-Want a single-node / VPS relay instead of the local-dev stack? Use the production Compose bundle in [`deploy/compose/`](deploy/compose/README.md) (`docker compose` + Postgres, Redis, MinIO, optional Caddy/TLS). The root [`docker-compose.yml`](docker-compose.yml) is for day-to-day development only.
+On the machine you want your agents to run on:
 
-For agents, set `BUZZ_PRIVATE_KEY` and use [`buzz-cli`](crates/buzz-cli) — JSON in, JSON out, designed for LLM tool calls.
+```bash
+just node-stack all           # relay backend + node daemon + a runtime, enrolled
+```
+
+`node-stack` (see [`scripts/execution-node-stack.sh`](scripts/execution-node-stack.sh))
+enrolls the node and publishes its announcement; once you approve it as the owner,
+it shows up in the desktop's **"Run on"** picker by name. Networking is over
+[Tailscale](https://tailscale.com/) — address the relay and node by their tailnet
+IPs so any machine can reach them. The individual steps
+(`backend`, `relay`, `enroll`, `up`, `assign`, `status`) are available separately.
+
+### 3. Create and run an agent
+
+In the app: create an agent (name, instructions, model), choose a node under
+**Run on**, and it launches there. Edit its instructions and it restarts on the
+node with the new prompt. Close the app and it keeps running — the conversation is
+waiting when you come back.
 
 ---
 
-## Windows prerequisites
+## Runtimes
 
-The agent shell tool runs commands under bash. On macOS and Linux that's already there; on Windows you need to bring it.
+Agents run through ACP: on the node, `buzz-acp` execs the selected runtime and
+bridges it to the relay. Adding a runtime comes down to three things — an ACP
+command, a provider key, and an auth method:
 
-Install [Git for Windows](https://git-scm.com/download/win) — it ships Git Bash, which is what buzz resolves at runtime. Once it's installed, everything works the same as on other platforms.
+- **Codex** runs via `codex-acp` with `OPENAI_API_KEY`.
+- **Claude Code** support is next, via its ACP adapter with `ANTHROPIC_API_KEY`.
 
-If you'd rather point buzz at a different bash-compatible shell, set `BUZZ_SHELL` to its path (e.g. `BUZZ_SHELL=C:\path\to\bash.exe`). The agent's tool description updates automatically to reflect whichever shell is active.
+Provider keys live in the node's secret store and are injected into the agent
+process at launch — they're set once per node and never travel through the app.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                             Clients                                     │
-│  Human client         AI agent              CLI / scripts               │
-│  (Buzz desktop)       (Goose, Codex, ...)   (buzz-cli, agents)          │
-│       │               ┌──────────────┐               │                  │
-│       │               │  buzz-acp  │                 │                  │
-│       │               │  (ACP ↔ MCP) │               │                  │
-│       │               └──────┬───────┘               │                  │
-│       │                      │                       │                  │
-└───────┼──────────────────────┼───────────────────────┼──────────────────┘
-        │ WebSocket            │ WS + REST             │ WS + REST
-        ▼                      ▼                       ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          buzz-relay                                     │
-│  NIP-01 · NIP-42 auth · channel/DM/media/workflow/git REST · audit log  │
-└───┬──────────────────────────┬──────────────────────────┬───────────────┘
-    │                          │                          │
- ┌──▼───────────┐       ┌──────▼──────┐           ┌───────▼─────┐
- │   Postgres   │       │    Redis    │           │   S3/MinIO  │
- │ (events +    │       │  (pub/sub)  │           │  (Blossom)  │
- │  FTS search) │       └─────────────┘           └─────────────┘
- └──────────────┘
+        Clients                          Execution nodes  (your compute)
+   OS1 desktop · buzz CLI                 buzz-node daemon
+        │                                  │  runs agents via buzz-acp → Codex / Claude Code
+        │ WebSocket / REST                 │ WS: enroll · assignments · status
+        ▼                                  ▼
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │                              buzz-relay                                    │
+ │   NIP-01 · NIP-42 auth · channels / DMs / media / git / workflows · audit │
+ └───┬──────────────────────────┬──────────────────────────┬────────────────┘
+     │                          │                           │
+ ┌───▼────────┐          ┌──────▼──────┐            ┌───────▼─────┐
+ │  Postgres  │          │    Redis    │            │   S3/MinIO  │
+ │ (events +  │          │  (pub/sub)  │            │  (Blossom)  │
+ │  FTS)      │          └─────────────┘            └─────────────┘
+ └────────────┘
 ```
 
-A Rust workspace of focused crates. Single source of truth: the relay. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown.
+A Rust workspace of focused crates; the relay is the single source of truth. Full
+breakdown in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 <details>
 <summary><strong>Crate map</strong></summary>
 
-**Core protocol** — `buzz-core` (zero-I/O types, NIP-01 filters, Schnorr verify) · `buzz-relay` (Axum WS + REST)
+**Core & relay** — `buzz-core` (zero-I/O types, filters, Schnorr verify) ·
+`buzz-relay` (Axum WS + REST) · `buzz-db` (Postgres) · `buzz-auth` (NIP-42/98) ·
+`buzz-pubsub` (Redis) · `buzz-search` (FTS) · `buzz-audit` (hash-chain log) ·
+`buzz-media` (Blossom/S3)
 
-**Services** — `buzz-db` (Postgres) · `buzz-auth` (NIP-42/98 Schnorr auth, rate limiting) · `buzz-pubsub` (Redis, presence, typing) · `buzz-search` (Postgres FTS) · `buzz-audit` (hash-chain log). Multi-community mode scopes tenant-observable rows, cache keys, search documents, workflow state, media metadata, git repo pointers, and audit chains by the host-derived community; shared infrastructure is an implementation detail, not a user-visible global workspace.
+**Agents & nodes** — `buzz-node` (execution-node daemon: enroll, reconcile, run) ·
+`buzz-acp` (ACP harness) · `buzz-agent` (ACP agent) · `buzz-dev-mcp` (shell + file
+tools) · `buzz-cli` (agent-first CLI) · `buzz-workflow` (YAML automation) ·
+`buzz-persona` (persona packs) · `buzz-sdk` (typed event builders)
 
-**Agent surface** — `buzz-cli` (agent-first CLI, JSON in / JSON out) · `buzz-acp` (ACP harness for Goose/Codex/Claude Code) · `buzz-agent` (ACP agent — see [VISION_AGENT.md](VISION_AGENT.md)) · `buzz-dev-mcp` (shell + file-edit tools) · `buzz-workflow` (YAML automation) · `buzz-persona` (agent persona packs)
-
-**Git & pairing** — `git-sign-nostr` / `git-credential-nostr` (nostr-signed git) · `buzz-pair-relay` / `buzz-pairing-cli` (relay pairing)
-
-**Shared** — `buzz-sdk` (typed event builders) · `buzz-media` (Blossom/S3)
-
-**Tooling** — `buzz-admin` (admin CLI) · `buzz-test-client` (E2E)
-
-</details>
-
----
-
-## Going further
-
-- **[VISION.md](VISION.md)** · **[VISION_SOVEREIGN.md](VISION_SOVEREIGN.md)** · **[VISION_PROJECTS.md](VISION_PROJECTS.md)** · **[VISION_AGENT.md](VISION_AGENT.md)** — the four vision docs
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — system design, kind ranges, subsystem boundaries
-- **[TESTING.md](TESTING.md)** — multi-agent E2E test suite
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** · **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** · **[SECURITY.md](SECURITY.md)** · **[GOVERNANCE.md](GOVERNANCE.md)**
-
-<details>
-<summary><strong>Configuration</strong> (env vars, defaults work for local dev)</summary>
-
-All defaults work out of the box. Override via `.env`. Full reference in [`.env.example`](.env.example).
+**Git & tooling** — `git-sign-nostr` / `git-credential-nostr` (nostr-signed git) ·
+`buzz-admin` (admin CLI) · `buzz-test-client` (E2E)
 
 </details>
 
 <details>
-<summary><strong>Common dev commands</strong></summary>
+<summary><strong>Common commands</strong></summary>
 
 ```bash
-just setup          # Docker, migrations, desktop deps
-just relay          # Run the relay
-just dev            # Run the desktop app
-just build          # Build the Rust workspace
+just setup          # deps, Docker, migrations
+just os1-app        # build + install the OS1 desktop app
+just node-stack all # bring up / enroll a compute node
+just dev            # relay + desktop app together
 just check          # fmt + clippy + desktop check
-just test-unit      # Unit tests (no infra required)
-just test           # Full suite (starts services if needed)
-just ci             # Everything CI runs
-just reset          # ⚠️  Wipe data + recreate
+just test-unit      # unit tests (no infra)
+just ci             # everything CI runs
 ```
 
 </details>
 
 ---
 
-## What it is not
+## Acknowledgment
 
-- Not blockchain. Signed events are useful without making everyone buy a commemorative coin.
-- Not an AI replacement plan. Buzz works best when humans stay in the loop and agents stay in the room.
-- Not finished. We will tell you what works and what doesn't.
-
-**What it is:** one relay where humans, agents, workflows, git events, and project memory cooperate — the beginning of a workspace that can grow past the tabs it replaces.
-
----
+OS1 is built on [Buzz](https://github.com/block/buzz) by Block, Inc.
+(Apache 2.0) — the relay, desktop client, CLI, and agent harness are its
+foundation. OS1 adds the execution-node system, the desktop experience, and the
+theme on top. Our thanks to the Buzz authors.
 
 <p align="center">
-  <sub>Buzz 🐝</sub><br>
-  <sub>Apache 2.0 · Built by <a href="https://block.xyz">Block, Inc.</a></sub>
+  <sub>Apache 2.0</sub>
 </p>

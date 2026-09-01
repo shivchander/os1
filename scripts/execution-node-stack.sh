@@ -16,10 +16,19 @@
 # node-hosted agent inherits them; the desktop's per-agent runtime choice
 # decides which is used (Codex -> OPENAI_API_KEY, Claude Code -> ANTHROPIC_API_KEY).
 #
+# Claude Code via Vertex: instead of an ANTHROPIC_API_KEY, Claude can auth to
+# Google Vertex AI. Set ANTHROPIC_VERTEX_PROJECT_ID and copy your Google ADC to
+# the node; the `vertex` step installs the ADC (0600) and records the Vertex env
+# (CLAUDE_CODE_USE_VERTEX / project / region / model) in NodeConfig.agent_env, so
+# every node-hosted claude-agent-acp agent talks to Vertex. See VERTEX_* below.
+#
 # Usage:
 #   OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... \
 #     ./scripts/execution-node-stack.sh all
-#   ./scripts/execution-node-stack.sh backend|relay|runtimes|enroll|secrets|up|assign|status|down
+#   # Claude via Vertex (copy your ADC to the node first):
+#   ANTHROPIC_VERTEX_PROJECT_ID=my-proj VERTEX_ADC=~/adc.json \
+#     ./scripts/execution-node-stack.sh all
+#   ./scripts/execution-node-stack.sh backend|relay|runtimes|enroll|secrets|vertex|up|assign|status|down
 #
 # Idempotent: safe to re-run (e.g. after a reboot — `all` restarts everything;
 # enrollment persists on disk so it is not redone).
@@ -32,6 +41,17 @@ NODE_HOME="${NODE_HOME:-$HOME/.buzz-node}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"        # Codex provider key (optional)
 ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"  # Claude Code provider key (optional)
 AGENT_COMMAND="${BUZZ_ACP_AGENT_COMMAND:-codex-acp}"  # only the dev `assign` smoke-test uses this
+
+# Claude Code via Google Vertex AI (alternative to ANTHROPIC_API_KEY). The
+# `vertex` step is a no-op unless ANTHROPIC_VERTEX_PROJECT_ID is set. Model IDs
+# mirror the desktop's defaults and are override-able for other Vertex projects.
+ANTHROPIC_VERTEX_PROJECT_ID="${ANTHROPIC_VERTEX_PROJECT_ID:-}"  # GCP project serving Claude on Vertex (enables `vertex`)
+CLOUD_ML_REGION="${CLOUD_ML_REGION:-global}"                    # Vertex region
+VERTEX_ADC="${VERTEX_ADC:-$HOME/.config/gcloud/application_default_credentials.json}"  # Google ADC JSON on the node to install
+VERTEX_ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-4-8[1m]}"                 # default model for node claude agents
+VERTEX_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-5[1m]}"     # `sonnet` alias -> Vertex model
+VERTEX_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-4-8[1m]}"         # `opus` alias -> Vertex model
+VERTEX_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5@20251001}" # `haiku` alias -> Vertex model
 PODMAN="${PODMAN:-sudo podman}"                          # rootless here needs sudo
 PG_IMAGE="${PG_IMAGE:-docker.io/library/postgres:16}"
 REDIS_IMAGE="${REDIS_IMAGE:-docker.io/library/redis:7}"
@@ -70,6 +90,19 @@ runtimes() {
     curl -fsSL https://claude.ai/install.sh | bash \
       || log "WARNING: claude CLI install failed (see https://code.claude.com/docs)"
   fi
+  # The ACP adapters are Node scripts (`#!/usr/bin/env node`), so the daemon must
+  # resolve BOTH the adapter AND `node` when it spawns them. A headless daemon
+  # PATH (login/cron, or a hand-rolled launcher) may not carry the fnm/nvm node,
+  # so pin node + the adapters into ~/.local/bin, which is always on DAEMON_PATH.
+  mkdir -p "$HOME/.local/bin"
+  if nb="$(PATH="$DAEMON_PATH" command -v node 2>/dev/null)"; then
+    ln -sf "$(readlink -f "$nb")" "$HOME/.local/bin/node"
+  fi
+  for a in codex-acp claude-agent-acp; do
+    if p="$(PATH="$DAEMON_PATH" command -v "$a" 2>/dev/null)"; then
+      ln -sf "$(readlink -f "$p")" "$HOME/.local/bin/$a"
+    fi
+  done
   log "daemon-PATH runtime check:"
   for bin in buzz-acp codex-acp codex claude-agent-acp claude; do
     if PATH="$DAEMON_PATH" command -v "$bin" >/dev/null 2>&1; then
@@ -118,6 +151,54 @@ with open(path, "w") as f:
 print("providers:", cfg["providers"])
 PY
   log "node providers updated (restart 'up' to apply)"
+}
+
+# Claude Code via Vertex: install the Google ADC on the node (0600) and record
+# the Vertex env in NodeConfig.agent_env, so every node-hosted claude-agent-acp
+# agent authenticates to Vertex instead of using ANTHROPIC_API_KEY. The node's
+# claude CLI reads these vars and google-auth refreshes tokens itself (no gcloud
+# needed at runtime). Run after `enroll` (needs config.json), before `up`.
+# No-op unless ANTHROPIC_VERTEX_PROJECT_ID is set.
+vertex() {
+  [ -n "$ANTHROPIC_VERTEX_PROJECT_ID" ] || { log "ANTHROPIC_VERTEX_PROJECT_ID unset — skipping Vertex provisioning"; return; }
+  [ -f "$NODE_HOME/config.json" ] || die "enroll first (no $NODE_HOME/config.json)"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required to update agent_env"
+  [ -f "$VERTEX_ADC" ] || die "Google ADC not found at VERTEX_ADC=$VERTEX_ADC — copy it to the node first (e.g. scp ~/.config/gcloud/application_default_credentials.json node:.config/gcloud/)"
+  local dest="$HOME/.config/gcloud/application_default_credentials.json"
+  mkdir -p "$(dirname "$dest")"
+  if [ "$(readlink -f "$VERTEX_ADC")" != "$(readlink -f "$dest" 2>/dev/null || true)" ]; then
+    install -m 600 "$VERTEX_ADC" "$dest"
+  else
+    chmod 600 "$dest"
+  fi
+  log "installed Vertex ADC at $dest (0600)"
+  # Merge the Vertex env into NodeConfig.agent_env (the daemon injects it into
+  # every agent subprocess). Model IDs match the desktop's alias resolution.
+  ANTHROPIC_VERTEX_PROJECT_ID="$ANTHROPIC_VERTEX_PROJECT_ID" CLOUD_ML_REGION="$CLOUD_ML_REGION" \
+  GAC="$dest" VMODEL="$VERTEX_ANTHROPIC_MODEL" VSONNET="$VERTEX_SONNET_MODEL" \
+  VOPUS="$VERTEX_OPUS_MODEL" VHAIKU="$VERTEX_HAIKU_MODEL" \
+  python3 - "$NODE_HOME/config.json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+cfg = json.load(open(path))
+env = cfg.get("agent_env") or {}
+env.update({
+    "CLAUDE_CODE_USE_VERTEX": "1",
+    "ANTHROPIC_VERTEX_PROJECT_ID": os.environ["ANTHROPIC_VERTEX_PROJECT_ID"],
+    "CLOUD_ML_REGION": os.environ["CLOUD_ML_REGION"],
+    "GOOGLE_APPLICATION_CREDENTIALS": os.environ["GAC"],
+    "ANTHROPIC_MODEL": os.environ["VMODEL"],
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": os.environ["VSONNET"],
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": os.environ["VOPUS"],
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.environ["VHAIKU"],
+})
+cfg["agent_env"] = env
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+print("vertex agent_env set (project=%s region=%s model=%s)"
+      % (os.environ["ANTHROPIC_VERTEX_PROJECT_ID"], os.environ["CLOUD_ML_REGION"], os.environ["VMODEL"]))
+PY
+  log "Vertex agent_env recorded (restart 'up' to apply)"
 }
 
 backend() {
@@ -220,6 +301,19 @@ status() {
     PATH="$DAEMON_PATH" command -v "$bin" >/dev/null 2>&1 && echo "$bin: present" || echo "$bin: MISSING"
   done
   echo "--- providers (node config) ---"; grep -o '"providers":[^]]*]' "$NODE_HOME/config.json" 2>/dev/null || echo "(none)"
+  echo "--- vertex (claude auth) ---"
+  if grep -q '"CLAUDE_CODE_USE_VERTEX"' "$NODE_HOME/config.json" 2>/dev/null; then
+    python3 - "$NODE_HOME/config.json" <<'PY' 2>/dev/null || echo "(config parse failed)"
+import json, os, sys
+env = json.load(open(sys.argv[1])).get("agent_env") or {}
+adc = env.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+print("  project:", env.get("ANTHROPIC_VERTEX_PROJECT_ID"),
+      "region:", env.get("CLOUD_ML_REGION"), "model:", env.get("ANTHROPIC_MODEL"))
+print("  ADC:", adc, "(present)" if adc and os.path.exists(adc) else "(MISSING)")
+PY
+  else
+    echo "  (not configured; using ANTHROPIC_API_KEY or unset)"
+  fi
   echo "--- agent procs ---"; pgrep -af 'codex-acp|claude-agent-acp' | grep -v pgrep || echo "(none)"
   echo "--- agent health (6s) ---"; cd "$REPO_DIR" && timeout 9 ./target/debug/examples/owner_driver observe "$RELAY_URL" 6 2>&1 | tail -4 || true
 }
@@ -236,10 +330,11 @@ case "${1:-}" in
   runtimes) runtimes ;;
   enroll)   enroll ;;
   secrets)  secrets ;;
+  vertex)   vertex ;;
   up)       up ;;
   assign)   assign ;;
   status)   status ;;
   down)     down ;;
-  all)      backend; relay; runtimes; enroll; secrets; up; sleep 6; status ;;
-  *) die "usage: $0 {backend|relay|runtimes|enroll|secrets|up|assign|status|down|all}" ;;
+  all)      backend; relay; runtimes; enroll; secrets; vertex; up; sleep 6; status ;;
+  *) die "usage: $0 {backend|relay|runtimes|enroll|secrets|vertex|up|assign|status|down|all}" ;;
 esac

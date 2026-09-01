@@ -86,9 +86,12 @@ logs *ARGS:
 # no desktop): relay backend (podman) + relay + BOTH runtimes (Codex + Claude
 # Code adapters/CLIs) + node enroll + provider keys + daemon. Run ON the node.
 # `all` loads whichever of OPENAI_API_KEY / ANTHROPIC_API_KEY you export so the
-# desktop can pick either runtime per agent.
-# Subcommands: backend | relay | runtimes | enroll | secrets | up | assign | status | down | all
+# desktop can pick either runtime per agent. For Claude via Google Vertex AI
+# (instead of ANTHROPIC_API_KEY), set ANTHROPIC_VERTEX_PROJECT_ID and copy your
+# Google ADC to the node; the `vertex` step wires it into the node's agent_env.
+# Subcommands: backend | relay | runtimes | enroll | secrets | vertex | up | assign | status | down | all
 # Example: OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... just node-stack all
+# Vertex: ANTHROPIC_VERTEX_PROJECT_ID=my-proj VERTEX_ADC=~/adc.json just node-stack all
 node-stack cmd="status":
     #!/usr/bin/env bash
     set -euo pipefail

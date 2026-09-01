@@ -6,6 +6,7 @@ import {
   resolveAgentCardAvatarUrl,
 } from "@/features/agents/lib/agentCardAvatar";
 import { resolveAgentCardModelLabel } from "@/features/agents/lib/agentCardModelLabel";
+import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { friendlyAgentLastError } from "@/features/agents/lib/friendlyAgentLastError";
 import {
   isManagedAgentActive,
@@ -295,12 +296,16 @@ function AgentPersonaCard({
   // isNodeHostedAgent below is a plain read with no reactivity of its own.
   React.useSyncExternalStore(subscribeNodes, getNodesSnapshot);
   const title = persona.displayName;
-  const modelLabel = resolveAgentCardModelLabel({
-    agent,
-    personaModel: persona.model,
-    provider: persona.provider,
-    defaultModel,
-  });
+  // Card face second line: the authored description when one exists;
+  // otherwise fall back to the model label as before.
+  const subtitle =
+    effectiveAgentDescription(persona) ??
+    resolveAgentCardModelLabel({
+      agent,
+      personaModel: persona.model,
+      provider: persona.provider,
+      defaultModel,
+    });
   const isActive = agent ? isManagedAgentActive(agent) : false;
   const profileQuery = useUserProfileQuery(agent?.pubkey);
   const avatarUrl = agent
@@ -355,7 +360,7 @@ function AgentPersonaCard({
       avatarUrl={avatarUrl}
       dataTestId={`persona-agent-row-${persona.id}`}
       label={title}
-      modelLabel={modelLabel}
+      subtitle={subtitle}
       onClick={() => {
         // The card's main click always opens the PERSONA target, never an
         // explicit pubkey. A pubkey target is durable in the panel, so a pick
@@ -447,12 +452,16 @@ function StandaloneAgentCard({
       avatarUrl={profileQuery.data?.avatarUrl}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
-      modelLabel={resolveAgentCardModelLabel({
-        agent,
-        personaModel: null,
-        provider: agent.provider,
-        defaultModel,
-      })}
+      subtitle={
+        // Definition-less instance: no authored description exists, so fall
+        // back to the model label.
+        resolveAgentCardModelLabel({
+          agent,
+          personaModel: null,
+          provider: agent.provider,
+          defaultModel,
+        })
+      }
       onClick={() => {
         onOpenAgentProfile(
           agent.pubkey,
